@@ -21,18 +21,17 @@ jobs:
           node-version-file: .node-version
           package-manager-cache: false
 
-      - name: Install Anvil 1.7.1
-        env:
-          FOUNDRY_ARCHIVE: foundry_v1.7.1_linux_amd64.tar.gz
-          FOUNDRY_SHA256: cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b
-        run: |
-          curl --fail --location --silent --show-error \
-            "https://github.com/foundry-rs/foundry/releases/download/v1.7.1/${FOUNDRY_ARCHIVE}" \
-            --output "${RUNNER_TEMP}/${FOUNDRY_ARCHIVE}"
-          echo "${FOUNDRY_SHA256}  ${RUNNER_TEMP}/${FOUNDRY_ARCHIVE}" | sha256sum --check --strict
-          mkdir "${RUNNER_TEMP}/foundry"
-          tar --extract --gzip --file "${RUNNER_TEMP}/${FOUNDRY_ARCHIVE}" --directory "${RUNNER_TEMP}/foundry"
-          echo "${RUNNER_TEMP}/foundry" >> "${GITHUB_PATH}"
+      - name: Read pinned Foundry version
+        id: foundryref
+        run: echo "version=$(cat .foundryref)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Foundry
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1.8.0
+        with:
+          version: ${{ steps.foundryref.outputs.version }}
+
+      - name: Verify Anvil
+        run: anvil --version
 
       - name: Install dependencies
         run: npm ci
