@@ -63,7 +63,7 @@ test('returns stale when the selected report block is reorged in isolation', asy
   const screened = await guardian.screenWork(
     await guardian.reconstructWork(await guardian.discoverCandidatePositions(plan)),
   );
-  node.reorgBlock(plan.reportBlock.number);
+  node.reorgBlock(plan.discoveryRange.to.number);
 
   assert.deepEqual(await guardian.signalAndHeartbeat(screened), {
     kind: 'stale',
@@ -109,8 +109,8 @@ test('commits an own-flag-skipped anchor in the heartbeat digest', async () => {
       core: CORE,
       registry: REGISTRY,
       guardian: GUARDIAN,
-      previousCoverage: null,
-      reportBlock: plan.reportBlock.hash,
+      previousBlockHash: null,
+      reportBlockHash: plan.discoveryRange.to.hash,
     }),
   );
 });

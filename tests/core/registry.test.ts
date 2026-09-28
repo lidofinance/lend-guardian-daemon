@@ -139,7 +139,7 @@ for (const { name, data } of SOLIDITY_REVERTS) {
       event: 'transaction.failed',
       stage: 'preparation',
       error,
-      context: { method: 'heartbeat', reportBlock: plan.reportBlock },
+      context: { method: 'heartbeat', reportBlock: plan.discoveryRange.to },
     });
     assert.equal(event.event, 'transaction.failed');
     assert.equal(event.error, error);

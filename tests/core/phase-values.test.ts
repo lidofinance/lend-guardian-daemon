@@ -1,18 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Discovered, Work, Screened } from '../../src/core/outcomes.ts';
-import type { Plan } from '../../src/core/outcomes.ts';
+import type { ScanPlan } from '../../src/core/outcomes.ts';
 import { blockAt, BORROWER, CONTROLLER, CORE, MARKET } from './fake-node.ts';
 import { guardianOver } from './setup.ts';
 
 function inputs() {
-  const plan: Plan = {
+  const plan: ScanPlan = {
     kind: 'plan',
-    reportBlock: blockAt(200_000),
-    discoveryFrom: blockAt(100_000),
-    lookbackAnchor: 150_000,
-    coverage: blockAt(150_000),
-    storedTimestamp: blockAt(150_000).timestamp,
+    previousHeartbeatBlock: blockAt(150_000),
+    heartbeatTimestampAtStart: blockAt(150_000).timestamp,
+    discoveryRange: { from: blockAt(100_000), to: blockAt(200_000) },
   };
   const key = { controller: CONTROLLER, marketId: MARKET, borrower: BORROWER };
   const anchor = {
@@ -32,13 +30,13 @@ test('a returned plan and its block references cannot be changed', async () => {
   const covered = blockAt(150_000);
   const { guardian } = guardianOver({
     head: 200_000,
-    storedHeartbeat: covered.timestamp,
+    heartbeatTimestamp: covered.timestamp,
     heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
   });
   const plan = await guardian.buildScanPlan();
   assert.ok(plan.kind === 'plan');
-  assert.throws(() => Object.assign(plan, { storedTimestamp: 0 }), TypeError);
-  for (const block of [plan.reportBlock, plan.discoveryFrom, plan.coverage]) {
+  assert.throws(() => Object.assign(plan, { heartbeatTimestampAtStart: 0 }), TypeError);
+  for (const block of [plan.discoveryRange.from, plan.discoveryRange.to, plan.previousHeartbeatBlock]) {
     assert.ok(block !== null);
     assert.throws(() => Object.assign(block, { number: 0 }), TypeError);
   }
@@ -51,19 +49,17 @@ test('Discovered owns its plan and positions without freezing constructor inputs
   const positions = [source.key];
   const discovered = new Discovered(source.plan, positions);
 
-  Object.assign(source.plan.reportBlock, { number: 1 });
-  assert.ok(source.plan.coverage !== null);
-  Object.assign(source.plan.coverage, { number: 2 });
+  Object.assign(source.plan.discoveryRange.to, { number: 1 });
+  assert.ok(source.plan.previousHeartbeatBlock !== null);
+  Object.assign(source.plan.previousHeartbeatBlock, { number: 2 });
   Object.assign(source.key, { borrower: CORE });
   positions.length = 0;
 
   assert.deepEqual(discovered.plan(), expectedPlan);
   assert.deepEqual(discovered.all(), [expectedKey]);
-  assert.equal(discovered.positions, 1);
   discovered.all().splice(0);
   assert.deepEqual(discovered.all(), [expectedKey]);
-  assert.throws(() => Object.assign(discovered, { positions: 0 }), TypeError);
-  assert.throws(() => Object.assign(discovered.plan().reportBlock, { number: 0 }), TypeError);
+  assert.throws(() => Object.assign(discovered.plan().discoveryRange.to, { number: 0 }), TypeError);
   const position = discovered.all()[0];
   assert.ok(position !== undefined);
   assert.throws(() => Object.assign(position, { borrower: CORE }), TypeError);
@@ -73,15 +69,15 @@ test('Work owns its blocks, keys, anchors and map without freezing constructor i
   const source = inputs();
   const expected = structuredClone(source);
   const work = new Work(source.plan, source.entries);
-  assert.ok(source.plan.coverage !== null);
-  Object.assign(source.plan.reportBlock, { number: 1 });
-  Object.assign(source.plan.coverage, { number: 2 });
+  assert.ok(source.plan.previousHeartbeatBlock !== null);
+  Object.assign(source.plan.discoveryRange.to, { number: 1 });
+  Object.assign(source.plan.previousHeartbeatBlock, { number: 2 });
   Object.assign(source.key, { borrower: CORE });
   Object.assign(source.anchor, { logIndex: 99 });
   source.anchors.length = 0;
   source.entries.clear();
-  assert.deepEqual(work.reportBlock, expected.plan.reportBlock);
-  assert.deepEqual(work.coverage, expected.plan.coverage);
+  assert.deepEqual(work.reportBlock, expected.plan.discoveryRange.to);
+  assert.deepEqual(work.previousHeartbeatBlock, expected.plan.previousHeartbeatBlock);
   assert.deepEqual(work.entries(), expected.entries);
   assert.deepEqual(work.all(), [expected.anchor]);
   assert.equal(work.positions, 1);

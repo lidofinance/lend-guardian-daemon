@@ -8,7 +8,7 @@ The example runs from the SDK source checkout on Node 24 or newer, after install
 
 ## Read and adapt the example
 
-1. Follow `Guardian.cycle` and its use in [`daemon.ts`](daemon.ts) to see one complete iteration and the outcomes that stop it. An observed cycle does not advance coverage; an attested cursor comes from a confirmed heartbeat.
+1. Follow `Guardian.cycle` and its use in [`daemon.ts`](daemon.ts) to see one complete iteration and the outcomes that stop it. An observed cycle does not advance coverage; an attested result returns its confirmed report block as the next cycle's optional search hint.
 2. Read `createGuardian` in the same file for the reusable viem transport, public/wallet clients, one shared `onEvent` handler and SDK limits. `main` runs one cycle at a time and owns retry timing.
 3. Implement your provider in [`screening-adapter.ts`](screening-adapter.ts). Return decisions in the original anchor order; a timeout, missing answer or unknown result must remain incomplete. Keep vendor-specific calls and policy in this adapter.
 4. Set the deployment inputs below, start in observe mode and check the reconstructed work and proposed reports. Enable signal mode only with the intended delegate and a plan for reconciling pending writes after failure.
@@ -70,7 +70,7 @@ To observe a Hoodi deployment, supply its RPC and deployment configuration and r
 CHAIN_ID=560048 MODE=observe node example/daemon.ts
 ```
 
-A completed observation prints screened and skipped counts and proposed suspect/flag counts. It stops before `signalAndHeartbeat` and does not turn the observed report block into an attested cursor. The next observation may screen the same work again until onchain coverage changes.
+A completed observation prints screened and skipped counts and proposed suspect/flag counts. It stops before `signalAndHeartbeat` and retains only the previous onchain heartbeat block. The next observation may screen the same work again until onchain coverage changes.
 
 Providers implement `ScreeningProvider` directly and own transaction deduplication, concurrency limits, caching and risk policy.
 

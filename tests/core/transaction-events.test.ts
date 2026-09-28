@@ -183,11 +183,9 @@ function batches(size = 1, useFixedReceipt = false) {
     const work = new Work(
       {
         kind: 'plan',
-        reportBlock,
-        discoveryFrom: reportBlock,
-        lookbackAnchor: 98,
-        coverage: null,
-        storedTimestamp: 0,
+        previousHeartbeatBlock: null,
+        heartbeatTimestampAtStart: 0,
+        discoveryRange: { from: reportBlock, to: reportBlock },
       },
       new Map(),
     );

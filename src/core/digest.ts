@@ -20,8 +20,8 @@ export interface CoverageBounds {
   readonly registry: Address;
   readonly guardian: Address;
   /** The block a previous heartbeat covered, or zero before the first one. */
-  readonly previousCoverage: Bytes32 | null;
-  readonly reportBlock: Bytes32;
+  readonly previousBlockHash: Bytes32 | null;
+  readonly reportBlockHash: Bytes32;
 }
 
 function anchorHash(anchor: SupplyAnchor): Bytes32 {
@@ -73,8 +73,8 @@ export function coverageDigest(anchors: readonly SupplyAnchor[], bounds: Coverag
         bounds.core,
         bounds.registry,
         bounds.guardian,
-        bounds.previousCoverage ?? zeroHash,
-        bounds.reportBlock,
+        bounds.previousBlockHash ?? zeroHash,
+        bounds.reportBlockHash,
         hashes,
       ],
     ),

@@ -6,18 +6,17 @@ import { SUPPLY_COLLATERAL_ABI } from '../../abi/Core.abi.ts';
 import { BaseRpcProvider } from '../../src/chain/base-rpc-provider.ts';
 import type { ChainLog } from '../../src/chain/rpc.ts';
 import { Markets } from '../../src/contracts/markets.ts';
-import type { Lifecycle, SupplyLog } from '../../src/contracts/markets.ts';
 import { blockAt, BORROWER, CONTROLLER, CORE, MARKET } from './fake-node.ts';
 
 const BLOCK = blockAt(100_000);
-const SUPPLY: SupplyLog = {
+const SUPPLY = {
   marketId: MARKET,
   borrower: BORROWER,
   assets: 5n,
   blockHash: BLOCK.hash,
   transactionHash: blockAt(500_000).hash,
   logIndex: 5,
-};
+} as const;
 const CLASSIFICATION: ChainLog = {
   address: CONTROLLER,
   blockHash: BLOCK.hash,
@@ -84,12 +83,12 @@ test('supply classification rejects duplicate adjacent events', async () => {
   await assert.rejects(markets.activationBefore(SUPPLY, CONTROLLER), { reason: 'supply-without-controller-event' });
 });
 
-const ACTIVATION: Lifecycle = {
+const ACTIVATION = {
   kind: 'activating',
   amount: 5n,
   position: { dust: 0n, activating: 5n, activatingStart: BLOCK.timestamp, activatingDelay: 60 },
   at: CLASSIFICATION,
-};
+} as const;
 const SUPPLY_EVENT: ChainLog = {
   ...CLASSIFICATION,
   address: CORE,

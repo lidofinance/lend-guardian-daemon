@@ -149,7 +149,7 @@ for (const [mutation, mutate] of Object.entries(REQUEST_MUTATIONS)) {
 
     assert.deepEqual(sent.calls, []);
     assert.deepEqual({ anchors: work.all(), reportBlock: work.reportBlock }, original);
-    assert.deepEqual(plan.reportBlock, original.reportBlock);
+    assert.deepEqual(plan.discoveryRange.to, original.reportBlock);
   });
 }
 
@@ -195,8 +195,8 @@ test('retained provider inputs cannot change result order, work or the heartbeat
     core: CORE,
     registry: REGISTRY,
     guardian: GUARDIAN,
-    previousCoverage: null,
-    reportBlock: original.reportBlock.hash,
+    previousBlockHash: null,
+    reportBlockHash: original.reportBlock.hash,
   });
   const screened = await guardian.screenWork(work);
   const request = requests[0];
@@ -219,7 +219,7 @@ test('retained provider inputs cannot change result order, work or the heartbeat
   const outcome = await guardian.signalAndHeartbeat(screened);
   assert.ok(outcome.kind === 'attested');
   assert.equal(outcome.digest, expectedDigest);
-  assert.deepEqual(outcome.cursor.coverageThrough, original.reportBlock);
+  assert.deepEqual(outcome.previousHeartbeatBlock, original.reportBlock);
   assert.deepEqual(sent.suspects, []);
   assert.deepEqual(sent.flags, []);
   assert.deepEqual(sent.heartbeats, [{ block: original.reportBlock.hash, digest: expectedDigest }]);

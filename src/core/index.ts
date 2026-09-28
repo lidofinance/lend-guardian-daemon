@@ -4,13 +4,13 @@ export { Guardian } from './guardian.ts';
 export type { Deployment, GuardianSetup } from './guardian.ts';
 export type {
   Attested,
+  BlockRange,
   CycleOutcome,
-  Cursor,
   Discovered,
   NothingDue,
   NothingDueReason,
   Observed,
-  Plan,
+  ScanPlan,
   Screened,
   ScreenedAnchor,
   SkippedTarget,

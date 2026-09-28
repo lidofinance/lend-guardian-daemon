@@ -14,8 +14,13 @@ const HEARTBEAT_ABI = [getAbiItem({ abi: GUARDIAN_SIGNALS_ABI, name: 'Heartbeat'
 
 const GUARDIAN_ADDED_ABI = [getAbiItem({ abi: GUARDIAN_SIGNALS_ABI, name: 'GuardianAdded' })] as const;
 
-/** The latest heartbeat's committed block and registry timestamp. */
-export interface HeartbeatLog {
+/** Chain evidence recovered for phase A of the scan cycle. */
+export interface PreviousHeartbeatEvidence {
+  readonly previousHeartbeatBlock: BlockRef | null;
+  readonly heartbeatTimestampAtStart: number;
+}
+
+interface HeartbeatLog {
   readonly blockNumber: number;
   readonly timestamp: number;
 }
@@ -75,7 +80,7 @@ export class GuardianSignals {
     return decodeFunctionResult({ ...request, data });
   }
 
-  async storedHeartbeat(at: Bytes32): Promise<number> {
+  async getHeartbeat(at: Bytes32): Promise<number> {
     const request = {
       abi: GUARDIAN_SIGNALS_ABI,
       functionName: 'getHeartbeat',
@@ -83,6 +88,32 @@ export class GuardianSignals {
     } as const;
     const data = await this.#rpc.call(this.#registry, encodeFunctionData(request), at);
     return decodeFunctionResult({ ...request, data });
+  }
+
+  /**
+   * Recover the previous heartbeat evidence required by the scan plan. The optional block is only
+   * a search hint: its canonical header is checked before it can narrow the event range.
+   */
+  async recoverPreviousHeartbeat(
+    observationBlock: BlockRef,
+    hintedPreviousHeartbeatBlock: BlockRef | null = null,
+  ): Promise<PreviousHeartbeatEvidence> {
+    const heartbeatTimestampAtStart = await this.getHeartbeat(observationBlock.hash);
+    if (heartbeatTimestampAtStart === 0) {
+      return { heartbeatTimestampAtStart, previousHeartbeatBlock: null };
+    }
+
+    const searchFrom = await this.#heartbeatSearchFrom(heartbeatTimestampAtStart, hintedPreviousHeartbeatBlock);
+    const latestHeartbeat = await this.#latestHeartbeatEvent(searchFrom, observationBlock);
+    if (latestHeartbeat?.timestamp !== heartbeatTimestampAtStart) {
+      return { heartbeatTimestampAtStart, previousHeartbeatBlock: null };
+    }
+
+    const reportedBlock = await this.#rpc.getBlock(latestHeartbeat.blockNumber);
+    return {
+      heartbeatTimestampAtStart,
+      previousHeartbeatBlock: reportedBlock.timestamp === heartbeatTimestampAtStart ? reportedBlock : null,
+    };
   }
 
   async flaggedBy(target: SignalTarget, at: Bytes32): Promise<Address[]> {
@@ -130,7 +161,24 @@ export class GuardianSignals {
     return this.#writer.send({ chainId: this.#chainId, to: this.#registry, data, value: 0n }, options);
   }
 
-  async latestHeartbeat(fromBlock: number, until: BlockRef): Promise<HeartbeatLog | null> {
+  async #heartbeatSearchFrom(
+    heartbeatTimestampAtStart: number,
+    hintedPreviousHeartbeatBlock: BlockRef | null,
+  ): Promise<number> {
+    if (hintedPreviousHeartbeatBlock === null) {
+      return this.#deploymentBlock;
+    }
+
+    const canonicalBlock = await this.#rpc.getBlock(hintedPreviousHeartbeatBlock.number);
+    if (canonicalBlock.hash !== hintedPreviousHeartbeatBlock.hash) {
+      return this.#deploymentBlock;
+    }
+    return canonicalBlock.timestamp <= heartbeatTimestampAtStart
+      ? hintedPreviousHeartbeatBlock.number
+      : this.#deploymentBlock;
+  }
+
+  async #latestHeartbeatEvent(fromBlock: number, until: BlockRef): Promise<HeartbeatLog | null> {
     const topics = encodeEventTopics({
       abi: HEARTBEAT_ABI,
       eventName: 'Heartbeat',

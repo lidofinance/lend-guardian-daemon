@@ -39,10 +39,15 @@ An application supplies:
 - a `ScreeningProvider` that returns one decision for each requested anchor, in the same order;
 - a serial cycle loop and recovery policy.
 
-Run one iteration and retain the returned cursor only when the result carries one:
+Run one iteration with the last confirmed heartbeat block as an optional search hint. The SDK
+revalidates it against current chain evidence before using it:
 
 ```ts
-const outcome = await guardian.cycle(cursor);
+let previousHeartbeatBlock: BlockRef | null = null;
+const outcome = await guardian.cycle(previousHeartbeatBlock);
+if ('previousHeartbeatBlock' in outcome) {
+  previousHeartbeatBlock = outcome.previousHeartbeatBlock;
+}
 ```
 
 `cycle` emits typed phase and terminal events through the same `onEvent` handler as RPC, transaction and report events. Missing, malformed or incomplete screening results stop the attempt before submission. In signal mode the SDK submits required suspect reports, then flag reports, verifies their canonical confirmations and finally submits and confirms the heartbeat. RPC and provider failures propagate to the application.

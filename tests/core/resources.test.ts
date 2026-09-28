@@ -70,7 +70,7 @@ test('a long dust walk crosses prior coverage and retains dust absorbed into the
   const covered = blockAt(93_000);
   const { guardian } = guardianOver({
     head: HEAD,
-    storedHeartbeat: covered.timestamp,
+    heartbeatTimestamp: covered.timestamp,
     heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
     lots: [
       {

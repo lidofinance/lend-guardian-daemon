@@ -10,7 +10,7 @@ import { pathToFileURL } from 'node:url';
 import { createPublicClient, createWalletClient, isAddressEqual } from 'viem';
 import { createViemRpcTransport, ViemRpcClient } from '../src/chain/viem-client.ts';
 import { Guardian } from '../src/core/index.ts';
-import type { Cursor, EventHandler, SdkEvent } from '../src/core/index.ts';
+import type { BlockRef, EventHandler, SdkEvent } from '../src/core/index.ts';
 import { screening } from './screening-adapter.ts';
 import { privateKeyToAccount } from 'viem/accounts';
 import * as env from './env.ts';
@@ -53,18 +53,18 @@ const SEND_ATTEMPTS = 5;
 /**
  * Schedule [scan attempts](../docs/guardian-specification.md#scan-cycle). The intervals below are
  * example policy and must be chosen for the operator's agreed SLA; the SDK supplies no scheduler.
- * [Failed attempts](../docs/guardian-specification.md#failure-handling) leave the cursor unchanged;
+ * [Failed attempts](../docs/guardian-specification.md#failure-handling) leave the heartbeat hint unchanged;
  * signal exceptions stop for reconciliation, while observe retries after a delay.
  */
 async function main(): Promise<void> {
   const mode = env.mode('MODE');
   const guardian = createGuardian(mode);
 
-  // The cursor only spares the next plan a search, so losing it on a restart costs nothing else.
-  let cursor: Cursor | undefined;
+  // This block only spares the next plan a wider event search, so losing it on restart costs nothing else.
+  let previousHeartbeatBlock: BlockRef | null = null;
   while (true) {
     try {
-      cursor = await cycle(guardian, cursor);
+      previousHeartbeatBlock = await cycle(guardian, previousHeartbeatBlock);
     } catch (error) {
       console.error('cycle failed:', error);
       // A failed send may still have reached the chain. This example has no pending-write journal.
@@ -84,31 +84,31 @@ async function main(): Promise<void> {
 
 /**
  * Run one [scan cycle](../docs/guardian-specification.md#scan-cycle) and retain only confirmed
- * coverage. A stale or observed result leaves the previous cursor unchanged.
+ * coverage. A stale result leaves the previous heartbeat hint unchanged.
  */
-export async function cycle(guardian: Guardian, hint: Cursor | undefined): Promise<Cursor | undefined> {
-  const outcome = await guardian.cycle(hint);
+export async function cycle(guardian: Guardian, previousHeartbeatBlock: BlockRef | null): Promise<BlockRef | null> {
+  const outcome = await guardian.cycle(previousHeartbeatBlock);
   if (outcome.kind === 'observed') {
     const { screened } = outcome;
     console.log(
       `observed: ${screened.results.length} screened, ${screened.skipped.length} targets already flagged, ` +
         `${screened.suspects.length} suspects, ${screened.flags.length} flags; no transactions sent`,
     );
-    return hint;
+    return outcome.previousHeartbeatBlock;
   }
   if (outcome.kind === 'stale') {
     console.log(`plan went stale: ${outcome.reason}`);
-    return hint;
+    return previousHeartbeatBlock;
   }
   if (outcome.kind === 'nothing-due') {
     console.log(`nothing due: ${outcome.reason}`);
-    return outcome.cursor;
+    return outcome.previousHeartbeatBlock;
   }
 
   console.log(
-    `attested block ${outcome.cursor.verifiedAt.number}: heartbeat ${outcome.heartbeat}, digest ${outcome.digest}`,
+    `attested block ${outcome.previousHeartbeatBlock.number}: heartbeat ${outcome.heartbeat}, digest ${outcome.digest}`,
   );
-  return outcome.cursor;
+  return outcome.previousHeartbeatBlock;
 }
 
 /** Keep the example's progress readable while retaining every lower-level SDK event. */

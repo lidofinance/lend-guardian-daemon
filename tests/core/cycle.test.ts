@@ -108,7 +108,7 @@ test('observe cycle returns screened evidence and never submits', async () => {
 
   const outcome = await guardian.cycle();
   assert.equal(outcome.kind, 'observed');
-  assert.equal(outcome.cursor, undefined);
+  assert.equal(outcome.previousHeartbeatBlock, null);
   assert.equal(outcome.screened.results.length, 1);
   assert.equal(outcome.screened.flags.length, 1);
   assert.deepEqual(node.sent.calls, []);

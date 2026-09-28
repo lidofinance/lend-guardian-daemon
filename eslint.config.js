@@ -119,12 +119,20 @@ export default defineConfig([
   },
   {
     // Keep the backward walk, coverage checkpoint and activation evidence checks together.
-    files: ['src/core/guardian.ts'],
+    files: ['src/contracts/markets.ts'],
     rules: {
       'max-statements': ['error', 50],
       'max-lines-per-function': ['error', { max: 85, skipBlankLines: true, skipComments: true }],
       complexity: ['error', 28],
       'max-depth': ['error', 4],
+    },
+  },
+  {
+    // Keep the five cycle phases and their application events visible in execution order.
+    files: ['src/core/guardian.ts'],
+    rules: {
+      'max-statements': ['error', 30],
+      'max-lines-per-function': ['error', { max: 85, skipBlankLines: true, skipComments: true }],
     },
   },
   {

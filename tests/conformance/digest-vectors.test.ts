@@ -56,8 +56,9 @@ function boundsOf(value: Record<string, unknown>): CoverageBounds {
     core: addressOf(value.core, 'core'),
     registry: addressOf(value.registry, 'registry'),
     guardian: addressOf(value.guardian, 'guardian'),
-    previousCoverage: value.previousCoverage === null ? null : bytes32Of(value.previousCoverage, 'previous coverage'),
-    reportBlock: bytes32Of(value.reportBlock, 'report block'),
+    previousBlockHash:
+      value.previousCoverage === null ? null : bytes32Of(value.previousCoverage, 'previous block hash'),
+    reportBlockHash: bytes32Of(value.reportBlock, 'report block hash'),
   };
 }
 

@@ -135,7 +135,7 @@ export interface Script {
   readonly isGuardian?: boolean;
   /** The delegate the registry names for the Guardian, or none. */
   readonly delegate?: Address;
-  readonly storedHeartbeat?: number;
+  readonly heartbeatTimestamp?: number;
   readonly heartbeats?: readonly Heartbeat[];
   readonly guardianAddedAt?: number;
   /** The controller a market names, or null when it has none. */
@@ -309,7 +309,7 @@ function callAnswer(script: Script, params: readonly unknown[]): unknown {
     return padHex(script.delegate ?? zeroAddress, { size: 32 });
   }
   if (data.startsWith(SELECTOR.getHeartbeat)) {
-    return padHex(numberToHex(script.storedHeartbeat ?? 0), { size: 32 });
+    return padHex(numberToHex(script.heartbeatTimestamp ?? 0), { size: 32 });
   }
   if (data.startsWith(SELECTOR.marketController)) {
     const controller = script.controller === undefined ? CONTROLLER : script.controller;

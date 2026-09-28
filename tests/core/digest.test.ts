@@ -30,8 +30,8 @@ const BOUNDS: CoverageBounds = {
   core: CORE,
   registry: REGISTRY,
   guardian: GUARDIAN,
-  previousCoverage: null,
-  reportBlock: padHex('0xa', { size: 32 }),
+  previousBlockHash: null,
+  reportBlockHash: padHex('0xa', { size: 32 }),
 };
 
 test('one anchor commits to the value cast computes from the fields the specification lists', () => {
@@ -63,8 +63,8 @@ test('every bound changes the commitment, so none of them can be swapped silentl
     { ...BOUNDS, core: REGISTRY },
     { ...BOUNDS, registry: CORE },
     { ...BOUNDS, guardian: BORROWER },
-    { ...BOUNDS, previousCoverage: padHex('0xb', { size: 32 }) },
-    { ...BOUNDS, reportBlock: padHex('0xc', { size: 32 }) },
+    { ...BOUNDS, previousBlockHash: padHex('0xb', { size: 32 }) },
+    { ...BOUNDS, reportBlockHash: padHex('0xc', { size: 32 }) },
   ];
   for (const bounds of changed) {
     assert.notEqual(coverageDigest([ANCHOR], bounds), base);
@@ -86,6 +86,6 @@ test('every anchor field changes the commitment', () => {
   }
 });
 
-test('an absent previous coverage is the zero word, not an omitted field', () => {
-  assert.equal(coverageDigest([ANCHOR], BOUNDS), coverageDigest([ANCHOR], { ...BOUNDS, previousCoverage: zeroHash }));
+test('an absent previous block hash is the zero word, not an omitted field', () => {
+  assert.equal(coverageDigest([ANCHOR], BOUNDS), coverageDigest([ANCHOR], { ...BOUNDS, previousBlockHash: zeroHash }));
 });

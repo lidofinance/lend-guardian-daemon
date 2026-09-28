@@ -1,5 +1,5 @@
 import type { Address, BlockRef, Bytes32, MarketId, TxHash } from './common/types.ts';
-import type { CycleOutcome, NothingDue, Plan, ScreenedAnchor, SkippedTarget } from './core/outcomes.ts';
+import type { CycleOutcome, NothingDue, ScanPlan, ScreenedAnchor, SkippedTarget } from './core/outcomes.ts';
 import type { PositionKey, SignalTarget, SupplyAnchor } from './core/types.ts';
 
 /** Correlation data shared by every event emitted during one Guardian cycle. */
@@ -85,7 +85,7 @@ export type CycleEvent = CycleContext &
       }
     | {
         readonly event: 'cycle.planned';
-        readonly result: Plan | NothingDue;
+        readonly result: ScanPlan | NothingDue;
       }
     | {
         readonly event: 'cycle.discovered';

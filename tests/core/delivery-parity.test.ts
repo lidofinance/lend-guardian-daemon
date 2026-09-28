@@ -85,11 +85,9 @@ test('an orphaned first report stops Guardian before its second batch or heartbe
   const work = new Work(
     {
       kind: 'plan',
-      reportBlock,
-      discoveryFrom: reportBlock,
-      lookbackAnchor: 9,
-      coverage: null,
-      storedTimestamp: 0,
+      previousHeartbeatBlock: null,
+      heartbeatTimestampAtStart: 0,
+      discoveryRange: { from: reportBlock, to: reportBlock },
     },
     new Map(),
   );

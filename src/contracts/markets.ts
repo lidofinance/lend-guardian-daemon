@@ -8,6 +8,7 @@ import {
   pad,
   parseEventLogs,
   toEventSelector,
+  zeroAddress,
 } from 'viem';
 import type { ParseEventLogsReturnType } from 'viem';
 import { MARKET_CONTROLLER_ABI } from '../../abi/MarketController.abi.ts';
@@ -16,7 +17,8 @@ import { byLogPosition } from '../chain/log-order.ts';
 import type { LogPosition } from '../chain/log-order.ts';
 import type { RpcProvider, ChainLog } from '../chain/rpc.ts';
 import { decodeLogs } from './decode-logs.ts';
-import type { PositionKey } from '../core/types.ts';
+import type { ScanPlan } from '../core/outcomes.ts';
+import type { PositionKey, SupplyAnchor } from '../core/types.ts';
 import { GuardianStop } from '../core/stop.ts';
 import { lower } from '../common/types.ts';
 import type { Address, BlockRef, Bytes32, ContractDeployment, MarketId, TxHash } from '../common/types.ts';
@@ -31,7 +33,7 @@ interface LogRef extends LogPosition {
 }
 
 /** A borrower's delayed collateral after the event that changed it. */
-export interface Position {
+interface Position {
   readonly dust: bigint;
   readonly activating: bigint;
   /** The base deadline is `activatingStart + activatingDelay`; zero start means no timer. */
@@ -42,7 +44,7 @@ export interface Position {
 type LifecycleKind = 'dusted' | 'activating' | 'activated' | 'drained';
 
 /** One controller event for one borrower: every change to `dust`, `activating` and the timer. */
-export interface Lifecycle {
+interface LifecycleEvent {
   readonly kind: LifecycleKind;
   readonly amount: bigint;
   readonly position: Position;
@@ -50,7 +52,7 @@ export interface Lifecycle {
 }
 
 /** One `SupplyCollateral`, reduced to what discovery and reconstruction compare. */
-export interface SupplyLog {
+interface SupplyLog {
   readonly marketId: MarketId;
   readonly borrower: Address;
   readonly assets: bigint;
@@ -60,13 +62,18 @@ export interface SupplyLog {
 }
 
 /** A `CollateralActivating` that classified a supply: the timer it set, and where it was logged. */
-export interface Activation {
+interface Activation {
   readonly position: Position;
   readonly blockNumber: number;
 }
 
-/** A log as the node returns it, before the core knows which event it is. */
-type ReceiptLog = ChainLog;
+type LifecycleEventStream = AsyncGenerator<LifecycleEvent>;
+
+/** A reconstructed anchor and the block where it entered `activating`. */
+interface AnchorActivation {
+  readonly anchor: SupplyAnchor;
+  readonly activationBlock: bigint;
+}
 
 /** A `SupplyCollateral` as a log query decodes it. */
 type SupplyCollateralLog = ParseEventLogsReturnType<typeof SUPPLY_COLLATERAL_ABI, undefined, true>[number];
@@ -81,7 +88,7 @@ const LIFECYCLE_TOPICS = [
   toEventSelector(getAbiItem({ abi: MARKET_CONTROLLER_ABI, name: 'CollateralDrained' })),
 ];
 
-const LIFECYCLE_KINDS: Record<LifecycleLog['eventName'], Lifecycle['kind']> = {
+const LIFECYCLE_KINDS: Record<LifecycleLog['eventName'], LifecycleEvent['kind']> = {
   CollateralDusted: 'dusted',
   CollateralActivating: 'activating',
   CollateralActivated: 'activated',
@@ -100,12 +107,43 @@ export class Markets {
   readonly #deploymentBlock: number;
   readonly #controllers = new Map<MarketId, Address>();
   readonly #registries = new Map<Address, Address>();
-  readonly #blockLogs = new Map<string, Promise<ReceiptLog[]>>();
+  readonly #blockLogs = new Map<string, Promise<ChainLog[]>>();
 
   constructor(rpc: RpcProvider, deployment: ContractDeployment) {
     this.#rpc = rpc;
     this.#core = deployment.address;
     this.#deploymentBlock = deployment.deploymentBlock;
+  }
+
+  /** Discover every position that may require screening under Appendix B. */
+  async discoverCandidatePositions(plan: ScanPlan, targetRegistry: Address): Promise<PositionKey[]> {
+    const supplies = await this.supplies({
+      fromBlock: plan.discoveryRange.from.number,
+      toBlock: plan.discoveryRange.to.number,
+    });
+    const candidatesByPosition = new Map<string, PositionKey>();
+    for (const supply of supplies) {
+      const position = await this.#candidatePositionFromSupply(plan, supply, targetRegistry);
+      if (position !== null) {
+        candidatesByPosition.set(`${position.marketId}:${position.borrower}`, position);
+      }
+    }
+    return [...candidatesByPosition.values()];
+  }
+
+  /** Reconstruct the uncovered contributors for every candidate position under Appendix C. */
+  async reconstructWork(
+    plan: ScanPlan,
+    positions: readonly PositionKey[],
+  ): Promise<ReadonlyMap<PositionKey, readonly SupplyAnchor[]>> {
+    const byPosition = new Map<PositionKey, readonly SupplyAnchor[]>();
+    for (const position of positions) {
+      const anchors = await this.#reconstructPosition(plan, position);
+      if (anchors.length > 0) {
+        byPosition.set(position, anchors);
+      }
+    }
+    return byPosition;
   }
 
   /** Read the discovery window or one historical block without applying cycle policy. */
@@ -178,7 +216,7 @@ export class Markets {
   }
 
   /** The zero-boundary shortcut requires exactly one core supply paired with the activation. */
-  async supplyAfter(position: PositionKey, activation: Lifecycle): Promise<SupplyLog> {
+  async supplyAfter(position: PositionKey, activation: LifecycleEvent): Promise<SupplyLog> {
     const supplies = await this.supplies({
       fromBlock: Number(activation.at.blockNumber),
       toBlock: Number(activation.at.blockNumber),
@@ -192,7 +230,7 @@ export class Markets {
   }
 
   /** The controller's lifecycle events for one borrower, newest first. */
-  async *lifecycleBack(position: PositionKey, until: BlockRef): AsyncGenerator<Lifecycle> {
+  async *lifecycleBack(position: PositionKey, until: BlockRef): AsyncGenerator<LifecycleEvent> {
     const floor = this.#deploymentBlock;
     const borrower = pad(position.borrower, { size: 32 });
     for await (const logs of this.#rpc.logBatches(
@@ -210,8 +248,180 @@ export class Markets {
     }
   }
 
+  async #candidatePositionFromSupply(
+    plan: ScanPlan,
+    supply: SupplyLog,
+    targetRegistry: Address,
+  ): Promise<PositionKey | null> {
+    const controller = await this.controllerOf(supply.marketId, plan.discoveryRange.to.hash);
+    if (controller === zeroAddress) {
+      return null;
+    }
+    const reportsTo = await this.registryOf(controller, plan.discoveryRange.to.hash);
+    if (!isAddressEqual(reportsTo, targetRegistry)) {
+      return null;
+    }
+
+    const activation = await this.activationBefore(supply, controller);
+    if (activation === null) {
+      return null;
+    }
+    const deadline = activation.position.activatingStart + activation.position.activatingDelay;
+    if (deadline > plan.discoveryRange.to.timestamp) {
+      return null;
+    }
+    if (!this.#requiresCurrentCoverage(plan.previousHeartbeatBlock, activation.blockNumber, deadline)) {
+      return null;
+    }
+    return { controller: lower(controller), marketId: supply.marketId, borrower: supply.borrower };
+  }
+
+  #requiresCurrentCoverage(
+    previousHeartbeatBlock: BlockRef | null,
+    activationBlockNumber: number,
+    deadline: number,
+  ): boolean {
+    return (
+      previousHeartbeatBlock === null ||
+      activationBlockNumber > previousHeartbeatBlock.number ||
+      deadline > previousHeartbeatBlock.timestamp
+    );
+  }
+
+  async #reconstructPosition(plan: ScanPlan, position: PositionKey): Promise<SupplyAnchor[]> {
+    const events = this.lifecycleBack(position, plan.discoveryRange.to);
+    const activationBlockByAnchor = new Map<string, AnchorActivation>();
+    let positionAtPreviousHeartbeat: Position | null = null;
+    let current = await this.#readOlderLifecycleEvent(events);
+    if (current === null) {
+      throw new GuardianStop('position-without-history');
+    }
+    if (!this.#isBaseActivationDeadlineReached(current.position, plan.discoveryRange.to.timestamp)) {
+      return [];
+    }
+
+    while (true) {
+      if (plan.previousHeartbeatBlock !== null && positionAtPreviousHeartbeat === null) {
+        const isAtOrBeforePreviousHeartbeat = current.at.blockNumber <= BigInt(plan.previousHeartbeatBlock.number);
+        if (isAtOrBeforePreviousHeartbeat) {
+          positionAtPreviousHeartbeat = current.position;
+        }
+      }
+
+      if (current.kind === 'activating') {
+        if (current.position.dust !== 0n || current.position.activating < current.amount) {
+          throw new GuardianStop('position-history-broken');
+        }
+
+        const activationBlock = current.at.blockNumber;
+        const directAnchor = this.#supplyAnchorFromLifecycleEvent(current, position);
+        activationBlockByAnchor.set(`${directAnchor.transactionHash}:${directAnchor.logIndex}`, {
+          anchor: directAnchor,
+          activationBlock,
+        });
+        const startedFromZero = current.position.activating === current.amount;
+        const pairedSupply = startedFromZero ? await this.supplyAfter(position, current) : null;
+        if (pairedSupply?.assets === current.amount) {
+          break;
+        }
+
+        const previousEvent = await this.#readOlderLifecycleEvent(events);
+        if (pairedSupply !== null && current.amount !== pairedSupply.assets + (previousEvent?.position.dust ?? 0n)) {
+          throw new GuardianStop('position-history-broken');
+        }
+        const hasAbsorbedDust = previousEvent !== null && previousEvent.position.dust > 0n;
+        if (hasAbsorbedDust) {
+          const dust = await this.#findAbsorbedDustEvent(events, previousEvent, plan.previousHeartbeatBlock);
+          positionAtPreviousHeartbeat ??= dust.positionAtPreviousHeartbeat;
+          const dustAnchor = this.#supplyAnchorFromLifecycleEvent(dust.event, position);
+          activationBlockByAnchor.set(`${dustAnchor.transactionHash}:${dustAnchor.logIndex}`, {
+            anchor: dustAnchor,
+            activationBlock,
+          });
+        }
+
+        if (startedFromZero) {
+          break;
+        }
+        current = hasAbsorbedDust ? await this.#readOlderLifecycleEvent(events) : previousEvent;
+        if (current === null) {
+          throw new GuardianStop('position-history-broken');
+        }
+        continue;
+      }
+
+      if (current.position.activating <= 0n) {
+        throw new GuardianStop('position-history-broken');
+      }
+      current = await this.#readOlderLifecycleEvent(events);
+      if (current === null) {
+        throw new GuardianStop('position-history-broken');
+      }
+    }
+
+    const contributors = [...activationBlockByAnchor.values()];
+    const wasDueAtPreviousHeartbeat =
+      plan.previousHeartbeatBlock !== null &&
+      positionAtPreviousHeartbeat !== null &&
+      this.#isBaseActivationDeadlineReached(positionAtPreviousHeartbeat, plan.previousHeartbeatBlock.timestamp);
+    if (!wasDueAtPreviousHeartbeat) {
+      return contributors.map((contributor) => contributor.anchor);
+    }
+    const previousHeartbeatBlockNumber = BigInt(plan.previousHeartbeatBlock.number);
+    return contributors
+      .filter((contributor) => contributor.activationBlock > previousHeartbeatBlockNumber)
+      .map((contributor) => contributor.anchor);
+  }
+
+  async #readOlderLifecycleEvent(events: LifecycleEventStream): Promise<LifecycleEvent | null> {
+    const next = await events.next();
+    return next.done === true ? null : next.value;
+  }
+
+  async #findAbsorbedDustEvent(
+    events: LifecycleEventStream,
+    newest: LifecycleEvent,
+    previousHeartbeatBlock: BlockRef | null,
+  ): Promise<{ readonly event: LifecycleEvent; readonly positionAtPreviousHeartbeat: Position | null }> {
+    let positionAtPreviousHeartbeat: Position | null = null;
+    let current: LifecycleEvent | null = newest;
+    while (true) {
+      if (current === null || current.position.dust <= 0n) {
+        throw new GuardianStop('position-history-broken');
+      }
+      if (previousHeartbeatBlock !== null && positionAtPreviousHeartbeat === null) {
+        const isAtOrBeforePreviousHeartbeat = current.at.blockNumber <= BigInt(previousHeartbeatBlock.number);
+        if (isAtOrBeforePreviousHeartbeat) {
+          positionAtPreviousHeartbeat = current.position;
+        }
+      }
+      if (current.kind === 'dusted') {
+        if (current.position.dust !== current.amount) {
+          throw new GuardianStop('position-history-broken');
+        }
+        return { event: current, positionAtPreviousHeartbeat };
+      }
+      current = await this.#readOlderLifecycleEvent(events);
+    }
+  }
+
+  #isBaseActivationDeadlineReached(position: Position, at: number): boolean {
+    return position.activating > 0n && position.activatingStart + position.activatingDelay <= at;
+  }
+
+  #supplyAnchorFromLifecycleEvent(event: LifecycleEvent, position: PositionKey): SupplyAnchor {
+    return {
+      core: this.#core,
+      blockHash: event.at.blockHash,
+      transactionHash: event.at.transactionHash,
+      logIndex: event.at.logIndex + 1,
+      marketId: position.marketId,
+      borrower: position.borrower,
+    };
+  }
+
   /** The controller's logs of one block, read once however many of the block's supplies it classified. */
-  #logsOf(controller: Address, blockHash: Bytes32): Promise<ReceiptLog[]> {
+  #logsOf(controller: Address, blockHash: Bytes32): Promise<ChainLog[]> {
     const cacheKey = `${controller}:${blockHash}`;
     const cachedLogs = this.#blockLogs.get(cacheKey);
     if (cachedLogs !== undefined) {
@@ -225,7 +435,7 @@ export class Markets {
   }
 
   /** The activation named by the classification immediately before a supply. */
-  #activationOf(log: ReceiptLog, borrower: Address): Activation | null {
+  #activationOf(log: ChainLog, borrower: Address): Activation | null {
     const [classification] = parseEventLogs({
       abi: MARKET_CONTROLLER_ABI,
       eventName: ['CollateralDusted', 'CollateralActivating', 'CollateralActivated'],
@@ -252,7 +462,7 @@ export class Markets {
     };
   }
 
-  #isPairedWith(supply: SupplyLog, activation: Lifecycle, position: PositionKey): boolean {
+  #isPairedWith(supply: SupplyLog, activation: LifecycleEvent, position: PositionKey): boolean {
     const isSameTransaction =
       supply.blockHash === activation.at.blockHash && supply.transactionHash === activation.at.transactionHash;
     if (!isSameTransaction) {
@@ -267,7 +477,7 @@ export class Markets {
     return supply.marketId === position.marketId;
   }
 
-  #lifecycleOf(log: LifecycleLog): Lifecycle {
+  #lifecycleOf(log: LifecycleLog): LifecycleEvent {
     return {
       kind: LIFECYCLE_KINDS[log.eventName],
       amount: log.args.amount,

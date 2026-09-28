@@ -6,22 +6,21 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { isAddressEqual, zeroAddress } from 'viem';
 import { Markets } from '../contracts/markets.ts';
-import type { Lifecycle, Position, SupplyLog } from '../contracts/markets.ts';
 import { GuardianSignals } from '../contracts/guardian-signals.ts';
+import type { PreviousHeartbeatEvidence } from '../contracts/guardian-signals.ts';
 import { BroadcastFailure, replacementFee } from '../chain/rpc.ts';
 import type { PreparedTransaction, ReceiptRef, RpcClient, RpcProvider, TransactionAttempt } from '../chain/rpc.ts';
 import { emitEvent } from '../events.ts';
 import type { CycleContext, EventHandler, OperationContext, ReportContext, TransactionContext } from '../events.ts';
-import type { PositionKey, SignalTarget, SupplyAnchor } from './types.ts';
+import type { SignalTarget } from './types.ts';
 import { Discovered, Screened, Work } from './outcomes.ts';
 import type {
   Attested,
   CycleOutcome,
-  Cursor,
   NothingDue,
   NothingDueReason,
   PendingTarget,
-  Plan,
+  ScanPlan,
   ScreeningTargets,
   SkippedTarget,
   Stale,
@@ -31,18 +30,9 @@ import { coverageDigest } from './digest.ts';
 import type { CoverageBounds } from './digest.ts';
 import type { ScreeningProvider } from './screening-provider.ts';
 import { GuardianStop } from './stop.ts';
-import { lower } from '../common/types.ts';
 import { requireDefined, requireInteger } from '../common/validation.ts';
 import { frozenCopy } from '../common/immutable.ts';
 import type { Address, BlockRef, Bytes32, ContractDeployment, MarketId } from '../common/types.ts';
-
-type LifecycleEvents = AsyncGenerator<Lifecycle>;
-
-/** A reconstructed anchor and the block where it entered `activating`. */
-interface AnchorActivation {
-  readonly anchor: SupplyAnchor;
-  readonly activationBlock: bigint;
-}
 
 /** The deployment a Guardian screens. Every field is fixed for the life of the process. */
 export interface Deployment {
@@ -161,7 +151,7 @@ export class Guardian {
    * Run one complete [scan cycle](../../docs/guardian-specification.md#scan-cycle). The caller owns
    * scheduling and recovery between calls; observe mode returns the screened result without writes.
    */
-  async cycle(hint?: Cursor): Promise<CycleOutcome> {
+  async cycle(previousHeartbeatBlock?: BlockRef | null): Promise<CycleOutcome> {
     if (this.#activeCycle !== undefined) {
       throw new Error('another cycle is in progress');
     }
@@ -170,7 +160,7 @@ export class Guardian {
     this.#activeCycle = context;
     emitEvent(this.#setup.onEvent, { event: 'cycle.started', ...context, startedAt });
     try {
-      const planned = await this.buildScanPlan(hint);
+      const planned = await this.buildScanPlan(previousHeartbeatBlock);
       if (planned.kind === 'nothing-due') {
         const outcome = frozenCopy(planned);
         emitEvent(this.#setup.onEvent, { event: 'cycle.planned', ...context, result: outcome });
@@ -190,7 +180,7 @@ export class Guardian {
       emitEvent(this.#setup.onEvent, {
         event: 'cycle.discovered',
         ...context,
-        reportBlock: plan.reportBlock,
+        reportBlock: plan.discoveryRange.to,
         positions: discovered.all(),
       });
       const work = await this.reconstructWork(discovered);
@@ -213,7 +203,11 @@ export class Guardian {
       });
       const outcome: CycleOutcome =
         this.#setup.mode === 'observe'
-          ? Object.freeze({ kind: 'observed', cursor: frozenCopy(hint), screened })
+          ? Object.freeze({
+              kind: 'observed',
+              previousHeartbeatBlock: frozenCopy(work.previousHeartbeatBlock),
+              screened,
+            })
           : frozenCopy(await this.signalAndHeartbeat(screened));
       emitEvent(this.#setup.onEvent, {
         event: 'cycle.finished',
@@ -240,48 +234,40 @@ export class Guardian {
   /**
    * Choose coverage and recover the prior heartbeat: [scan phase 1](../../docs/guardian-specification.md#scan-cycle)
    * and [Appendix A](../../docs/guardian-specification.md#a-build-the-scan-plan).
-   * The SDK's optional cursor only narrows the event search; chain evidence still establishes coverage.
+   * The optional previous heartbeat block only narrows the event search; chain evidence still
+   * establishes the stored timestamp and reusable block.
    */
-  async buildScanPlan(hint?: Cursor): Promise<Plan | NothingDue> {
-    const observed = await this.#rpc.getBlock();
-    await this.#requireConfigured(observed.hash);
+  async buildScanPlan(previousHeartbeatBlock?: BlockRef | null): Promise<ScanPlan | NothingDue> {
+    const observationBlock = await this.#rpc.getBlock();
+    await this.#requireGuardianConfiguration(observationBlock.hash);
 
-    const storedTimestamp = await this.#registry.storedHeartbeat(observed.hash);
-    const coverage = await this.#coverageThrough(storedTimestamp, observed, hint);
-    const cursor: Cursor = { coverageThrough: coverage, storedTimestamp, verifiedAt: observed };
+    const previousHeartbeatEvidence = await this.#registry.recoverPreviousHeartbeat(
+      observationBlock,
+      previousHeartbeatBlock,
+    );
 
     const { deploymentBlock } = this.#setup.deployment.lidoLend;
     const { reportBlockLag } = this.#setup;
-    if (observed.number - reportBlockLag < deploymentBlock) {
-      return nothingDue(cursor, 'report-block-before-core-deployment');
+    if (observationBlock.number - reportBlockLag < deploymentBlock) {
+      return nothingDue(previousHeartbeatEvidence.previousHeartbeatBlock, 'report-block-before-core-deployment');
     }
-    const reportBlock = await this.#rpc.getBlock(observed.number - reportBlockLag);
-    if (reportBlock.timestamp <= storedTimestamp) {
-      return nothingDue(cursor, 'report-block-not-past-stored-heartbeat');
+    const reportBlock = await this.#rpc.getBlock(observationBlock.number - reportBlockLag);
+    if (reportBlock.timestamp <= previousHeartbeatEvidence.heartbeatTimestampAtStart) {
+      return nothingDue(previousHeartbeatEvidence.previousHeartbeatBlock, 'report-block-not-past-stored-heartbeat');
     }
-    return this.#planFrom(cursor, reportBlock);
+    return this.#completeScanPlan(previousHeartbeatEvidence, observationBlock, reportBlock);
   }
 
   /**
    * Find the positions that may be due: [scan phase 2](../../docs/guardian-specification.md#scan-cycle)
    * and [Appendix B](../../docs/guardian-specification.md#b-discover-candidate-positions).
    */
-  async discoverCandidatePositions(plan: Plan): Promise<Discovered> {
+  async discoverCandidatePositions(plan: ScanPlan): Promise<Discovered> {
     const markets = new Markets(this.#rpc, this.#setup.deployment.lidoLend);
-    await this.#requireBlock(plan.reportBlock);
-    const supplies = await markets.supplies({
-      fromBlock: plan.discoveryFrom.number,
-      toBlock: plan.reportBlock.number,
-    });
-    await this.#requireBlock(plan.reportBlock);
-    const candidatesByPosition = new Map<string, PositionKey>();
-    for (const supply of supplies) {
-      const position = await this.#candidateOf(plan, supply, markets);
-      if (position !== null) {
-        candidatesByPosition.set(`${position.marketId}:${position.borrower}`, position);
-      }
-    }
-    return new Discovered(plan, [...candidatesByPosition.values()]);
+    await this.#requireCanonicalBlock(plan.discoveryRange.to);
+    const positions = await markets.discoverCandidatePositions(plan, this.#setup.deployment.guardianSignals.address);
+    await this.#requireCanonicalBlock(plan.discoveryRange.to);
+    return new Discovered(plan, positions);
   }
 
   /**
@@ -291,13 +277,7 @@ export class Guardian {
   async reconstructWork(discovered: Discovered): Promise<Work> {
     const plan = discovered.plan();
     const markets = new Markets(this.#rpc, this.#setup.deployment.lidoLend);
-    const byPosition = new Map<PositionKey, readonly SupplyAnchor[]>();
-    for (const position of discovered.all()) {
-      const anchors = await this.#reconstructPosition(plan, position, markets);
-      if (anchors.length > 0) {
-        byPosition.set(position, anchors);
-      }
-    }
+    const byPosition = await markets.reconstructWork(plan, discovered.all());
     return new Work(plan, byPosition);
   }
 
@@ -340,30 +320,23 @@ export class Guardian {
       }
       const work = screened.work();
       if (!this.#isHeartbeatDue(work)) {
-        return nothingDue(
-          {
-            coverageThrough: work.coverage,
-            storedTimestamp: work.storedTimestamp,
-            verifiedAt: work.reportBlock,
-          },
-          'no-work-and-idle-heartbeat-not-due',
-        );
+        return nothingDue(work.previousHeartbeatBlock, 'no-work-and-idle-heartbeat-not-due');
       }
 
-      const reported = await this.#report(screened);
+      const reported = await this.#submitRequiredSignals(screened);
       if ('kind' in reported) {
         return reported;
       }
 
-      const staleReason = await this.#invalidation(work);
+      const staleReason = await this.#planInvalidationReason(work);
       if (staleReason !== null) {
         return { kind: 'stale', reason: staleReason };
       }
-      if (!(await this.#isEveryReportConfirmed(reported))) {
+      if (!(await this.#areAllReportsConfirmed(reported))) {
         return { kind: 'stale', reason: 'report-no-longer-confirmed' };
       }
 
-      return await this.#heartbeat(work);
+      return await this.#submitHeartbeat(work);
     } finally {
       this.#isWriting = false;
     }
@@ -384,8 +357,11 @@ export class Guardian {
     }
     const client = this.#setup.client;
     const signer = requireDefined('client.signer', client.signer);
-    const cycle = this.#activeCycle === undefined ? {} : this.#activeCycle;
-    const context: TransactionContext = Object.freeze({ method: 'cancel', operationId: randomUUID(), ...cycle });
+    const context: TransactionContext = Object.freeze({
+      method: 'cancel',
+      operationId: randomUUID(),
+      ...(this.#activeCycle ?? {}),
+    });
     const deadline = Date.now() + client.transactionPolicy.sendTimeoutMs;
     this.#isWriting = true;
     try {
@@ -551,7 +527,7 @@ export class Guardian {
     }
   }
 
-  async #requireConfigured(at: Bytes32): Promise<void> {
+  async #requireGuardianConfiguration(at: Bytes32): Promise<void> {
     await this.#requireChain();
 
     const isMember = await this.#registry.isGuardian(at);
@@ -582,71 +558,34 @@ export class Guardian {
   }
 
   /**
-   * The block a previous heartbeat covered, or null when there is none to reuse. The stored
-   * timestamp alone does not name a block, so the latest `Heartbeat` must carry it and name a block
-   * whose header carries it too. A `Heartbeat` whose event timestamp has since been overtaken, or
-   * whose block does not carry that timestamp, names no coverage boundary and is refused.
-   */
-  async #coverageThrough(
-    storedTimestamp: number,
-    observed: BlockRef,
-    hint: Cursor | undefined,
-  ): Promise<BlockRef | null> {
-    if (storedTimestamp === 0) {
-      return null;
-    }
-
-    const searchFrom = await this.#heartbeatSearchFrom(storedTimestamp, hint);
-    const latestHeartbeat = await this.#registry.latestHeartbeat(searchFrom, observed);
-    if (latestHeartbeat?.timestamp !== storedTimestamp) {
-      return null;
-    }
-
-    const reported = await this.#rpc.getBlock(latestHeartbeat.blockNumber);
-    return reported.timestamp === storedTimestamp ? reported : null;
-  }
-
-  /**
-   * The first block the search for the latest `Heartbeat` needs. A reusable heartbeat names the one
-   * canonical block whose header carries the stored timestamp, and lands after that block. A hinted
-   * block that is still canonical, and whose header is not later than the stored timestamp, therefore
-   * lies at or before it and bounds the search. The header read here decides, never the timestamp the
-   * hint carries. Without such a hint the search reaches the registry's deployment.
-   */
-  async #heartbeatSearchFrom(storedTimestamp: number, hint: Cursor | undefined): Promise<number> {
-    const floor = this.#setup.deployment.guardianSignals.deploymentBlock;
-    const hinted = hint?.coverageThrough ?? null;
-    if (hinted === null) {
-      return floor;
-    }
-
-    const current = await this.#rpc.getBlock(hinted.number);
-    if (current.hash !== hinted.hash) {
-      return floor;
-    }
-    return current.timestamp <= storedTimestamp ? hinted.number : floor;
-  }
-
-  /**
    * The discovery window. It reaches back one full activation lookback before the coverage
    * boundary, because an event that set a deadline still in the future at that boundary lies before
    * it, and the lot it started is this cycle's work.
    */
-  async #planFrom(cursor: Cursor, reportBlock: BlockRef): Promise<Plan | NothingDue> {
-    const lookbackAnchor = await this.#lookbackAnchor(reportBlock, cursor);
-    if (typeof lookbackAnchor !== 'number') {
-      return lookbackAnchor;
+  async #completeScanPlan(
+    previousHeartbeatEvidence: PreviousHeartbeatEvidence,
+    observationBlock: BlockRef,
+    reportBlock: BlockRef,
+  ): Promise<ScanPlan | NothingDue> {
+    const lookbackAnchorNumber = await this.#findLookbackAnchorNumber(
+      previousHeartbeatEvidence.previousHeartbeatBlock,
+      observationBlock,
+      reportBlock,
+    );
+    if (typeof lookbackAnchorNumber !== 'number') {
+      return lookbackAnchorNumber;
     }
 
     const { deploymentBlock } = this.#setup.deployment.lidoLend;
-    const discoveryFromNumber = Math.max(lookbackAnchor - this.#lookbackBlocks, deploymentBlock);
+    const firstEventBlock = Math.max(lookbackAnchorNumber - this.#lookbackBlocks, deploymentBlock);
     return frozenCopy({
       kind: 'plan',
-      reportBlock,
-      discoveryFrom: await this.#rpc.getBlock(discoveryFromNumber),
-      lookbackAnchor,
-      coverage: cursor.coverageThrough,
-      storedTimestamp: cursor.storedTimestamp,
+      previousHeartbeatBlock: previousHeartbeatEvidence.previousHeartbeatBlock,
+      heartbeatTimestampAtStart: previousHeartbeatEvidence.heartbeatTimestampAtStart,
+      discoveryRange: {
+        from: await this.#rpc.getBlock(firstEventBlock),
+        to: reportBlock,
+      },
     });
   }
 
@@ -655,205 +594,29 @@ export class Guardian {
    * it has never heartbeated. A membership event after the report block means the Guardian was not
    * yet a member then, so there is nothing for it to attest.
    */
-  async #lookbackAnchor(reportBlock: BlockRef, cursor: Cursor): Promise<number | NothingDue> {
-    if (cursor.coverageThrough !== null) {
-      return cursor.coverageThrough.number;
+  async #findLookbackAnchorNumber(
+    previousHeartbeatBlock: BlockRef | null,
+    observationBlock: BlockRef,
+    reportBlock: BlockRef,
+  ): Promise<number | NothingDue> {
+    if (previousHeartbeatBlock !== null) {
+      return previousHeartbeatBlock.number;
     }
-    const membershipBlock = await this.#registry.latestGuardianAdded(cursor.verifiedAt);
+    const membershipBlock = await this.#registry.latestGuardianAdded(observationBlock);
     if (membershipBlock === null) {
       throw new GuardianStop('guardian-added-event-missing');
     }
     if (membershipBlock > reportBlock.number) {
-      return nothingDue(cursor, 'membership-after-report-block');
+      return nothingDue(previousHeartbeatBlock, 'membership-after-report-block');
     }
     return membershipBlock;
   }
 
-  // ─── Discovery: which positions may have delayed collateral due at the report block.
-
-  async #candidateOf(plan: Plan, supply: SupplyLog, markets: Markets): Promise<PositionKey | null> {
-    const { guardianSignals } = this.#setup.deployment;
-    const controller = await markets.controllerOf(supply.marketId, plan.reportBlock.hash);
-    if (controller === zeroAddress) {
-      return null;
-    }
-    const reportsTo = await markets.registryOf(controller, plan.reportBlock.hash);
-    if (!isAddressEqual(reportsTo, guardianSignals.address)) {
-      return null;
-    }
-
-    const activation = await markets.activationBefore(supply, controller);
-    if (activation === null) {
-      return null;
-    }
-    const deadline = activation.position.activatingStart + activation.position.activatingDelay;
-    if (deadline > plan.reportBlock.timestamp) {
-      return null;
-    }
-    if (!this.#isCoverageRequired(plan.coverage, activation.blockNumber, deadline)) {
-      return null;
-    }
-    return { controller: lower(controller), marketId: supply.marketId, borrower: supply.borrower };
-  }
-
-  /** Whether the previous heartbeat already covered this activation. */
-  #isCoverageRequired(coverage: BlockRef | null, startedAt: number, deadline: number): boolean {
-    if (coverage === null) {
-      return true;
-    }
-    if (startedAt > coverage.number) {
-      return true;
-    }
-    return deadline > coverage.timestamp;
-  }
-
-  async #requireBlock(block: BlockRef): Promise<void> {
+  async #requireCanonicalBlock(block: BlockRef): Promise<void> {
     const seen = await this.#rpc.getBlock(block.number);
     if (seen.hash !== block.hash) {
       throw new GuardianStop('node-behind-the-plan');
     }
-  }
-
-  // ─── Reconstruction: which supplies still fund each candidate's activating balance.
-
-  async #reconstructPosition(plan: Plan, position: PositionKey, markets: Markets): Promise<SupplyAnchor[]> {
-    const events = markets.lifecycleBack(position, plan.reportBlock);
-    const activationBlockByAnchor = new Map<string, AnchorActivation>();
-    let positionAtPreviousHeartbeat: Position | null = null;
-    let current = await this.#readOlderLifecycleEvent(events);
-    if (current === null) {
-      throw new GuardianStop('position-without-history');
-    }
-    if (!this.#isBaseActivationDeadlineReached(current.position, plan.reportBlock.timestamp)) {
-      return [];
-    }
-
-    while (true) {
-      if (plan.coverage !== null && positionAtPreviousHeartbeat === null) {
-        const isAtOrBeforeCoverage = current.at.blockNumber <= BigInt(plan.coverage.number);
-        if (isAtOrBeforeCoverage) {
-          positionAtPreviousHeartbeat = current.position;
-        }
-      }
-
-      if (current.kind === 'activating') {
-        if (current.position.dust !== 0n || current.position.activating < current.amount) {
-          throw new GuardianStop('position-history-broken');
-        }
-
-        const activationBlock = current.at.blockNumber;
-        const directAnchor = this.#supplyAnchorFromLifecycleEvent(current, position);
-        activationBlockByAnchor.set(`${directAnchor.transactionHash}:${directAnchor.logIndex}`, {
-          anchor: directAnchor,
-          activationBlock,
-        });
-        const startedFromZero = current.position.activating === current.amount;
-        const pairedSupply = startedFromZero ? await markets.supplyAfter(position, current) : null;
-        // At the zero boundary, amount == supplied assets proves that no older dust was absorbed.
-        if (pairedSupply?.assets === current.amount) {
-          break;
-        }
-
-        const previousEvent = await this.#readOlderLifecycleEvent(events);
-        // credit adds the supply plus the immediately preceding dust balance. A mismatch is missing
-        // or inconsistent evidence, even when the activation started from zero (Appendix C).
-        if (pairedSupply !== null && current.amount !== pairedSupply.assets + (previousEvent?.position.dust ?? 0n)) {
-          throw new GuardianStop('position-history-broken');
-        }
-        const hasAbsorbedDust = previousEvent !== null && previousEvent.position.dust > 0n;
-        if (hasAbsorbedDust) {
-          const dust = await this.#findDustedEvent(events, previousEvent, plan.coverage);
-          positionAtPreviousHeartbeat ??= dust.positionAtPreviousHeartbeat;
-          const dustAnchor = this.#supplyAnchorFromLifecycleEvent(dust.event, position);
-          activationBlockByAnchor.set(`${dustAnchor.transactionHash}:${dustAnchor.logIndex}`, {
-            anchor: dustAnchor,
-            activationBlock,
-          });
-        }
-
-        if (startedFromZero) {
-          break;
-        }
-        current = hasAbsorbedDust ? await this.#readOlderLifecycleEvent(events) : previousEvent;
-        if (current === null) {
-          throw new GuardianStop('position-history-broken');
-        }
-        continue;
-      }
-
-      if (current.position.activating <= 0n) {
-        throw new GuardianStop('position-history-broken');
-      }
-      current = await this.#readOlderLifecycleEvent(events);
-      if (current === null) {
-        throw new GuardianStop('position-history-broken');
-      }
-    }
-
-    const contributors = [...activationBlockByAnchor.values()];
-    const wasDueAtPreviousHeartbeat =
-      plan.coverage !== null &&
-      positionAtPreviousHeartbeat !== null &&
-      this.#isBaseActivationDeadlineReached(positionAtPreviousHeartbeat, plan.coverage.timestamp);
-    if (!wasDueAtPreviousHeartbeat) {
-      return contributors.map((contributor) => contributor.anchor);
-    }
-    const coveredThrough = BigInt(plan.coverage.number);
-    return contributors
-      .filter((contributor) => contributor.activationBlock > coveredThrough)
-      .map((contributor) => contributor.anchor);
-  }
-
-  async #readOlderLifecycleEvent(events: LifecycleEvents): Promise<Lifecycle | null> {
-    const next = await events.next();
-    return next.done === true ? null : next.value;
-  }
-
-  /** Find the dust supply absorbed by an activation and preserve a crossed coverage checkpoint. */
-  async #findDustedEvent(
-    events: LifecycleEvents,
-    newest: Lifecycle,
-    coverage: BlockRef | null,
-  ): Promise<{ readonly event: Lifecycle; readonly positionAtPreviousHeartbeat: Position | null }> {
-    let positionAtPreviousHeartbeat: Position | null = null;
-    let current: Lifecycle | null = newest;
-    while (true) {
-      if (current === null || current.position.dust <= 0n) {
-        throw new GuardianStop('position-history-broken');
-      }
-      if (coverage !== null && positionAtPreviousHeartbeat === null) {
-        const isAtOrBeforeCoverage = current.at.blockNumber <= BigInt(coverage.number);
-        if (isAtOrBeforeCoverage) {
-          positionAtPreviousHeartbeat = current.position;
-        }
-      }
-      if (current.kind === 'dusted') {
-        if (current.position.dust !== current.amount) {
-          throw new GuardianStop('position-history-broken');
-        }
-        return { event: current, positionAtPreviousHeartbeat };
-      }
-      current = await this.#readOlderLifecycleEvent(events);
-    }
-  }
-
-  /** Whether the lot's base timer has elapsed by `at`. A position with no activating balance never has. */
-  #isBaseActivationDeadlineReached(position: Position, at: number): boolean {
-    if (position.activating <= 0n) {
-      return false;
-    }
-    return position.activatingStart + position.activatingDelay <= at;
-  }
-
-  #supplyAnchorFromLifecycleEvent(event: Lifecycle, position: PositionKey): SupplyAnchor {
-    return {
-      core: this.#setup.deployment.lidoLend.address,
-      blockHash: event.at.blockHash,
-      transactionHash: event.at.transactionHash,
-      logIndex: event.at.logIndex + 1,
-      marketId: position.marketId,
-      borrower: position.borrower,
-    };
   }
 
   // ─── Screening: who is asked about, and what the answers require.
@@ -896,17 +659,17 @@ export class Guardian {
    * distinguishable from a dead one without a transaction every cycle.
    */
   #isHeartbeatDue(work: Work): boolean {
-    if (work.anchors > 0 || work.storedTimestamp === 0) {
+    if (work.anchors > 0 || work.heartbeatTimestampAtStart === 0) {
       return true;
     }
 
-    const idle = work.reportBlock.timestamp - work.storedTimestamp;
+    const idle = work.reportBlock.timestamp - work.heartbeatTimestampAtStart;
 
     return idle >= this.#setup.idleHeartbeatInterval;
   }
 
   /** Reports are grouped by kind and market; all targets in a group share one registry call. */
-  async #report(screened: Screened): Promise<readonly ReceiptRef[] | Stale> {
+  async #submitRequiredSignals(screened: Screened): Promise<readonly ReceiptRef[] | Stale> {
     const work = screened.work();
     const reports: ReceiptRef[] = [];
     const groups = [
@@ -915,20 +678,20 @@ export class Guardian {
     ] as const;
     for (const group of groups) {
       const landed: { context: OperationContext; receipt: ReceiptRef }[] = [];
-      for (const { marketId, borrowers } of this.#batches(group.targets)) {
-        const reason = await this.#invalidation(work);
+      for (const { marketId, borrowers } of this.#signalBatches(group.targets)) {
+        const reason = await this.#planInvalidationReason(work);
         if (reason !== null) {
           return { kind: 'stale', reason };
         }
         const depth = Math.min(this.#setup.txConfirmationBlocks, this.#setup.interBatchConfirmationBlocks);
-        const context = this.#startReport({ method: group.kind, marketId, accounts: borrowers });
+        const context = this.#startReportOperation({ method: group.kind, marketId, accounts: borrowers });
         const receipt = await this.#registry[group.kind](marketId, borrowers, {
           confirmations: depth,
           context,
         });
         landed.push({ context, receipt });
       }
-      const stale = await this.#confirmReports(
+      const stale = await this.#confirmSignalTransactions(
         work,
         landed.map((report) => report.receipt),
       );
@@ -936,14 +699,14 @@ export class Guardian {
         return stale;
       }
       for (const { context, receipt } of landed) {
-        this.#confirmed(context, receipt);
+        this.#emitConfirmedReport(context, receipt);
       }
       reports.push(...landed.map((report) => report.receipt));
     }
     return reports;
   }
 
-  #batches(targets: readonly SignalTarget[]): { marketId: MarketId; borrowers: Address[] }[] {
+  #signalBatches(targets: readonly SignalTarget[]): { marketId: MarketId; borrowers: Address[] }[] {
     const byMarket = new Map<MarketId, Address[]>();
     for (const target of targets) {
       const borrowers = byMarket.get(target.marketId);
@@ -963,12 +726,12 @@ export class Guardian {
   }
 
   /** Wait once for the whole report kind, checking the plan while the required depth accumulates. */
-  async #confirmReports(work: Work, receipts: readonly ReceiptRef[]): Promise<Stale | null> {
+  async #confirmSignalTransactions(work: Work, receipts: readonly ReceiptRef[]): Promise<Stale | null> {
     if (receipts.length === 0) {
       return null;
     }
     while (true) {
-      const reason = await this.#invalidation(work);
+      const reason = await this.#planInvalidationReason(work);
       if (reason !== null) {
         return { kind: 'stale', reason };
       }
@@ -977,7 +740,7 @@ export class Guardian {
         (receipt) => head.number - receipt.blockNumber + 1 >= this.#setup.txConfirmationBlocks,
       );
       if (deepEnough) {
-        return (await this.#isEveryReportConfirmed(receipts))
+        return (await this.#areAllReportsConfirmed(receipts))
           ? null
           : { kind: 'stale', reason: 'report-no-longer-confirmed' };
       }
@@ -986,12 +749,12 @@ export class Guardian {
   }
 
   /** Commit coverage only after every required report has passed the final check. */
-  async #heartbeat(work: Work): Promise<Attested> {
+  async #submitHeartbeat(work: Work): Promise<Attested> {
     const depth = this.#setup.txConfirmationBlocks;
     // Appendix runCycle hashes before screening. Work is an immutable snapshot, so computing
     // here commits the same complete set, including own-flagged anchors, without a cached digest.
-    const digest = coverageDigest(work.all(), this.#bounds(work));
-    const context = this.#startReport({
+    const digest = coverageDigest(work.all(), this.#coverageDigestBounds(work));
+    const context = this.#startReportOperation({
       method: 'heartbeat',
       reportBlock: work.reportBlock,
       coverageDigest: digest,
@@ -1004,27 +767,23 @@ export class Guardian {
     if (!(await this.#rpc.isConfirmed(receipt, await this.#rpc.getBlock(), depth))) {
       throw new Error(`Heartbeat ${heartbeat} is no longer confirmed`);
     }
-    this.#confirmed(context, receipt);
+    this.#emitConfirmedReport(context, receipt);
     return {
       kind: 'attested',
-      cursor: {
-        coverageThrough: work.reportBlock,
-        storedTimestamp: work.reportBlock.timestamp,
-        verifiedAt: work.reportBlock,
-      },
+      previousHeartbeatBlock: work.reportBlock,
       heartbeat,
       digest,
     };
   }
 
-  #startReport(report: ReportContext): OperationContext {
+  #startReportOperation(report: ReportContext): OperationContext {
     const cycle = this.#activeCycle === undefined ? {} : this.#activeCycle;
     const context = frozenCopy({ ...report, operationId: randomUUID(), ...cycle });
     emitEvent(this.#setup.onEvent, { event: 'report.started', context });
     return context;
   }
 
-  #confirmed(context: OperationContext, receipt: ReceiptRef): void {
+  #emitConfirmedReport(context: OperationContext, receipt: ReceiptRef): void {
     emitEvent(this.#setup.onEvent, {
       event: 'report.confirmed',
       context,
@@ -1038,7 +797,7 @@ export class Guardian {
    * Why the plan can no longer be attested, or null while it still can. A head that is not the
    * canonical block at its own number is not a reason to replan but a broken read, and stops.
    */
-  async #invalidation(work: Work): Promise<StaleReason | null> {
+  async #planInvalidationReason(work: Work): Promise<StaleReason | null> {
     const head = await this.#rpc.getBlock();
     if (head.number <= work.reportBlock.number) {
       return 'head-not-past-report-block';
@@ -1054,11 +813,11 @@ export class Guardian {
       return 'report-block-reorged';
     }
 
-    const stored = await this.#registry.storedHeartbeat(head.hash);
-    if (stored < work.storedTimestamp) {
+    const currentHeartbeatTimestamp = await this.#registry.getHeartbeat(head.hash);
+    if (currentHeartbeatTimestamp < work.heartbeatTimestampAtStart) {
       return 'stored-heartbeat-moved';
     }
-    if (stored > work.reportBlock.timestamp) {
+    if (currentHeartbeatTimestamp > work.reportBlock.timestamp) {
       return 'stored-heartbeat-moved';
     }
 
@@ -1070,7 +829,7 @@ export class Guardian {
   }
 
   /** Reread every receipt immediately before committing coverage. */
-  async #isEveryReportConfirmed(receipts: readonly ReceiptRef[]): Promise<boolean> {
+  async #areAllReportsConfirmed(receipts: readonly ReceiptRef[]): Promise<boolean> {
     const head = await this.#rpc.getBlock();
     for (const receipt of receipts) {
       if (!(await this.#rpc.isConfirmed(receipt, head, this.#setup.txConfirmationBlocks))) {
@@ -1080,15 +839,15 @@ export class Guardian {
     return true;
   }
 
-  #bounds(work: Work): CoverageBounds {
+  #coverageDigestBounds(work: Work): CoverageBounds {
     const { chainId, lidoLend, guardianSignals } = this.#setup.deployment;
     return {
       chainId,
       core: lidoLend.address,
       registry: guardianSignals.address,
       guardian: this.#setup.guardian,
-      previousCoverage: work.coverage?.hash ?? null,
-      reportBlock: work.reportBlock.hash,
+      previousBlockHash: work.previousHeartbeatBlock?.hash ?? null,
+      reportBlockHash: work.reportBlock.hash,
     };
   }
 }
@@ -1115,8 +874,8 @@ function validateSetup(setup: GuardianState): void {
   });
 }
 
-function nothingDue(cursor: Cursor, reason: NothingDueReason): NothingDue {
-  return { kind: 'nothing-due', cursor, reason };
+function nothingDue(previousHeartbeatBlock: BlockRef | null, reason: NothingDueReason): NothingDue {
+  return { kind: 'nothing-due', previousHeartbeatBlock, reason };
 }
 
 /** Retain validated configuration, excluding signing material even when supplied to observe mode. */

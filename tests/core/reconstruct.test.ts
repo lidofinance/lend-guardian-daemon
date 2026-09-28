@@ -373,7 +373,13 @@ test('a plan whose report block the node no longer holds stops the attempt', asy
   });
   const planned = await guardian.buildScanPlan();
   assert.ok(planned.kind === 'plan');
-  const broken = { ...planned, reportBlock: { ...planned.reportBlock, hash: blockAt(1).hash } };
+  const broken = {
+    ...planned,
+    discoveryRange: {
+      ...planned.discoveryRange,
+      to: { ...planned.discoveryRange.to, hash: blockAt(1).hash },
+    },
+  };
   await assert.rejects(
     async () => {
       const discovered = await guardian.discoverCandidatePositions(broken);
@@ -503,7 +509,7 @@ for (const deadlineOffset of [-1, 0, 1]) {
     const activatingDelay = coverage.timestamp + deadlineOffset - started.position.activatingStart;
     const { work } = await workOf({
       head: HEAD,
-      storedHeartbeat: coverage.timestamp,
+      heartbeatTimestamp: coverage.timestamp,
       heartbeats: [{ blockNumber: coverage.number, timestamp: coverage.timestamp }],
       lots: [
         { ...started, position: { ...started.position, activatingDelay } },
@@ -535,7 +541,7 @@ test('a dust search crossing coverage uses the latest position at that block', a
   };
   const { work } = await workOf({
     head: HEAD,
-    storedHeartbeat: coverage.timestamp,
+    heartbeatTimestamp: coverage.timestamp,
     heartbeats: [{ blockNumber: coverage.number, timestamp: coverage.timestamp }],
     lots: [started, dusted, matured, { ...absorbing, position: { ...absorbing.position, activating: 5n } }],
   });
@@ -558,7 +564,7 @@ test('a partial drain at the coverage block preserves coverage of the older cont
   const fresh = activation(100_000, 3n, 3n);
   const { work } = await workOf({
     head: HEAD,
-    storedHeartbeat: coverage.timestamp,
+    heartbeatTimestamp: coverage.timestamp,
     heartbeats: [{ blockNumber: coverage.number, timestamp: coverage.timestamp }],
     lots: [old, drained, { ...fresh, position: { ...fresh.position, activating: 6n } }],
   });
@@ -569,7 +575,7 @@ test('discovery skips an already-due position with no fresh activation after cov
   const coverage = blockAt(95_000);
   const { work } = await workOf({
     head: HEAD,
-    storedHeartbeat: coverage.timestamp,
+    heartbeatTimestamp: coverage.timestamp,
     heartbeats: [{ blockNumber: coverage.number, timestamp: coverage.timestamp }],
     lots: [activation(80_000, 5n, 5n)],
   });
@@ -581,7 +587,7 @@ test('an older activation that first becomes due after coverage remains discover
   const old = activation(90_000, 5n, 5n);
   const { work } = await workOf({
     head: HEAD,
-    storedHeartbeat: coverage.timestamp,
+    heartbeatTimestamp: coverage.timestamp,
     heartbeats: [{ blockNumber: coverage.number, timestamp: coverage.timestamp }],
     lots: [old],
   });

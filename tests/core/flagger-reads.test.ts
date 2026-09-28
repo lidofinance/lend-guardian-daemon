@@ -35,11 +35,9 @@ function workFor(count: number): Work {
   return new Work(
     {
       kind: 'plan',
-      reportBlock: blockAt(HEAD - 2),
-      discoveryFrom: blockAt(99_600),
-      lookbackAnchor: 150_000,
-      coverage: null,
-      storedTimestamp: 0,
+      previousHeartbeatBlock: null,
+      heartbeatTimestampAtStart: 0,
+      discoveryRange: { from: blockAt(99_600), to: blockAt(HEAD - 2) },
     },
     new Map(entries),
   );

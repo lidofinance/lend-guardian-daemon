@@ -8,18 +8,6 @@ import { frozenCopy } from '../common/immutable.ts';
 import { isRecord } from '../common/validation.ts';
 import { GuardianStop } from './stop.ts';
 
-/**
- * Where coverage stood at the end of a cycle. It is a hint and never an authority: the next `plan`
- * still requires the latest `Heartbeat` of this Guardian to carry the stored timestamp and to name a
- * block whose header carries it too. A hinted block that is still canonical only narrows the search
- * for that event to the blocks from it to the head.
- */
-export interface Cursor {
-  readonly coverageThrough: BlockRef | null;
-  readonly storedTimestamp: number;
-  readonly verifiedAt: BlockRef;
-}
-
 export type NothingDueReason =
   | 'report-block-before-core-deployment'
   | 'report-block-not-past-stored-heartbeat'
@@ -28,7 +16,7 @@ export type NothingDueReason =
 
 export interface NothingDue {
   readonly kind: 'nothing-due';
-  readonly cursor: Cursor;
+  readonly previousHeartbeatBlock: BlockRef | null;
   readonly reason: NothingDueReason;
 }
 
@@ -36,27 +24,17 @@ export interface NothingDue {
 // public construction API; they do not authenticate a value's origin. The caller must pass the
 // original values through the same Guardian's attempt in order; there is no instance/replay guard.
 
-/** What phase A produced. `kind` is what lets a caller tell it from `NothingDue`. */
-export interface Plan {
+export interface BlockRange {
+  readonly from: BlockRef;
+  readonly to: BlockRef;
+}
+
+/** The scan plan defined by the specification. `kind` distinguishes it from `NothingDue`. */
+export interface ScanPlan {
   readonly kind: 'plan';
-  /** The coverage block; observation, historical events and submission checks use their own blocks. */
-  readonly reportBlock: BlockRef;
-  /** First block of the candidate search, for the cycle record. */
-  readonly discoveryFrom: BlockRef;
-  /**
-   * The block the discovery window reaches back from, for the cycle record: the block a previous
-   * heartbeat covered, or this Guardian's `GuardianAdded` block when there is none. It is the value
-   * before the lookback and the core's deployment floor apply.
-   */
-  readonly lookbackAnchor: number;
-  /**
-   * The block a previous heartbeat already covered, or null before the first one. Phase B keeps a
-   * position when it became due later or gained a new activating contributor, and phase C drops
-   * only the anchors this boundary already covered.
-   */
-  readonly coverage: BlockRef | null;
-  /** What the registry stored when the plan was built. */
-  readonly storedTimestamp: number;
+  readonly previousHeartbeatBlock: BlockRef | null;
+  readonly heartbeatTimestampAtStart: number;
+  readonly discoveryRange: BlockRange;
 }
 
 /**
@@ -64,27 +42,22 @@ export interface Plan {
  * The private snapshots keep later reconstruction tied to the same plan and candidate set.
  */
 export class Discovered {
-  readonly positions: number;
-
-  readonly #plan: Plan;
+  readonly #plan: ScanPlan;
 
   readonly #positions: readonly PositionKey[];
 
-  constructor(plan: Plan, positions: readonly PositionKey[]) {
+  constructor(plan: ScanPlan, positions: readonly PositionKey[]) {
     this.#plan = frozenCopy({
       kind: 'plan',
-      reportBlock: plan.reportBlock,
-      discoveryFrom: plan.discoveryFrom,
-      lookbackAnchor: plan.lookbackAnchor,
-      coverage: plan.coverage,
-      storedTimestamp: plan.storedTimestamp,
+      previousHeartbeatBlock: plan.previousHeartbeatBlock,
+      heartbeatTimestampAtStart: plan.heartbeatTimestampAtStart,
+      discoveryRange: plan.discoveryRange,
     });
     this.#positions = frozenCopy(positions);
-    this.positions = positions.length;
     Object.freeze(this);
   }
 
-  plan(): Plan {
+  plan(): ScanPlan {
     return this.#plan;
   }
 
@@ -102,10 +75,10 @@ export class Work {
   readonly reportBlock: BlockRef;
 
   /** The block a previous heartbeat covered, which the digest commits alongside the anchors. */
-  readonly coverage: BlockRef | null;
+  readonly previousHeartbeatBlock: BlockRef | null;
 
-  /** The initial heartbeat timestamp; regression below it or advancement past reportBlock invalidates the plan. */
-  readonly storedTimestamp: number;
+  /** The stored heartbeat timestamp captured while the scan plan was built. */
+  readonly heartbeatTimestampAtStart: number;
 
   readonly anchors: number;
 
@@ -113,10 +86,10 @@ export class Work {
 
   readonly #byPosition: ReadonlyMap<PositionKey, readonly SupplyAnchor[]>;
 
-  constructor(plan: Plan, byPosition: ReadonlyMap<PositionKey, readonly SupplyAnchor[]>) {
-    this.reportBlock = frozenCopy(plan.reportBlock);
-    this.coverage = frozenCopy(plan.coverage);
-    this.storedTimestamp = plan.storedTimestamp;
+  constructor(plan: ScanPlan, byPosition: ReadonlyMap<PositionKey, readonly SupplyAnchor[]>) {
+    this.reportBlock = frozenCopy(plan.discoveryRange.to);
+    this.previousHeartbeatBlock = frozenCopy(plan.previousHeartbeatBlock);
+    this.heartbeatTimestampAtStart = plan.heartbeatTimestampAtStart;
     this.#byPosition = new Map(
       [...byPosition].map(([position, anchors]) => [frozenCopy(position), frozenCopy(anchors)]),
     );
@@ -280,7 +253,8 @@ export type StaleReason =
 /** The heartbeat landed: the cycle's coverage now stands at the report block. */
 export interface Attested {
   readonly kind: 'attested';
-  readonly cursor: Cursor;
+  /** The report block committed by this heartbeat; pass it as the next cycle's optional hint. */
+  readonly previousHeartbeatBlock: BlockRef;
   readonly heartbeat: TxHash;
   readonly digest: Bytes32;
 }
@@ -294,7 +268,7 @@ export interface Stale {
 /** A complete read-only cycle: screening finished, but observe mode submitted nothing. */
 export interface Observed {
   readonly kind: 'observed';
-  readonly cursor: Cursor | undefined;
+  readonly previousHeartbeatBlock: BlockRef | null;
   readonly screened: Screened;
 }
 

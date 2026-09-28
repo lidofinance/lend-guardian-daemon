@@ -134,7 +134,7 @@ test('editing the caller setup cannot change the validated discovery profile', a
   Object.assign(setup.deployment.lidoLend, { deploymentBlock: HEAD });
   const plan = await guardian.buildScanPlan();
   assert.ok(plan.kind === 'plan');
-  assert.equal(plan.discoveryFrom.number, 99_600);
+  assert.equal(plan.discoveryRange.from.number, 99_600);
   const screened = await guardian.screenWork(
     await guardian.reconstructWork(await guardian.discoverCandidatePositions(plan)),
   );
@@ -243,8 +243,7 @@ for (const [chainId, slotSeconds, expectedFrom] of [
     });
     const plan = await guardian.buildScanPlan();
     assert.equal(plan.kind, 'plan');
-    assert.equal(plan.lookbackAnchor, 150000);
-    assert.equal(plan.discoveryFrom.number, expectedFrom);
+    assert.equal(plan.discoveryRange.from.number, expectedFrom);
   });
 }
 
@@ -302,5 +301,5 @@ test('the configured report lag selects a stable block even after caller setup c
   setup.reportBlockLag = 1;
   const plan = await guardian.buildScanPlan();
   assert.equal(plan.kind, 'plan');
-  assert.deepEqual(plan.reportBlock, blockAt(HEAD - 7));
+  assert.deepEqual(plan.discoveryRange.to, blockAt(HEAD - 7));
 });

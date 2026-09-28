@@ -95,7 +95,7 @@ test('suspects and flags are signed by the configured account for the registry b
   );
 });
 
-test('the heartbeat commits the entire work set and returns its coverage cursor', async () => {
+test('the heartbeat commits the entire work set and returns its report block as the next hint', async () => {
   const { outcome, sent, work } = await cycle(ONE_DUE, 'flag');
   assert.equal(outcome.kind, 'attested');
   const expected = coverageDigest(work.all(), {
@@ -103,13 +103,12 @@ test('the heartbeat commits the entire work set and returns its coverage cursor'
     core: CORE,
     registry: REGISTRY,
     guardian: GUARDIAN,
-    previousCoverage: null,
-    reportBlock: blockAt(REPORT).hash,
+    previousBlockHash: null,
+    reportBlockHash: blockAt(REPORT).hash,
   });
   assert.equal(outcome.digest, expected);
   assert.equal(sent.heartbeats[0]?.digest, expected);
-  assert.equal(outcome.cursor.coverageThrough?.number, REPORT);
-  assert.equal(outcome.cursor.storedTimestamp, blockAt(REPORT).timestamp);
+  assert.equal(outcome.previousHeartbeatBlock.number, REPORT);
 });
 
 /** Alter evidence after the client's final receipt read, leaving Guardian to recheck it independently. */
@@ -243,7 +242,7 @@ function idleSince(age: number): Script {
   return {
     head: HEAD,
     guardianAddedAt: 1_000,
-    storedHeartbeat: covered.timestamp,
+    heartbeatTimestamp: covered.timestamp,
     heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
   };
 }
@@ -358,7 +357,7 @@ test('Guardian forwards delivery context and confirms each action once in protoc
       continue;
     }
     if (event.context.method === 'heartbeat') {
-      assert.deepEqual(event.context.reportBlock, plan.reportBlock);
+      assert.deepEqual(event.context.reportBlock, plan.discoveryRange.to);
       assert.equal(event.context.coverageDigest, outcome.digest);
     } else if (event.context.method === 'cancel') {
       assert.fail('submission must not emit nonce-clearing events');

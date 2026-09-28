@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { padHex } from 'viem';
 import { privateKeyToAddress } from 'viem/accounts';
 import type { GuardianSetup } from '../../src/core/guardian.ts';
-import type { Cursor } from '../../src/core/outcomes.ts';
+import type { BlockRef } from '../../src/common/types.ts';
 import { GuardianStop } from '../../src/core/stop.ts';
 import type { StopReason } from '../../src/core/stop.ts';
 import { blockAt, REGISTRY } from './fake-node.ts';
@@ -24,15 +24,15 @@ const OTHER_KEY = padHex('0x03', { size: 32 });
 const OTHER_DELEGATE = privateKeyToAddress(OTHER_KEY);
 
 /** A Guardian that never heartbeated and joined long before the report block. */
-const JOINED: Script = { head: HEAD, storedHeartbeat: 0, guardianAddedAt: 150_000 };
+const JOINED: Script = { head: HEAD, heartbeatTimestamp: 0, guardianAddedAt: 150_000 };
 
 async function planOver(
   script: Script,
   parts: Partial<GuardianSetup> & { privateKey?: `0x${string}` } = {},
-  hint?: Cursor,
+  previousHeartbeatBlock?: BlockRef | null,
 ) {
   const { guardian, node } = guardianOver(script, parts);
-  const planned = await guardian.buildScanPlan(hint);
+  const planned = await guardian.buildScanPlan(previousHeartbeatBlock);
   const registryQueries = node.logQueries
     .filter((query) => query.address === REGISTRY)
     .map((query) => [query.fromBlock, query.toBlock]);
@@ -52,21 +52,20 @@ async function assertStops(
   });
 }
 
-/** The cursor an attested cycle leaves behind for `covered`. */
-function hintAt(covered: number): Cursor {
-  const block = blockAt(covered);
-  return { coverageThrough: block, storedTimestamp: block.timestamp, verifiedAt: block };
+/** The report block an attested cycle can pass back as a search hint. */
+function hintAt(covered: number): BlockRef {
+  return blockAt(covered);
 }
 
 test('a node that serves another chain stops the attempt before anything is planned', async () => {
   await assertStops(
-    { head: HEAD, chainId: 560_048, storedHeartbeat: 0, guardianAddedAt: 150_000 },
+    { head: HEAD, chainId: 560_048, heartbeatTimestamp: 0, guardianAddedAt: 150_000 },
     'chain-id-mismatch',
   );
 });
 
 test('a Guardian that is not a member stops the attempt rather than planning one', async () => {
-  await assertStops({ head: HEAD, isGuardian: false, storedHeartbeat: 0 }, 'guardian-not-member');
+  await assertStops({ head: HEAD, isGuardian: false, heartbeatTimestamp: 0 }, 'guardian-not-member');
 });
 
 test('a Guardian that signs itself and expects no delegate plans while the registry names none', async () => {
@@ -120,7 +119,7 @@ test('a Guardian that signs itself plans while the registry names the delegate i
 test('nothing is due while the chain is younger than the core plus the report lag', async () => {
   const { planned } = await planOver({
     head: CORE_DEPLOYED + 1,
-    storedHeartbeat: 0,
+    heartbeatTimestamp: 0,
     guardianAddedAt: CORE_DEPLOYED,
   });
   assert.equal(planned.kind, 'nothing-due');
@@ -131,7 +130,7 @@ test('nothing is due when the report block is not past what the registry already
   const reportBlock = blockAt(HEAD - 2);
   const { planned } = await planOver({
     head: HEAD,
-    storedHeartbeat: reportBlock.timestamp,
+    heartbeatTimestamp: reportBlock.timestamp,
     heartbeats: [{ blockNumber: reportBlock.number, timestamp: reportBlock.timestamp }],
   });
   assert.equal(planned.kind, 'nothing-due');
@@ -139,12 +138,12 @@ test('nothing is due when the report block is not past what the registry already
 });
 
 test('a Guardian that never heartbeated measures its window back from joining', async () => {
-  const { planned } = await planOver({ head: HEAD, storedHeartbeat: 0, guardianAddedAt: 150_000 });
+  const { planned } = await planOver({ head: HEAD, heartbeatTimestamp: 0, guardianAddedAt: 150_000 });
   assert.ok(planned.kind === 'plan');
-  assert.equal(planned.reportBlock.number, HEAD - 2);
-  assert.equal(planned.coverage, null);
-  assert.equal(planned.lookbackAnchor, 150_000);
-  assert.equal(planned.discoveryFrom.number, 150_000 - LOOKBACK);
+  assert.equal(planned.discoveryRange.to.number, HEAD - 2);
+  assert.equal(planned.previousHeartbeatBlock, null);
+  assert.equal(planned.heartbeatTimestampAtStart, 0);
+  assert.equal(planned.discoveryRange.from.number, 150_000 - LOOKBACK);
 });
 
 test('custom lookbacks are rejected instead of changing the canonical discovery range', () => {
@@ -160,21 +159,20 @@ test('custom lookbacks are rejected instead of changing the canonical discovery 
   }
 });
 
-test('the window never reaches behind the core, and the plan still names its anchor', async () => {
-  const { planned } = await planOver({ head: 2_000, storedHeartbeat: 0, guardianAddedAt: 1_500 });
+test('the discovery range never reaches behind the core', async () => {
+  const { planned } = await planOver({ head: 2_000, heartbeatTimestamp: 0, guardianAddedAt: 1_500 });
   assert.ok(planned.kind === 'plan');
-  assert.equal(planned.discoveryFrom.number, CORE_DEPLOYED);
-  assert.equal(planned.lookbackAnchor, 1_500);
+  assert.equal(planned.discoveryRange.from.number, CORE_DEPLOYED);
 });
 
 test('a membership event after the report block leaves this cycle nothing to attest', async () => {
-  const { planned } = await planOver({ head: HEAD, storedHeartbeat: 0, guardianAddedAt: HEAD - 1 });
+  const { planned } = await planOver({ head: HEAD, heartbeatTimestamp: 0, guardianAddedAt: HEAD - 1 });
   assert.equal(planned.kind, 'nothing-due');
   assert.equal(planned.reason, 'membership-after-report-block');
 });
 
 test('a Guardian with no membership event at all cannot be planned for', async () => {
-  await assertStops({ head: HEAD, storedHeartbeat: 0 }, 'guardian-added-event-missing');
+  await assertStops({ head: HEAD, heartbeatTimestamp: 0 }, 'guardian-added-event-missing');
 });
 
 test('a membership event that does not decode stops the attempt rather than reading as absent', async () => {
@@ -187,7 +185,7 @@ test('a heartbeat event that does not decode stops the attempt rather than namin
   await assertStops(
     {
       head: HEAD,
-      storedHeartbeat: covered.timestamp,
+      heartbeatTimestamp: covered.timestamp,
       heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
       undecodable: ['heartbeat'],
     },
@@ -199,26 +197,27 @@ test('a stored heartbeat is matched to the block it reported, not the block it l
   const covered = blockAt(180_000);
   const { planned } = await planOver({
     head: HEAD,
-    storedHeartbeat: covered.timestamp,
+    heartbeatTimestamp: covered.timestamp,
     heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp, includedAt: 180_005 }],
   });
   assert.ok(planned.kind === 'plan');
-  assert.deepEqual(planned.coverage, covered);
-  assert.equal(planned.lookbackAnchor, covered.number);
-  assert.equal(planned.discoveryFrom.number, covered.number - LOOKBACK);
+  assert.deepEqual(planned.previousHeartbeatBlock, covered);
+  assert.equal(planned.heartbeatTimestampAtStart, covered.timestamp);
+  assert.equal(planned.discoveryRange.from.number, covered.number - LOOKBACK);
 });
 
 test('a heartbeat whose event timestamp is not the stored one names no coverage', async () => {
   const covered = blockAt(180_000);
   const { planned } = await planOver({
     head: HEAD,
-    storedHeartbeat: covered.timestamp + 1,
+    heartbeatTimestamp: covered.timestamp + 1,
     heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
     guardianAddedAt: 150_000,
   });
   assert.ok(planned.kind === 'plan');
-  assert.equal(planned.coverage, null);
-  assert.equal(planned.discoveryFrom.number, 150_000 - LOOKBACK);
+  assert.equal(planned.previousHeartbeatBlock, null);
+  assert.equal(planned.heartbeatTimestampAtStart, covered.timestamp + 1);
+  assert.equal(planned.discoveryRange.from.number, 150_000 - LOOKBACK);
 });
 
 test('the latest heartbeat is found by block, whatever order the node returns the logs in', async () => {
@@ -226,14 +225,14 @@ test('the latest heartbeat is found by block, whatever order the node returns th
   const newer = blockAt(185_000);
   const { planned } = await planOver({
     head: HEAD,
-    storedHeartbeat: newer.timestamp,
+    heartbeatTimestamp: newer.timestamp,
     heartbeats: [
       { blockNumber: newer.number, timestamp: newer.timestamp },
       { blockNumber: older.number, timestamp: older.timestamp },
     ],
   });
   assert.ok(planned.kind === 'plan');
-  assert.deepEqual(planned.coverage, newer);
+  assert.deepEqual(planned.previousHeartbeatBlock, newer);
 });
 
 test('of two heartbeats in one block, the later transaction is the latest', async () => {
@@ -241,7 +240,7 @@ test('of two heartbeats in one block, the later transaction is the latest', asyn
   const newer = blockAt(184_000);
   const { planned } = await planOver({
     head: HEAD,
-    storedHeartbeat: newer.timestamp,
+    heartbeatTimestamp: newer.timestamp,
     heartbeats: [
       {
         blockNumber: newer.number,
@@ -258,7 +257,7 @@ test('of two heartbeats in one block, the later transaction is the latest', asyn
     ],
   });
   assert.ok(planned.kind === 'plan');
-  assert.deepEqual(planned.coverage, newer);
+  assert.deepEqual(planned.previousHeartbeatBlock, newer);
 });
 
 test('a hint that still holds narrows the heartbeat search to the blocks after it', async () => {
@@ -266,27 +265,26 @@ test('a hint that still holds narrows the heartbeat search to the blocks after i
   const { planned, registryQueries } = await planOver(
     {
       head: HEAD,
-      storedHeartbeat: covered.timestamp,
+      heartbeatTimestamp: covered.timestamp,
       heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
     },
     {},
     hintAt(covered.number),
   );
   assert.ok(planned.kind === 'plan');
-  assert.deepEqual(planned.coverage, covered);
+  assert.deepEqual(planned.previousHeartbeatBlock, covered);
   assert.deepEqual(registryQueries, [[covered.number, HEAD]]);
 });
 
 test('a hint names no coverage when no heartbeat event stands behind it', async () => {
   const covered = blockAt(180_000);
   const { planned } = await planOver(
-    { head: HEAD, storedHeartbeat: covered.timestamp, guardianAddedAt: 150_000 },
+    { head: HEAD, heartbeatTimestamp: covered.timestamp, guardianAddedAt: 150_000 },
     {},
     hintAt(covered.number),
   );
   assert.ok(planned.kind === 'plan');
-  assert.equal(planned.coverage, null);
-  assert.equal(planned.lookbackAnchor, 150_000);
+  assert.equal(planned.previousHeartbeatBlock, null);
 });
 
 test('a hint names no coverage when the latest heartbeat names a block without that timestamp', async () => {
@@ -296,7 +294,7 @@ test('a hint names no coverage when the latest heartbeat names a block without t
   const { planned } = await planOver(
     {
       head: HEAD,
-      storedHeartbeat: covered.timestamp,
+      heartbeatTimestamp: covered.timestamp,
       heartbeats: [
         { blockNumber: covered.number, timestamp: covered.timestamp },
         { blockNumber: 185_000, timestamp: covered.timestamp },
@@ -307,9 +305,8 @@ test('a hint names no coverage when the latest heartbeat names a block without t
     hintAt(covered.number),
   );
   assert.ok(planned.kind === 'plan');
-  assert.equal(planned.coverage, null);
-  assert.equal(planned.lookbackAnchor, 150_000);
-  assert.equal(planned.discoveryFrom.number, 150_000 - LOOKBACK);
+  assert.equal(planned.previousHeartbeatBlock, null);
+  assert.equal(planned.discoveryRange.from.number, 150_000 - LOOKBACK);
 });
 
 test('a hint later than the stored heartbeat does not narrow the search', async () => {
@@ -319,14 +316,14 @@ test('a hint later than the stored heartbeat does not narrow the search', async 
   const { planned, registryQueries } = await planOver(
     {
       head: HEAD,
-      storedHeartbeat: covered.timestamp,
+      heartbeatTimestamp: covered.timestamp,
       heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
     },
     {},
     hintAt(180_000),
   );
   assert.ok(planned.kind === 'plan');
-  assert.deepEqual(planned.coverage, covered);
+  assert.deepEqual(planned.previousHeartbeatBlock, covered);
   assert.deepEqual(registryQueries, [[REGISTRY_DEPLOYED, HEAD]]);
 });
 
@@ -335,14 +332,14 @@ test('a hint whose block is no longer canonical does not narrow the search', asy
   const { planned, registryQueries } = await planOver(
     {
       head: HEAD,
-      storedHeartbeat: covered.timestamp,
+      heartbeatTimestamp: covered.timestamp,
       heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
     },
     {},
-    { ...hintAt(covered.number), coverageThrough: { ...covered, hash: blockAt(999_999).hash } },
+    { ...covered, hash: blockAt(999_999).hash },
   );
   assert.ok(planned.kind === 'plan');
-  assert.deepEqual(planned.coverage, covered);
+  assert.deepEqual(planned.previousHeartbeatBlock, covered);
   assert.deepEqual(registryQueries, [[REGISTRY_DEPLOYED, HEAD]]);
 });
 
@@ -352,16 +349,15 @@ test('a hint that understates its block timestamp does not narrow the search pas
   const { planned, registryQueries } = await planOver(
     {
       head: HEAD,
-      storedHeartbeat: covered.timestamp,
+      heartbeatTimestamp: covered.timestamp,
       heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
       guardianAddedAt: 150_000,
     },
     {},
-    { coverageThrough: { ...hinted, timestamp: 0 }, storedTimestamp: 0, verifiedAt: hinted },
+    { ...hinted, timestamp: 0 },
   );
   assert.ok(planned.kind === 'plan');
-  assert.deepEqual(planned.coverage, covered);
-  assert.equal(planned.lookbackAnchor, covered.number);
+  assert.deepEqual(planned.previousHeartbeatBlock, covered);
   assert.deepEqual(registryQueries, [[REGISTRY_DEPLOYED, HEAD]]);
 });
 
@@ -371,13 +367,13 @@ test('a canonical hint narrows the search by its header, whatever timestamp it c
   const { planned, registryQueries } = await planOver(
     {
       head: HEAD,
-      storedHeartbeat: covered.timestamp,
+      heartbeatTimestamp: covered.timestamp,
       heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
     },
     {},
-    { ...hintAt(hinted.number), coverageThrough: { ...hinted, timestamp: covered.timestamp + 1 } },
+    { ...hinted, timestamp: covered.timestamp + 1 },
   );
   assert.ok(planned.kind === 'plan');
-  assert.deepEqual(planned.coverage, covered);
+  assert.deepEqual(planned.previousHeartbeatBlock, covered);
   assert.deepEqual(registryQueries, [[hinted.number, HEAD]]);
 });

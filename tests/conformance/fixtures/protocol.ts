@@ -132,8 +132,7 @@ async function deployProtocol(anvil: AnvilFixture): Promise<ProtocolFixture> {
   ]);
   await authorizeBorrower(anvil, core, coreArtifact.abi, admin.address);
 
-  const createMarket = () =>
-    createMarketFixture(anvil, write, deploy, core, coreArtifact.abi, admin.address, guardianSignals);
+  const createMarket = () => createMarketFixture(write, deploy, core, coreArtifact.abi, admin.address, guardianSignals);
   const primaryMarket = await createMarket();
   const setDelegate = () => write(guardianSignals, guardianArtifact.abi, 'setDelegate', [delegate.address]);
   const suspect = (marketId: Hex, borrowers: readonly Address[]) =>
@@ -235,7 +234,6 @@ async function authorizeBorrower(anvil: AnvilFixture, core: Address, coreAbi: Ab
 }
 
 async function createMarketFixture(
-  anvil: AnvilFixture,
   write: Write,
   deploy: Deploy,
   core: Address,

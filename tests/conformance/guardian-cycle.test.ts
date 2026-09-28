@@ -69,7 +69,7 @@ test('lands required suspect, flag and heartbeat through SDK signing', async () 
   assert.equal(recording.requests[0]?.anchors[0]?.transactionHash, supplied.transactionHash);
   assert.ok((await suspectedBy(fixture)).includes(fixture.admin.address.toLowerCase()));
   assert.ok((await flaggedBy(fixture)).includes(fixture.admin.address.toLowerCase()));
-  assert.equal(await heartbeatTimestamp(fixture), outcome.cursor.storedTimestamp);
+  assert.equal(await heartbeatTimestamp(fixture), outcome.previousHeartbeatBlock.timestamp);
 });
 
 test('reconstructs both an absorbed dust supply and the supply that absorbed it', async () => {
@@ -118,8 +118,8 @@ test('dust supplied before coverage stays in work when a later activation absorb
   const guardian = guardianOf(fixture, recordingProvider(cleanResult()).provider);
   const plan = await guardian.buildScanPlan();
   assert.equal(plan.kind, 'plan');
-  assert.ok(plan.coverage !== null);
-  assert.ok(BigInt(plan.coverage.number) > dust.blockNumber);
+  assert.ok(plan.previousHeartbeatBlock !== null);
+  assert.ok(BigInt(plan.previousHeartbeatBlock.number) > dust.blockNumber);
   const work = await guardian.reconstructWork(await guardian.discoverCandidatePositions(plan));
   const hashes = work
     .all()
@@ -129,7 +129,7 @@ test('dust supplied before coverage stays in work when a later activation absorb
   assert.ok(!hashes.includes(original.transactionHash));
 });
 
-test('uses the latest membership anchor after removal and re-addition', async () => {
+test('discovers supplies around removal and re-addition from the membership-based range', async () => {
   const fixture = await deployed;
   const beforeRemoval = await fixture.primaryMarket.supply(100n);
   const readded = await fixture.removeAndReaddGuardian();
@@ -139,7 +139,7 @@ test('uses the latest membership anchor after removal and re-addition', async ()
   const guardian = guardianOf(fixture, recording.provider);
   const plan = await guardian.buildScanPlan();
   assert.equal(plan.kind, 'plan');
-  assert.equal(plan.lookbackAnchor, Number(readded.blockNumber));
+  assert.ok(BigInt(plan.discoveryRange.from.number) <= readded.blockNumber);
   const work = await guardian.reconstructWork(await guardian.discoverCandidatePositions(plan));
   const screened = await guardian.screenWork(work);
 
@@ -193,7 +193,7 @@ test('keeps own-flagged work in coverage without calling the provider', async ()
   const outcome = await cycleWith(fixture, forbidden);
 
   assert.equal(outcome.kind, 'attested');
-  assert.equal(await heartbeatTimestamp(fixture), outcome.cursor.storedTimestamp);
+  assert.equal(await heartbeatTimestamp(fixture), outcome.previousHeartbeatBlock.timestamp);
 });
 
 test('stops an incomplete real-cycle decision before reports or heartbeat', async () => {
