@@ -2,6 +2,7 @@
 // decision of `docs/guardian-specification.md`, sections B and C.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { padHex } from 'viem';
 
 import type { GuardianSetup } from '../../src/core/guardian.ts';
 import type { Work } from '../../src/core/outcomes.ts';
@@ -235,6 +236,9 @@ test('a due lot yields one anchor, and the supply beside it ends the walk', asyn
   assert.equal(anchor.logIndex, 5, 'the anchor is the supply, one log after the activation');
   const lifecycleQueries = node.logQueries.filter((query) => query.address === CONTROLLER);
   assert.equal(lifecycleQueries.length, 11, 'the walk reads down to the span that holds the lot and no older one');
+  for (const query of lifecycleQueries) {
+    assert.equal(query.topics[1], padHex(BORROWER, { size: 32 }));
+  }
 });
 
 test('an activation that absorbed dust keeps the supply that dust came from', async () => {
@@ -456,7 +460,14 @@ test('a log range the node refuses is not silently retried with different config
         },
         { maxLogBlockRange: SPAN },
       ),
-      `the configured range must remain visible as a failure: ${logsCapped.message}`,
+      (error: unknown) =>
+        hasCause(
+          error,
+          (candidate) =>
+            candidate instanceof Error &&
+            candidate.message === logsCapped.message &&
+            (logsCapped.code === undefined || ('code' in candidate && candidate.code === logsCapped.code)),
+        ),
     );
   }
 });
@@ -472,7 +483,15 @@ test('a node that refuses a single-block query stops the cycle', async () => {
       },
       { maxLogBlockRange: SPAN },
     ),
-    'a single block the node will not serve is a fault, not a range to halve',
+    (error: unknown) =>
+      hasCause(
+        error,
+        (candidate) =>
+          candidate instanceof Error &&
+          candidate.message === 'query returned more than 10000 results' &&
+          'code' in candidate &&
+          candidate.code === -32005,
+      ),
   );
 });
 
@@ -498,7 +517,8 @@ test('a log response the client will not read stops the cycle', async () => {
       },
       { maxLogBlockRange: SPAN },
     ),
-    'the caller must observe and fix a response-size failure',
+    (error: unknown) =>
+      hasCause(error, (candidate) => candidate instanceof Error && candidate.name === 'ResponseBodyTooLargeError'),
   );
 });
 
@@ -702,3 +722,19 @@ test('multiple supplies in one block yield distinct anchors regardless of return
     [100_000, 9],
   ]);
 });
+
+function hasCause(error: unknown, predicate: (candidate: unknown) => boolean): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (current !== null && typeof current === 'object') {
+    if (seen.has(current)) {
+      break;
+    }
+    if (predicate(current)) {
+      return true;
+    }
+    seen.add(current);
+    current = 'cause' in current ? current.cause : undefined;
+  }
+  return false;
+}

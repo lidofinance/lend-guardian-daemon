@@ -1,6 +1,6 @@
 {
   "repository": {
-    "revision": "158633403243d8ceafd7a1fb7d14d0fd009c3a4b"
+    "revision": "bdf9e5047525c5b6f7489385fd494d53242db9a3"
   },
   "build": {
     "command": "forge build",
@@ -17,38 +17,38 @@
   "artifacts": {
     "GuardianSignals.json": {
       "classification": "production",
-      "upstreamSha256": "6a3558837cfb32e71514b3f90677b2d85a76fd371bf44c52390440060f6cfa10",
+      "upstreamSha256": "7f1d54fdd0106304546988fe91b93e01eecec64f74b9eca7ff07891eefc76af7",
       "sha256": "4ba561ef0a1d7dd38db1c0a7f8b7cf7fd58f21b9ed73847ad604209618da2950",
       "bytecodeSha256": "0304f4faa89addfbd8b7a2c7da4d34b5e2f42a652087adc4262a2f7e0304a88c"
     },
     "OssifiableProxy.json": {
       "classification": "production",
-      "upstreamSha256": "9a41e8bef691e3ba003dc60752faff719cac07f0818c8141382f9b73f81c96c7",
+      "upstreamSha256": "5a291f3b75aacb963b5b0e30a808cdc357b0d928b375c47633e8c8ce8b9ea415",
       "sha256": "572d3442ca5749d37454fb80aefb8af7d63654a6aeafacbd9e6d446b00feec8b",
       "bytecodeSha256": "5618732d389b8c746134b41da82f679335584c18372d533109f10490e4477e19"
     },
     "Core.json": {
       "classification": "production",
-      "upstreamSha256": "e195e0c72160eaec77a4c838cb50fc9ba84038ab73ce59383616549aa1e352a8",
-      "sha256": "44f866c69d643595e84b27f0598290c68015f7d0432e5c8175e4c287485b2868",
+      "upstreamSha256": "196e22f14076fdf49019cbeeb46e0ae805ac49ec30232e805ff5f2ad94782bea",
+      "sha256": "5b7007b7556dabd60e4ff5b40be00f3e8066467e9d544aafe2571eee449b819b",
       "bytecodeSha256": "8f042a44ed49296e547c8e4b386f6dcfbdd4f02c58c28bf16aeeec6f375ef35c"
     },
     "MarketController.json": {
       "classification": "production",
-      "upstreamSha256": "fdd9703bf68a56a1199c26cd65b9d32977f863f10106b92bf7cc8942288a9ee5",
-      "sha256": "9a8a9641b7f484456a2708e549dfcd55c2398db4472ad44f1e8f0f75563a6bc8",
-      "bytecodeSha256": "c91447e0033e8eac03881120a329e486e6a0ce6d8029e64fcb23bdf84356605f"
+      "upstreamSha256": "0f51d5da87e2896d7605e46d6c62c7654ec50acf7ec7e9c657128d760f4e2960",
+      "sha256": "f72e6f895984bbff0a77ee3fc09ddbd962937c4114df5a45304e2ab048ac285b",
+      "bytecodeSha256": "58a12440a63d8a40663568b1117bd159bc3cc9e743280e5a276d6da9b847884f"
     },
     "MockERC20.json": {
       "classification": "synthetic-test-dependency",
-      "upstreamSha256": "1dd5f628e2ca4dee9a02c158049d1d8fae0be0127def8dd83fece192d4d42f6c",
+      "upstreamSha256": "1c78b050d3279b173dbcbb5822f6c7b71e4d4f9bf150a8701f135f065d1ac8e5",
       "sha256": "bd83b9b0ea56fdec31f734fffc44b41bb660cfd6399b2c5c45c3d70c8c3be82d",
       "bytecodeSha256": "ef28462f7d098de4820ff10e7c8df944a7f42b6bb6b215a6875e54db733a8432"
     },
     "MockPriceOracle.json": {
       "classification": "synthetic-test-dependency",
-      "upstreamSha256": "da565c9cd6205d5640f5ec8e4219099174b2d9be8c4e47d55949acaea0170b79",
-      "sha256": "1a82d7c7c483f8629da6fc58dcd83fa1aa46e69a7973524b486ae8f24186219f",
+      "upstreamSha256": "7fa39947a8be23215405e0cae9b3c65cfa07d334a3ee7495e3bf6aef640f56b2",
+      "sha256": "45d61d70f91e968729dd3974dde87e140eedd06fe145a4018d637f80b06b9cce",
       "bytecodeSha256": "b09b8647f5a1308e475a551f81c89a2b87dabc567b9b4c9be8b1bd3d5e645494"
     }
   },

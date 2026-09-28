@@ -25,6 +25,8 @@ npm install git+https://github.com/lidofinance/lido-lend-guardian-daemon-sdk.git
 
 Node.js 24 or newer is required. The package currently uses `private: true` to disable npm registry publication; installation from Git is supported.
 
+Both entry points need viem at run time. The package declares it as a peer dependency, `^2.55.19`, so the application and the SDK share one viem installation; the SDK is tested with viem 2.55.19. npm installs a missing peer automatically. With a package manager that does not, add viem to the application.
+
 The package exposes two entry points:
 
 - `guardian-daemon-sdk/core` contains `Guardian`, the screening interface, phase outcomes, shared types and the generic RPC interfaces.
@@ -52,7 +54,7 @@ if ('previousHeartbeatBlock' in outcome) {
 
 `cycle` emits typed phase and terminal events through the same `onEvent` handler as RPC, transaction and report events. Missing, malformed or incomplete screening results stop the attempt before submission. In signal mode the SDK submits required suspect reports, then flag reports, verifies their canonical confirmations and finally submits and confirms the heartbeat. RPC and provider failures propagate to the application.
 
-For viem, create one reusable transport, use it to configure the public and wallet clients, and pass those clients to `ViemRpcClient`. Applications using another library may implement the exported RPC interfaces directly. The reference implementation for both modes is in [`example/daemon.ts`](example/daemon.ts).
+For viem, create one reusable transport, use it to configure the public and wallet clients, and pass those clients to `ViemRpcClient`. Applications using another library may implement the exported `RpcProvider` reads and `RpcClient` preparation, broadcast and bounded-delivery methods directly. In signal mode `Guardian` requires the client's `transactionPolicy.sendTimeoutMs` to be an integer from 1 to 2,147,483,647 milliseconds, rejects any other value at construction and applies the same budget to its shared report-confirmation wait. `Guardian.clearPendingNonces()` is an explicit signal-mode recovery operation for a reconciled dedicated signer; it is not run automatically by `cycle`. The reference implementation for both modes is in [`example/daemon.ts`](example/daemon.ts).
 
 ## Development
 

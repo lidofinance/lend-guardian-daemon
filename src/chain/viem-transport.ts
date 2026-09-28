@@ -8,6 +8,7 @@ import {
   fallback,
 } from 'viem';
 import type { EIP1193Parameters, FallbackTransport, Transport } from 'viem';
+import { frozenCopy } from '../common/immutable.ts';
 import { isRecord, requireInteger } from '../common/validation.ts';
 import { emitEvent } from '../events.ts';
 import type { EventHandler, RpcRequestFinishedEvent, RpcRequestStartedEvent } from '../events.ts';
@@ -39,6 +40,17 @@ interface JsonRpcError {
 type ParsedJson =
   | { readonly status: 'valid'; readonly value: unknown }
   | { readonly status: 'invalid'; readonly error: Error };
+
+type RpcReply =
+  | { readonly kind: 'result'; readonly result: unknown }
+  | { readonly kind: 'error'; readonly error: JsonRpcError }
+  | { readonly kind: 'malformed'; readonly message: string };
+
+const NEITHER_RESULT_NOR_ERROR = 'The RPC endpoint returned neither a result nor a valid error.';
+
+const BOTH_RESULT_AND_ERROR = 'The RPC endpoint returned both result and error.';
+
+const INVALID_ERROR = 'The RPC endpoint returned an invalid error.';
 
 /** The SDK's viem transport: direct HTTP owns an attempt; viem owns retries and endpoint selection. */
 export function createViemRpcTransport(options: ViemRpcTransportOptions): ViemRpcTransport {
@@ -84,6 +96,8 @@ class HttpAttempt {
 
   readonly #bodyText: string;
 
+  readonly #requestId: number;
+
   readonly #rpcIndex: number;
 
   readonly #target: RequestTarget;
@@ -102,6 +116,7 @@ class HttpAttempt {
     options: ViemRpcTransportOptions,
   ) {
     this.#args = args;
+    this.#requestId = id;
     this.#body = {
       jsonrpc: '2.0',
       id,
@@ -145,10 +160,15 @@ class HttpAttempt {
   }
 
   #started(): RpcRequestStartedEvent {
+    // viem sends the same parameters on a retry and to the next endpoint, so an observer gets a
+    // frozen copy: editing what it received cannot change a later attempt.
+    const params = this.#args.params === undefined ? {} : { params: frozenCopy(this.#args.params) };
     return {
       event: 'rpc.requestStarted',
+      requestId: this.#requestId,
       rpcIndex: this.#rpcIndex,
       method: this.#args.method,
+      ...params,
       startedAt: performance.timeOrigin + performance.now(),
     };
   }
@@ -210,16 +230,20 @@ class HttpAttempt {
       }
       throw parsed.error;
     }
-    const reply = parsed.value;
-    const refused = rpcErrorOf(reply);
-    if (refused !== undefined) {
-      throw new RpcRequestError({ body: this.#body, error: refused, url: this.#target.url });
+    const reply = classifyReply(parsed.value);
+    // A JSON-RPC error keeps its code and data under any HTTP status. Every other reply of a
+    // failed HTTP request is reported with that status, so its retry headers stay available.
+    if (reply.kind === 'error') {
+      throw new RpcRequestError({ body: this.#body, error: reply.error, url: this.#target.url });
     }
     if (!response.ok) {
       throw this.#httpError(response);
     }
+    if (reply.kind === 'malformed') {
+      throw new TypeError(reply.message);
+    }
 
-    return isRecord(reply) ? reply.result : undefined;
+    return reply.result;
   }
 
   #httpError(response: Response): HttpRequestError {
@@ -298,11 +322,40 @@ function parsedJson(text: string): ParsedJson {
   }
 }
 
-function rpcErrorOf(reply: unknown): JsonRpcError | undefined {
-  if (!isRecord(reply) || !isRecord(reply.error)) {
+/**
+ * Decide whether a JSON-RPC reply holds a result, an error or neither. Some endpoints send the
+ * unused field as null, so a null `error` means no error and a null `result` beside an error is
+ * not a result.
+ */
+function classifyReply(reply: unknown): RpcReply {
+  if (!isRecord(reply)) {
+    return { kind: 'malformed', message: NEITHER_RESULT_NOR_ERROR };
+  }
+  const hasResult = Object.hasOwn(reply, 'result');
+  const hasError = reply.error !== undefined && reply.error !== null;
+  if (!hasError) {
+    if (!hasResult) {
+      return { kind: 'malformed', message: NEITHER_RESULT_NOR_ERROR };
+    }
+    return { kind: 'result', result: reply.result };
+  }
+  const hasResultValue = hasResult && reply.result !== null;
+  if (hasResultValue) {
+    return { kind: 'malformed', message: BOTH_RESULT_AND_ERROR };
+  }
+  const error = parseRpcError(reply.error);
+  if (error === undefined) {
+    return { kind: 'malformed', message: INVALID_ERROR };
+  }
+
+  return { kind: 'error', error };
+}
+
+function parseRpcError(error: unknown): JsonRpcError | undefined {
+  if (!isRecord(error)) {
     return undefined;
   }
-  const { code, message, data } = reply.error;
+  const { code, message, data } = error;
   if (typeof code !== 'number' || typeof message !== 'string') {
     return undefined;
   }

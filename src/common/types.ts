@@ -4,8 +4,9 @@
 // `lower` normalizes hexadecimal case for addresses and transaction keys without validating them.
 //
 // viem declares the same shapes, and these stay ours on purpose: a consumer names them without
-// installing viem, and a viem major is then not a breaking change of this package's surface, which
-// `scripts/check-surface.ts` enforces. These public types intentionally remain independent of viem.
+// importing viem's types, and a viem major is then not a breaking change of this package's type
+// surface, which `scripts/check-surface.ts` enforces. At run time the package needs viem, which the
+// consumer installs as a peer dependency.
 
 /**
  * A `0x`-prefixed hex string. This template type is not a runtime byte or length validator.

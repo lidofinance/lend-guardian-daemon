@@ -150,6 +150,6 @@ test('a signal failure stops the scheduler instead of starting another attempt',
   assert.equal(child.error, undefined);
   assert.equal(child.status, 1, child.stderr);
   assert.match(child.stdout, /synthetic provider outage/);
-  assert.match(child.stdout, /reconcile pending transactions before restarting/);
+  assert.match(child.stdout, /reconcile the reports and transactions already sent before restarting/);
   assert.match(child.stdout, /Signal failure returned without retrying/);
 });

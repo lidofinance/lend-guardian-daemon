@@ -647,6 +647,30 @@ test('a receipt RPC failure propagates unchanged and is not treated as an absent
   assert.equal(node.sendRawTransaction.calls.length, 1);
 });
 
+test('recognizes receipt absence from another viem package instance', async () => {
+  const absent = Object.assign(new Error('receipt not found'), { name: 'TransactionReceiptNotFoundError' });
+  const fake = harness({
+    node: { getTransactionReceipt: answering(failure(absent), value(RECEIPT)) },
+  });
+
+  await registryDelivery(fake.options, fake.observe).sendSuspects([TARGET], 1);
+
+  assert.equal(fake.node.sendRawTransaction.calls.length, 1);
+});
+
+test('recognizes an inclusion wait timeout from another viem package instance', async (context) => {
+  const timedOut = Object.assign(new Error('wait timed out'), { name: 'WaitForTransactionReceiptTimeoutError' });
+  const fake = harness({
+    node: { getTransactionReceipt: answering(failure(notFound()), value(RECEIPT)) },
+  });
+  context.mock.method(fake.options.publicClient, 'waitForTransactionReceipt', () => Promise.reject(timedOut));
+
+  await registryDelivery(fake.options, fake.observe).sendSuspects([TARGET], 1);
+
+  assert.equal(fake.node.getTransactionReceipt.calls.length, 3);
+  assert.equal(fake.node.sendRawTransaction.calls.length, 1);
+});
+
 test('a pending receipt can become readable without another block or replacement', { timeout: 1000 }, async () => {
   const { options, observe, node } = harness({
     node: {

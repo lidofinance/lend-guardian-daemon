@@ -1,6 +1,5 @@
 // EIP-1559 delivery over configured viem clients. The transport owns RPC retries and failover.
 import { setTimeout as sleep } from 'node:timers/promises';
-import { TransactionReceiptNotFoundError, WaitForTransactionReceiptTimeoutError } from 'viem';
 import type { Account, Chain, PublicClient, TransactionReceipt as ViemReceipt, Transport, WalletClient } from 'viem';
 import { emitEvent } from '../events.ts';
 import type { EventHandler, TransactionContext, TransactionStage } from '../events.ts';
@@ -301,7 +300,7 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
         checkReplacement: false,
       });
     } catch (error) {
-      if (!(error instanceof WaitForTransactionReceiptTimeoutError)) {
+      if (!isNamedError(error, 'WaitForTransactionReceiptTimeoutError')) {
         throw error;
       }
       // viem can suppress head-poll errors. A failed fresh read must not cause a fee bump.
@@ -321,7 +320,7 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
   async #receiptOf(hashes: readonly TxHash[]): Promise<ViemReceipt | null> {
     for (const hash of hashes) {
       const receipt = await this.#publicClient.getTransactionReceipt({ hash }).catch((error: unknown) => {
-        if (error instanceof TransactionReceiptNotFoundError) {
+        if (isNamedError(error, 'TransactionReceiptNotFoundError')) {
           return null;
         }
         throw error;
@@ -384,3 +383,8 @@ export { createViemRpcTransport } from './viem-transport.ts';
 export type { ViemRpcTransport, ViemRpcTransportOptions } from './viem-transport.ts';
 
 export type { TransactionPolicy } from './rpc.ts';
+
+/** Match public viem error identities across package instances. */
+function isNamedError(error: unknown, name: string): error is Error {
+  return error instanceof Error && error.name === name;
+}

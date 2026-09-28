@@ -6,6 +6,9 @@ import { mainnet } from 'viem/chains';
 import type { EventHandler, Hex, RpcRequest } from '../../src/core/index.ts';
 import { GUARDIAN_KEY } from './fake-node.ts';
 
+/** The delivery budget of every client built here, which Guardian also applies to its shared wait. */
+export const SEND_TIMEOUT_MS = 264_000;
+
 export function signingClient(
   endpoints: readonly NodeEndpoint[],
   privateKey: Hex = GUARDIAN_KEY,
@@ -40,7 +43,7 @@ export function signingClient(
     walletClient,
     maxLogBlockRange,
     transactionPolicy: {
-      sendTimeoutMs: 264_000,
+      sendTimeoutMs: SEND_TIMEOUT_MS,
       replacementFeeBumpBps: 1_000,
       maxFeePerGas: 1_000_000_000_000n,
       replacementTimeoutMs: 3,

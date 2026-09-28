@@ -67,9 +67,10 @@ async function main(): Promise<void> {
       previousHeartbeatBlock = await cycle(guardian, previousHeartbeatBlock);
     } catch (error) {
       console.error('cycle failed:', error);
-      // A failed send may still have reached the chain. This example has no pending-write journal.
+      // A failed send may still have reached the chain, and earlier reports of the attempt may
+      // already be included. This example keeps no journal of what it sent.
       if (mode === 'signal') {
-        console.error('Signal mode stopped; reconcile pending transactions before restarting.');
+        console.error('Signal mode stopped; reconcile the reports and transactions already sent before restarting.');
         process.exitCode = 1;
         return;
       }

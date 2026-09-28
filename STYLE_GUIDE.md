@@ -56,7 +56,7 @@ Sources these rules are drawn from: the [Google TypeScript Style Guide](https://
 
 - Expected outcomes are values, not exceptions: a parser that finds nothing returns `undefined`, an ambiguous match returns a failure object with a reason code. Exceptions propagate infrastructure failures and represent programming errors or broken invariants; handle them at the owning boundary without turning missing evidence into success.
 - Throw `Error` instances, never strings, and keep the context: provider, operation, transaction hash, the value that was wrong. Wrap a caught error with `new Error(message, { cause })` rather than losing it (lint: `preserve-caught-error`).
-- Keys, URLs with secrets and full responses never appear in messages, in a value the library returns or in a file a tool writes. A reason a caller may store or display names what failed, never the request that failed.
+- Structured fields of SDK events never hold signing keys, credentials or full RPC responses, and identify an endpoint only by `rpcIndex`; RPC request events carry the method and a copy of the parameters. Error objects keep viem's form, including those the SDK transport creates and those carried in an event's `error` field: they name the endpoint URL and the request, so the integrating application must redact them at its logging boundary before display or persistence. A reason code defined by the SDK names what failed, never the request that failed.
 - `catch (error)` treats `error` as `unknown` and narrows with `instanceof` or a guard. A `catch` that ignores the error has a comment saying why ignoring it is correct; a `catch` never turns an error into an empty success, and expected incompleteness is returned explicitly (`coverage: 'partial'` with reasons).
 
 ## Modules

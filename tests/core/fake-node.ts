@@ -106,6 +106,7 @@ interface LogQuery {
   readonly address: string;
   readonly fromBlock: number;
   readonly toBlock: number;
+  readonly topics: readonly unknown[];
 }
 
 /** One `eth_getLogs` the core sent for a single block by its hash. */
@@ -130,6 +131,10 @@ export interface LogsCap {
 
 export interface Script {
   head: number;
+  /** Numbered blocks this node answers as unknown. */
+  readonly missingBlocks?: readonly number[];
+  /** A numbered block whose returned hash is deliberately malformed. */
+  readonly invalidBlockHashAt?: number;
   /** What `eth_chainId` answers, or `CHAIN_ID`. */
   readonly chainId?: number;
   readonly isGuardian?: boolean;
@@ -202,6 +207,7 @@ function txOf(lot: Lot): Bytes32 {
 export interface FakeNode {
   readonly sent: Sent;
   setReceipt(hash: TxHash, receipt: Receipt | null): void;
+  setHeartbeatTimestamp(timestamp: number): void;
   readonly transport: (method: string, params: readonly unknown[]) => Promise<unknown>;
   readonly logQueries: LogQuery[];
   /** The one-block queries by hash, in the order they were sent. */
@@ -234,6 +240,9 @@ export function fakeNode(script: Script): FakeNode {
     sent: state.sent,
     setReceipt: (hash, receipt) => {
       state.submitted.set(hash, receipt);
+    },
+    setHeartbeatTimestamp: (timestamp) => {
+      Object.assign(state, { heartbeatTimestamp: timestamp });
     },
     logQueries: queries.ranges,
     blockLogQueries: queries.blocks,
@@ -285,12 +294,16 @@ function blockAnswer(script: NodeState, params: readonly unknown[]): unknown {
   const tag = String(params[0]);
   const isLatest = tag === 'latest';
   const number = isLatest ? script.head : Number(BigInt(tag));
+  if (!isLatest && script.missingBlocks?.includes(number) === true) {
+    return null;
+  }
   const block = blockAt(number);
   const isForkedHead = isLatest && script.isHeadForked;
   const isReorgedBlock = script.reorgedBlockNumbers.has(number);
+  const canonicalHash = isForkedHead || isReorgedBlock ? FORKED_HEAD_HASH : block.hash;
   return {
     number: numberToHex(block.number),
-    hash: isForkedHead || isReorgedBlock ? FORKED_HEAD_HASH : block.hash,
+    hash: script.invalidBlockHashAt === number ? '0x01' : canonicalHash,
     timestamp: numberToHex(block.timestamp),
     parentHash: zeroHash,
     baseFeePerGas: '0x1',
@@ -360,7 +373,7 @@ function logAnswer(script: Script, params: readonly unknown[], queries: Queries)
   if (kind === 'lifecycle' && isCapped) {
     throw Object.assign(new Error(cap.message), cap.code === undefined ? {} : { code: cap.code });
   }
-  queries.ranges.push({ address: text(filter, 'address'), fromBlock: from, toBlock: to });
+  queries.ranges.push({ address: text(filter, 'address'), fromBlock: from, toBlock: to, topics });
 
   const logs = selectedLogs(script, kind, from, to);
   return isBroken(script, kind, from === to) ? logs.map(undecodable) : logs;
