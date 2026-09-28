@@ -280,10 +280,13 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
     if (receipt !== null) {
       return receipt;
     }
-    const timeout = Math.min(this.transactionPolicy.replacementTimeoutMs, deadline - Date.now());
-    if (timeout <= 0) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
       throw new DeliveryLimit('confirmation-timeout');
     }
+    const replacementTimeoutMs = this.transactionPolicy.replacementTimeoutMs;
+    const isBoundedByDeadline = remainingMs <= replacementTimeoutMs;
+    const timeout = Math.min(replacementTimeoutMs, remainingMs);
     const hash = hashes.at(-1);
     if (hash === undefined) {
       // No broadcast was allowed by the fee cap. Pace the next estimate.
@@ -303,7 +306,14 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
       }
       // viem can suppress head-poll errors. A failed fresh read must not cause a fee bump.
       await this.#publicClient.getBlockNumber({ cacheTime: 0 });
-      return await this.#receiptOf(hashes);
+      const receiptAfterTimeout = await this.#receiptOf(hashes);
+      if (receiptAfterTimeout !== null) {
+        return receiptAfterTimeout;
+      }
+      if (isBoundedByDeadline) {
+        throw new DeliveryLimit('confirmation-timeout');
+      }
+      return null;
     }
   }
 
