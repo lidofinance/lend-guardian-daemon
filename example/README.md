@@ -8,7 +8,7 @@ The example runs from the SDK source checkout on Node 24 or newer, after install
 
 ## Read and adapt the example
 
-1. Follow `cycle` in [`daemon.ts`](daemon.ts) to see all five specification phases and the outcomes that stop an attempt. An observed cycle does not advance coverage; an attested cursor comes from a confirmed heartbeat.
+1. Follow `Guardian.cycle` and its use in [`daemon.ts`](daemon.ts) to see one complete iteration and the outcomes that stop it. An observed cycle does not advance coverage; an attested cursor comes from a confirmed heartbeat.
 2. Read `createGuardian` in the same file for the reusable viem transport, public/wallet clients, one shared `onEvent` handler and SDK limits. `main` runs one cycle at a time and owns retry timing.
 3. Implement your provider in [`screening-adapter.ts`](screening-adapter.ts). Return decisions in the original anchor order; a timeout, missing answer or unknown result must remain incomplete. Keep vendor-specific calls and policy in this adapter.
 4. Set the deployment inputs below, start in observe mode and check the reconstructed work and proposed reports. Enable signal mode only with the intended delegate and a plan for reconciling pending writes after failure.
@@ -58,7 +58,7 @@ export const screening: ScreeningProvider = new YourScreeningProvider(/* provide
 
 `daemon.ts` imports this instance and passes it directly to `Guardian`. `main()` has no arguments and is not exported; the example is meant to be read and adapted, not imported as an application API.
 
-Your provider implements `ScreeningProvider`. Return one positional result for each requested anchor: `judged` with actual suspect/flag decisions, or `incomplete` when a decision cannot be established. Exceptions propagate. Optional evidence is described in the [SDK integration guide](../README.md#integration).
+Your provider implements `ScreeningProvider`. Return one positional result for each requested anchor: `judged` with actual suspect/flag decisions, or `incomplete` when a decision cannot be established. Exceptions propagate. An optional `evidenceReference` may be omitted, `undefined`, `null` or a nonempty string.
 
 ```bash
 MODE=observe node example/daemon.ts
@@ -84,7 +84,7 @@ MODE=signal node example/daemon.ts
 
 The example passes the provider directly to the SDK without checking its concrete class. Incomplete requested results stop the cycle. When no anchors require screening, the SDK may send a heartbeat without calling the provider, including with the placeholder selected.
 
-`cycle` keeps the specification order visible: `buildScanPlan → discoverCandidatePositions → reconstructWork → screenWork → signalAndHeartbeat`. Signal mode sends required suspect reports, flag reports and finally a heartbeat. Missing, incomplete or malformed results and provider exceptions abort before submission. Existing own-flag exclusions remain unchanged.
+`Guardian.cycle` runs `buildScanPlan → discoverCandidatePositions → reconstructWork → screenWork → signalAndHeartbeat` and emits each completed phase through `onEvent`. Signal mode sends required suspect reports, flag reports and finally a heartbeat. Missing, incomplete or malformed results and provider exceptions abort before submission. Existing own-flag exclusions remain unchanged.
 
 ## Delivery and recovery limits
 
@@ -98,7 +98,7 @@ These are choices of this example, not additional specification requirements:
 - The client caps fees at 100 gwei, considers replacement after 36 seconds, raises both fees by more than 10% and allows five preparation attempts within a 264-second send budget. Replacements retain the transaction's nonce and call; the SDK manages confirmation within the current send. These settings are examples to review for the target network.
 - The example prints errors directly with `console.error('cycle failed:', error)`, preserving the error object and stack without custom viem parsing or a redaction layer. Production logging, credential redaction, persistent records and alerts belong to the integrating application.
 
-The [SDK integration guide](../README.md#integration) describes delivery events and transport customization. The [Guardian specification](../docs/guardian-specification.md) defines required behavior; this launcher is one possible application around it.
+The [SDK README](../README.md) describes the package entry points. The [Guardian specification](../docs/guardian-specification.md) defines required behavior; this launcher is one possible application around it.
 
 ## Verification
 

@@ -32,7 +32,7 @@ const DUE: Script = {
 
 test('the example never submits or advances coverage when screening is unconfigured', async () => {
   const { guardian, sent } = guardianOver(DUE, { screening: new UnconfiguredScreening() });
-  await assert.rejects(cycle(guardian, undefined, 'signal'), {
+  await assert.rejects(cycle(guardian, undefined), {
     reason: 'screening-result-incomplete',
   });
   assert.deepEqual(sent.calls, []);
@@ -53,7 +53,7 @@ test('observe runs screening through a read-only client and never signals', asyn
   const signalAndHeartbeat = context.mock.method(guardian, 'signalAndHeartbeat', () => {
     assert.fail('observe must not signal or heartbeat');
   });
-  assert.equal(await cycle(guardian, undefined, 'observe'), undefined);
+  assert.equal(await cycle(guardian, undefined), undefined);
   assert.equal(signalAndHeartbeat.mock.callCount(), 0);
   assert.deepEqual(node.sent.calls, []);
 });
@@ -64,7 +64,7 @@ test('signal submits the configured provider decisions before the heartbeat', as
       screen: () => Promise.resolve([{ status: 'judged', requiresSuspect: true, requiresFlag: true }]),
     },
   });
-  const cursor = await cycle(guardian, undefined, 'signal');
+  const cursor = await cycle(guardian, undefined);
   assert.ok(cursor !== undefined);
   assert.deepEqual(sent.calls, ['suspects', 'flags', 'heartbeat']);
 });
@@ -74,7 +74,7 @@ test('a provider exception escapes the cycle without sending reports or heartbea
   const { guardian, sent } = guardianOver(DUE, {
     screening: { screen: () => Promise.reject(failure) },
   });
-  await assert.rejects(cycle(guardian, undefined, 'signal'), (error) => error === failure);
+  await assert.rejects(cycle(guardian, undefined), (error) => error === failure);
   assert.deepEqual(sent.calls, []);
 });
 

@@ -10,7 +10,7 @@ import { pathToFileURL } from 'node:url';
 import { createPublicClient, createWalletClient, isAddressEqual } from 'viem';
 import { createViemRpcTransport, ViemRpcClient } from '../src/chain/viem-client.ts';
 import { Guardian } from '../src/core/index.ts';
-import type { Cursor, EventHandler } from '../src/core/index.ts';
+import type { Cursor, EventHandler, SdkEvent } from '../src/core/index.ts';
 import { screening } from './screening-adapter.ts';
 import { privateKeyToAccount } from 'viem/accounts';
 import * as env from './env.ts';
@@ -64,7 +64,7 @@ async function main(): Promise<void> {
   let cursor: Cursor | undefined;
   while (true) {
     try {
-      cursor = await cycle(guardian, cursor, mode);
+      cursor = await cycle(guardian, cursor);
     } catch (error) {
       console.error('cycle failed:', error);
       // A failed send may still have reached the chain. This example has no pending-write journal.
@@ -83,34 +83,19 @@ async function main(): Promise<void> {
 }
 
 /**
- * Run the five [scan phases](../docs/guardian-specification.md#scan-cycle) through five SDK calls.
- * Each phase uses the original result of the preceding phase in this attempt.
- * A stale result discards the work; main schedules a new attempt instead of looping here.
+ * Run one [scan cycle](../docs/guardian-specification.md#scan-cycle) and retain only confirmed
+ * coverage. A stale or observed result leaves the previous cursor unchanged.
  */
-export async function cycle(guardian: Guardian, hint: Cursor | undefined, mode: Mode): Promise<Cursor | undefined> {
-  // 1. [Coverage and prior heartbeat](../docs/guardian-specification.md#a-build-the-scan-plan).
-  const plan = await guardian.buildScanPlan(hint);
-  if (plan.kind === 'nothing-due') {
-    console.log(`nothing due: ${plan.reason}`);
-    return plan.cursor;
-  }
-
-  // 2. [Candidate positions](../docs/guardian-specification.md#b-discover-candidate-positions).
-  const discovered = await guardian.discoverCandidatePositions(plan);
-  // 3. [Contributing supplies](../docs/guardian-specification.md#c-reconstruct-the-contributors).
-  const work = await guardian.reconstructWork(discovered);
-  console.log(`block ${plan.reportBlock.number}: reconstructed ${work.anchors} supply anchors`);
-  // 4. [Screening](../docs/guardian-specification.md#screening-provider), with own flags resolved.
-  const screened = await guardian.screenWork(work);
-  if (mode === 'observe') {
+export async function cycle(guardian: Guardian, hint: Cursor | undefined): Promise<Cursor | undefined> {
+  const outcome = await guardian.cycle(hint);
+  if (outcome.kind === 'observed') {
+    const { screened } = outcome;
     console.log(
       `observed: ${screened.results.length} screened, ${screened.skipped.length} targets already flagged, ` +
         `${screened.suspects.length} suspects, ${screened.flags.length} flags; no transactions sent`,
     );
     return hint;
   }
-  // 5. [Reports, then heartbeat](../docs/guardian-specification.md#d-submit-signals-and-send-the-heartbeat).
-  const outcome = await guardian.signalAndHeartbeat(screened);
   if (outcome.kind === 'stale') {
     console.log(`plan went stale: ${outcome.reason}`);
     return hint;
@@ -121,12 +106,18 @@ export async function cycle(guardian: Guardian, hint: Cursor | undefined, mode: 
   }
 
   console.log(
-    `attested block ${plan.reportBlock.number}: ${work.anchors} anchors, ` +
-      `${screened.results.length} screened, ${screened.skipped.length} targets already flagged, ` +
-      `${screened.suspects.length} suspects, ${screened.flags.length} flags, ` +
-      `heartbeat ${outcome.heartbeat}`,
+    `attested block ${outcome.cursor.verifiedAt.number}: heartbeat ${outcome.heartbeat}, digest ${outcome.digest}`,
   );
   return outcome.cursor;
+}
+
+/** Keep the example's progress readable while retaining every lower-level SDK event. */
+function logEvent(event: SdkEvent): void {
+  if (event.event === 'cycle.reconstructed') {
+    console.log(`block ${event.reportBlock.number}: reconstructed ${event.anchors.length} supply anchors`);
+    return;
+  }
+  console.log(event);
 }
 
 /** Build the example Guardian with its configuration, event handler and RPC/signing connection. */
@@ -134,7 +125,7 @@ function createGuardian(mode: Mode): Guardian {
   const chain = env.chain('CHAIN_ID');
   const nodeUrls = env.rpcUrls('RPC_URLS');
   const guardianAddress = env.address('GUARDIAN');
-  const onEvent: EventHandler = (event) => console.log(event);
+  const onEvent: EventHandler = logEvent;
   const transport = createViemRpcTransport({
     urls: nodeUrls,
     timeoutMs: RPC_REQUEST_TIMEOUT_MS,

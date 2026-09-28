@@ -11,11 +11,12 @@ import { GuardianSignals } from '../contracts/guardian-signals.ts';
 import { BroadcastFailure, replacementFee } from '../chain/rpc.ts';
 import type { PreparedTransaction, ReceiptRef, RpcClient, RpcProvider, TransactionAttempt } from '../chain/rpc.ts';
 import { emitEvent } from '../events.ts';
-import type { EventHandler, OperationContext, ReportContext, TransactionContext } from '../events.ts';
+import type { CycleContext, EventHandler, OperationContext, ReportContext, TransactionContext } from '../events.ts';
 import type { PositionKey, SignalTarget, SupplyAnchor } from './types.ts';
 import { Discovered, Screened, Work } from './outcomes.ts';
 import type {
   Attested,
+  CycleOutcome,
   Cursor,
   NothingDue,
   NothingDueReason,
@@ -136,6 +137,8 @@ export class Guardian {
 
   #isWriting = false;
 
+  #activeCycle: CycleContext | undefined;
+
   // ─── The cycle: one attempt is these five calls, and the caller owns the loop between them.
 
   constructor(setup: GuardianSetup) {
@@ -152,6 +155,86 @@ export class Guardian {
       deployment: this.#setup.deployment.guardianSignals,
       guardian: this.#setup.guardian,
     });
+  }
+
+  /**
+   * Run one complete [scan cycle](../../docs/guardian-specification.md#scan-cycle). The caller owns
+   * scheduling and recovery between calls; observe mode returns the screened result without writes.
+   */
+  async cycle(hint?: Cursor): Promise<CycleOutcome> {
+    if (this.#activeCycle !== undefined) {
+      throw new Error('another cycle is in progress');
+    }
+    const context = Object.freeze({ cycleId: randomUUID() });
+    const startedAt = Date.now();
+    this.#activeCycle = context;
+    emitEvent(this.#setup.onEvent, { event: 'cycle.started', ...context, startedAt });
+    try {
+      const planned = await this.buildScanPlan(hint);
+      if (planned.kind === 'nothing-due') {
+        const outcome = frozenCopy(planned);
+        emitEvent(this.#setup.onEvent, { event: 'cycle.planned', ...context, result: outcome });
+        emitEvent(this.#setup.onEvent, {
+          event: 'cycle.finished',
+          ...context,
+          startedAt,
+          finishedAt: Date.now(),
+          outcome,
+        });
+        return outcome;
+      }
+      const plan = planned;
+      emitEvent(this.#setup.onEvent, { event: 'cycle.planned', ...context, result: plan });
+
+      const discovered = await this.discoverCandidatePositions(plan);
+      emitEvent(this.#setup.onEvent, {
+        event: 'cycle.discovered',
+        ...context,
+        reportBlock: plan.reportBlock,
+        positions: discovered.all(),
+      });
+      const work = await this.reconstructWork(discovered);
+      emitEvent(this.#setup.onEvent, {
+        event: 'cycle.reconstructed',
+        ...context,
+        reportBlock: work.reportBlock,
+        positions: work.positions,
+        anchors: work.all(),
+      });
+      const screened = await this.screenWork(work);
+      emitEvent(this.#setup.onEvent, {
+        event: 'cycle.screened',
+        ...context,
+        reportBlock: work.reportBlock,
+        results: screened.results,
+        skipped: screened.skipped,
+        suspects: screened.suspects,
+        flags: screened.flags,
+      });
+      const outcome: CycleOutcome =
+        this.#setup.mode === 'observe'
+          ? Object.freeze({ kind: 'observed', cursor: frozenCopy(hint), screened })
+          : frozenCopy(await this.signalAndHeartbeat(screened));
+      emitEvent(this.#setup.onEvent, {
+        event: 'cycle.finished',
+        ...context,
+        startedAt,
+        finishedAt: Date.now(),
+        outcome,
+      });
+      return outcome;
+    } catch (error) {
+      emitEvent(this.#setup.onEvent, {
+        event: 'cycle.failed',
+        ...context,
+        startedAt,
+        finishedAt: Date.now(),
+        error,
+      });
+      throw error;
+    } finally {
+      this.#activeCycle = undefined;
+    }
   }
 
   /**
@@ -301,7 +384,8 @@ export class Guardian {
     }
     const client = this.#setup.client;
     const signer = requireDefined('client.signer', client.signer);
-    const context: TransactionContext = Object.freeze({ method: 'cancel', operationId: randomUUID() });
+    const cycle = this.#activeCycle === undefined ? {} : this.#activeCycle;
+    const context: TransactionContext = Object.freeze({ method: 'cancel', operationId: randomUUID(), ...cycle });
     const deadline = Date.now() + client.transactionPolicy.sendTimeoutMs;
     this.#isWriting = true;
     try {
@@ -934,7 +1018,8 @@ export class Guardian {
   }
 
   #startReport(report: ReportContext): OperationContext {
-    const context = frozenCopy({ ...report, operationId: randomUUID() });
+    const cycle = this.#activeCycle === undefined ? {} : this.#activeCycle;
+    const context = frozenCopy({ ...report, operationId: randomUUID(), ...cycle });
     emitEvent(this.#setup.onEvent, { event: 'report.started', context });
     return context;
   }

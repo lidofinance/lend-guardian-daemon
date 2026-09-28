@@ -1,4 +1,11 @@
 import type { Address, BlockRef, Bytes32, MarketId, TxHash } from './common/types.ts';
+import type { CycleOutcome, NothingDue, Plan, ScreenedAnchor, SkippedTarget } from './core/outcomes.ts';
+import type { PositionKey, SignalTarget, SupplyAnchor } from './core/types.ts';
+
+/** Correlation data shared by every event emitted during one Guardian cycle. */
+export interface CycleContext {
+  readonly cycleId: string;
+}
 
 export type ReportContext =
   | {
@@ -13,9 +20,11 @@ export type ReportContext =
     };
 
 /** Immutable correlation data passed through the contract and RPC layers for one report. */
-export type OperationContext = ReportContext & { readonly operationId: string };
+export type OperationContext = ReportContext & { readonly operationId: string; readonly cycleId?: string };
 
-export type TransactionContext = OperationContext | { readonly operationId: string; readonly method: 'cancel' };
+export type TransactionContext =
+  | OperationContext
+  | { readonly operationId: string; readonly method: 'cancel'; readonly cycleId?: string };
 
 export type TransactionStage = 'preparation' | 'signing' | 'broadcast' | 'confirmation' | 'nonce-clearing';
 
@@ -67,9 +76,54 @@ export type TransactionDeliveryEvent =
       readonly receiptBlockHash?: Bytes32;
     };
 
+/** Phase evidence and the terminal result of one call to `Guardian.cycle`. */
+export type CycleEvent = CycleContext &
+  (
+    | {
+        readonly event: 'cycle.started';
+        readonly startedAt: number;
+      }
+    | {
+        readonly event: 'cycle.planned';
+        readonly result: Plan | NothingDue;
+      }
+    | {
+        readonly event: 'cycle.discovered';
+        readonly reportBlock: BlockRef;
+        readonly positions: readonly PositionKey[];
+      }
+    | {
+        readonly event: 'cycle.reconstructed';
+        readonly reportBlock: BlockRef;
+        readonly positions: number;
+        readonly anchors: readonly SupplyAnchor[];
+      }
+    | {
+        readonly event: 'cycle.screened';
+        readonly reportBlock: BlockRef;
+        readonly results: readonly ScreenedAnchor[];
+        readonly skipped: readonly SkippedTarget[];
+        readonly suspects: readonly SignalTarget[];
+        readonly flags: readonly SignalTarget[];
+      }
+    | {
+        readonly event: 'cycle.finished';
+        readonly startedAt: number;
+        readonly finishedAt: number;
+        readonly outcome: CycleOutcome;
+      }
+    | {
+        readonly event: 'cycle.failed';
+        readonly startedAt: number;
+        readonly finishedAt: number;
+        readonly error: unknown;
+      }
+  );
+
 /** All SDK event names and their payloads. A receipt inclusion is not a confirmed report. */
 export type SdkEvent =
   | (TransactionDeliveryEvent & { readonly context?: TransactionContext | undefined })
+  | CycleEvent
   | RpcEvent
   | {
       readonly event: 'nonce.cleared';

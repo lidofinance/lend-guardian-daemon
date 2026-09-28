@@ -4,10 +4,12 @@ export { Guardian } from './guardian.ts';
 export type { Deployment, GuardianSetup } from './guardian.ts';
 export type {
   Attested,
+  CycleOutcome,
   Cursor,
   Discovered,
   NothingDue,
   NothingDueReason,
+  Observed,
   Plan,
   Screened,
   ScreenedAnchor,
@@ -30,7 +32,15 @@ export { BaseRpcProvider } from '../chain/base-rpc-provider.ts';
 export type { BaseRpcProviderOptions } from '../chain/base-rpc-provider.ts';
 export type { ChainLog, LogFilter, BlockLogFilter, TransactionReceipt } from '../chain/rpc.ts';
 
-export type { EventHandler, SdkEvent, OperationContext, ReportContext, TransactionDeliveryEvent } from '../events.ts';
+export type {
+  CycleContext,
+  CycleEvent,
+  EventHandler,
+  SdkEvent,
+  OperationContext,
+  ReportContext,
+  TransactionDeliveryEvent,
+} from '../events.ts';
 
 export type { TransactionContext, RpcEvent, RpcRequestStartedEvent, RpcRequestFinishedEvent } from '../events.ts';
 

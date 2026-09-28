@@ -290,3 +290,13 @@ export interface Stale {
   readonly kind: 'stale';
   readonly reason: StaleReason;
 }
+
+/** A complete read-only cycle: screening finished, but observe mode submitted nothing. */
+export interface Observed {
+  readonly kind: 'observed';
+  readonly cursor: Cursor | undefined;
+  readonly screened: Screened;
+}
+
+/** Every expected result of one Guardian cycle; infrastructure and invariant failures throw. */
+export type CycleOutcome = Attested | NothingDue | Observed | Stale;
