@@ -1,0 +1,9 @@
+node_modules/
+cache/
+.env
+*.tmp
+.DS_Store
+dist/
+
+# Local audit planning.
+/audit-scope.md

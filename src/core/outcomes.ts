@@ -1,0 +1,292 @@
+// What the five phases hand back. Each value says what the cycle established and what the caller
+// may do next, so the loop around them is a decision over values rather than over exceptions.
+
+import type { PositionKey, SignalTarget, SupplyAnchor } from './types.ts';
+import type { ScreeningResult } from './screening-provider.ts';
+import type { Address, BlockRef, Bytes32, TxHash } from '../common/types.ts';
+import { frozenCopy } from '../common/immutable.ts';
+import { isRecord } from '../common/validation.ts';
+import { GuardianStop } from './stop.ts';
+
+/**
+ * Where coverage stood at the end of a cycle. It is a hint and never an authority: the next `plan`
+ * still requires the latest `Heartbeat` of this Guardian to carry the stored timestamp and to name a
+ * block whose header carries it too. A hinted block that is still canonical only narrows the search
+ * for that event to the blocks from it to the head.
+ */
+export interface Cursor {
+  readonly coverageThrough: BlockRef | null;
+  readonly storedTimestamp: number;
+  readonly verifiedAt: BlockRef;
+}
+
+export type NothingDueReason =
+  | 'report-block-before-core-deployment'
+  | 'report-block-not-past-stored-heartbeat'
+  | 'membership-after-report-block'
+  | 'no-work-and-idle-heartbeat-not-due';
+
+export interface NothingDue {
+  readonly kind: 'nothing-due';
+  readonly cursor: Cursor;
+  readonly reason: NothingDueReason;
+}
+
+// Phase values are immutable snapshots for the caller to inspect. Type-only exports limit the
+// public construction API; they do not authenticate a value's origin. The caller must pass the
+// original values through the same Guardian's attempt in order; there is no instance/replay guard.
+
+/** What phase A produced. `kind` is what lets a caller tell it from `NothingDue`. */
+export interface Plan {
+  readonly kind: 'plan';
+  /** The coverage block; observation, historical events and submission checks use their own blocks. */
+  readonly reportBlock: BlockRef;
+  /** First block of the candidate search, for the cycle record. */
+  readonly discoveryFrom: BlockRef;
+  /**
+   * The block the discovery window reaches back from, for the cycle record: the block a previous
+   * heartbeat covered, or this Guardian's `GuardianAdded` block when there is none. It is the value
+   * before the lookback and the core's deployment floor apply.
+   */
+  readonly lookbackAnchor: number;
+  /**
+   * The block a previous heartbeat already covered, or null before the first one. Phase B keeps a
+   * position when it became due later or gained a new activating contributor, and phase C drops
+   * only the anchors this boundary already covered.
+   */
+  readonly coverage: BlockRef | null;
+  /** What the registry stored when the plan was built. */
+  readonly storedTimestamp: number;
+}
+
+/**
+ * What phase B produced: the positions that may be due at the plan's report block.
+ * The private snapshots keep later reconstruction tied to the same plan and candidate set.
+ */
+export class Discovered {
+  readonly positions: number;
+
+  readonly #plan: Plan;
+
+  readonly #positions: readonly PositionKey[];
+
+  constructor(plan: Plan, positions: readonly PositionKey[]) {
+    this.#plan = frozenCopy({
+      kind: 'plan',
+      reportBlock: plan.reportBlock,
+      discoveryFrom: plan.discoveryFrom,
+      lookbackAnchor: plan.lookbackAnchor,
+      coverage: plan.coverage,
+      storedTimestamp: plan.storedTimestamp,
+    });
+    this.#positions = frozenCopy(positions);
+    this.positions = positions.length;
+    Object.freeze(this);
+  }
+
+  plan(): Plan {
+    return this.#plan;
+  }
+
+  all(): PositionKey[] {
+    return [...this.#positions];
+  }
+}
+
+/**
+ * What phase C produced: every uncovered anchor that may still contribute to a due position.
+ * The private snapshot keeps the digest's input stable while callers inspect separate containers.
+ * This protects ownership, not instance/attempt provenance or reuse.
+ */
+export class Work {
+  readonly reportBlock: BlockRef;
+
+  /** The block a previous heartbeat covered, which the digest commits alongside the anchors. */
+  readonly coverage: BlockRef | null;
+
+  /** The initial heartbeat timestamp; regression below it or advancement past reportBlock invalidates the plan. */
+  readonly storedTimestamp: number;
+
+  readonly anchors: number;
+
+  readonly positions: number;
+
+  readonly #byPosition: ReadonlyMap<PositionKey, readonly SupplyAnchor[]>;
+
+  constructor(plan: Plan, byPosition: ReadonlyMap<PositionKey, readonly SupplyAnchor[]>) {
+    this.reportBlock = frozenCopy(plan.reportBlock);
+    this.coverage = frozenCopy(plan.coverage);
+    this.storedTimestamp = plan.storedTimestamp;
+    this.#byPosition = new Map(
+      [...byPosition].map(([position, anchors]) => [frozenCopy(position), frozenCopy(anchors)]),
+    );
+    this.positions = byPosition.size;
+    this.anchors = [...byPosition.values()].reduce((total, list) => total + list.length, 0);
+    Object.freeze(this);
+  }
+
+  entries(): ReadonlyMap<PositionKey, readonly SupplyAnchor[]> {
+    // Freezing a Map does not disable set/delete/clear; expose a separate map instead.
+    return new Map(this.#byPosition);
+  }
+
+  /** Every anchor the cycle found, flag-skipped ones included: what the digest commits. */
+  all(): SupplyAnchor[] {
+    return [...this.#byPosition.values()].flat();
+  }
+}
+
+/** One anchor sent to the provider, and what the provider answered for it. */
+export interface ScreenedAnchor {
+  readonly anchor: SupplyAnchor;
+  readonly result: ScreeningResult;
+}
+
+/** A target withheld from the provider because this Guardian had already flagged it. */
+export interface SkippedTarget {
+  readonly target: SignalTarget;
+  readonly anchors: readonly SupplyAnchor[];
+  /** `getFlaggedBy(marketId, borrower)` pinned at the report block, which names this Guardian. */
+  readonly flaggedBy: readonly Address[];
+}
+
+/** One target still to be judged, with the anchors that stand behind it. */
+export interface PendingTarget {
+  readonly target: SignalTarget;
+  readonly anchors: readonly SupplyAnchor[];
+}
+
+/** Targets divided by whether this Guardian's own flag already resolves them. */
+export interface ScreeningTargets {
+  readonly pending: readonly PendingTarget[];
+  readonly skipped: readonly SkippedTarget[];
+}
+
+/**
+ * What the screening phase established. What was asked and what was withheld are kept apart
+ * because they answer different questions: what a provider judged, and what this Guardian had
+ * already decided.
+ */
+export class Screened {
+  /** Every anchor sent to the provider, in request order, with its result. */
+  readonly results: readonly ScreenedAnchor[];
+
+  readonly skipped: readonly SkippedTarget[];
+
+  readonly suspects: readonly SignalTarget[];
+
+  readonly flags: readonly SignalTarget[];
+
+  readonly #work: Work;
+
+  constructor(
+    work: Work,
+    screening: { results: readonly ScreenedAnchor[]; skipped: readonly SkippedTarget[] },
+    reports: { suspects: readonly SignalTarget[]; flags: readonly SignalTarget[] },
+  ) {
+    this.#work = work;
+    this.results = frozenCopy(screening.results);
+    this.skipped = frozenCopy(screening.skipped);
+    this.suspects = frozenCopy(reports.suspects);
+    this.flags = frozenCopy(reports.flags);
+    Object.freeze(this);
+  }
+
+  /** Validate positional provider answers and derive reports from the same captured decisions. */
+  static fromAnswers(work: Work, targets: ScreeningTargets, answers: readonly unknown[]): Screened {
+    const anchors = targets.pending.flatMap((entry) => entry.anchors);
+    const results = Screened.#screenedAnchors(anchors, answers);
+    const reports = Screened.#reportTargets(targets.pending, results);
+    return new Screened(work, { results, skipped: targets.skipped }, reports);
+  }
+
+  /** The work this judgement was made over: what a heartbeat after it must commit. */
+  work(): Work {
+    return this.#work;
+  }
+
+  /** Every requested anchor needs its own complete answer before any reports can be submitted. */
+  static #screenedAnchors(anchors: readonly SupplyAnchor[], answers: readonly unknown[]): ScreenedAnchor[] {
+    if (answers.length !== anchors.length) {
+      throw new GuardianStop('screening-result-missing');
+    }
+    return anchors.map((anchor, index) => {
+      const answer = answers[index];
+      if (answer === undefined) {
+        throw new GuardianStop('screening-result-missing');
+      }
+      return { anchor, result: Screened.#screeningResult(answer) };
+    });
+  }
+
+  /** Read known fields once; unrelated provider fields are neither inspected nor copied. */
+  static #screeningResult(answer: unknown): ScreeningResult {
+    if (!isRecord(answer)) {
+      throw new GuardianStop('screening-result-malformed');
+    }
+    const status = answer.status;
+    const hasEvidence = 'evidenceReference' in answer;
+    const evidenceReference = hasEvidence ? answer.evidenceReference : undefined;
+    if (evidenceReference !== undefined && evidenceReference !== null) {
+      if (typeof evidenceReference !== 'string' || evidenceReference.length === 0) {
+        throw new GuardianStop('screening-result-malformed');
+      }
+    }
+    if (status === 'incomplete') {
+      throw new GuardianStop('screening-result-incomplete');
+    }
+    if (status !== 'judged') {
+      throw new GuardianStop('screening-result-malformed');
+    }
+    const requiresSuspect = answer.requiresSuspect;
+    const requiresFlag = answer.requiresFlag;
+    if (typeof requiresSuspect !== 'boolean' || typeof requiresFlag !== 'boolean') {
+      throw new GuardianStop('screening-result-malformed');
+    }
+    return { status, requiresSuspect, requiresFlag, ...(hasEvidence ? { evidenceReference } : {}) };
+  }
+
+  /** Consume positional decisions once; repeated prefix slicing would be quadratic in target count. */
+  static #reportTargets(pending: readonly PendingTarget[], screened: readonly ScreenedAnchor[]) {
+    const decisions = screened.values();
+    const suspects = new Set<SignalTarget>();
+    const flags = new Set<SignalTarget>();
+    for (const entry of pending) {
+      for (let remaining = entry.anchors.length; remaining > 0; remaining -= 1) {
+        const decision = decisions.next().value;
+        if (decision?.result.status !== 'judged') {
+          throw new GuardianStop('screening-result-missing');
+        }
+        if (decision.result.requiresSuspect) {
+          suspects.add(entry.target);
+        }
+        if (decision.result.requiresFlag) {
+          flags.add(entry.target);
+        }
+      }
+    }
+    return { suspects: [...suspects], flags: [...flags] };
+  }
+}
+
+/** Why a plan can no longer be attested. Every value is chain state the caller may retry against. */
+export type StaleReason =
+  | 'head-not-past-report-block'
+  | 'report-block-reorged'
+  | 'report-block-aged-out'
+  | 'stored-heartbeat-moved'
+  | 'report-no-longer-confirmed';
+
+/** The heartbeat landed: the cycle's coverage now stands at the report block. */
+export interface Attested {
+  readonly kind: 'attested';
+  readonly cursor: Cursor;
+  readonly heartbeat: TxHash;
+  readonly digest: Bytes32;
+}
+
+/** The plan no longer describes the chain. Nothing was attested, and the caller decides what next. */
+export interface Stale {
+  readonly kind: 'stale';
+  readonly reason: StaleReason;
+}

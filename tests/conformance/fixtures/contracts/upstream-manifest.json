@@ -1,0 +1,56 @@
+{
+  "repository": {
+    "revision": "158633403243d8ceafd7a1fb7d14d0fd009c3a4b"
+  },
+  "build": {
+    "command": "forge build",
+    "forge": "forge Version: 1.7.1",
+    "compiler": "0.8.36+commit.8a079791",
+    "evmVersion": "osaka",
+    "optimizer": {
+      "enabled": true,
+      "runs": 200
+    },
+    "viaIR": false,
+    "bytecodeHash": "none"
+  },
+  "artifacts": {
+    "GuardianSignals.json": {
+      "classification": "production",
+      "upstreamSha256": "6a3558837cfb32e71514b3f90677b2d85a76fd371bf44c52390440060f6cfa10",
+      "sha256": "4ba561ef0a1d7dd38db1c0a7f8b7cf7fd58f21b9ed73847ad604209618da2950",
+      "bytecodeSha256": "0304f4faa89addfbd8b7a2c7da4d34b5e2f42a652087adc4262a2f7e0304a88c"
+    },
+    "OssifiableProxy.json": {
+      "classification": "production",
+      "upstreamSha256": "9a41e8bef691e3ba003dc60752faff719cac07f0818c8141382f9b73f81c96c7",
+      "sha256": "572d3442ca5749d37454fb80aefb8af7d63654a6aeafacbd9e6d446b00feec8b",
+      "bytecodeSha256": "5618732d389b8c746134b41da82f679335584c18372d533109f10490e4477e19"
+    },
+    "Core.json": {
+      "classification": "production",
+      "upstreamSha256": "e195e0c72160eaec77a4c838cb50fc9ba84038ab73ce59383616549aa1e352a8",
+      "sha256": "44f866c69d643595e84b27f0598290c68015f7d0432e5c8175e4c287485b2868",
+      "bytecodeSha256": "8f042a44ed49296e547c8e4b386f6dcfbdd4f02c58c28bf16aeeec6f375ef35c"
+    },
+    "MarketController.json": {
+      "classification": "production",
+      "upstreamSha256": "fdd9703bf68a56a1199c26cd65b9d32977f863f10106b92bf7cc8942288a9ee5",
+      "sha256": "9a8a9641b7f484456a2708e549dfcd55c2398db4472ad44f1e8f0f75563a6bc8",
+      "bytecodeSha256": "c91447e0033e8eac03881120a329e486e6a0ce6d8029e64fcb23bdf84356605f"
+    },
+    "MockERC20.json": {
+      "classification": "synthetic-test-dependency",
+      "upstreamSha256": "1dd5f628e2ca4dee9a02c158049d1d8fae0be0127def8dd83fece192d4d42f6c",
+      "sha256": "bd83b9b0ea56fdec31f734fffc44b41bb660cfd6399b2c5c45c3d70c8c3be82d",
+      "bytecodeSha256": "ef28462f7d098de4820ff10e7c8df944a7f42b6bb6b215a6875e54db733a8432"
+    },
+    "MockPriceOracle.json": {
+      "classification": "synthetic-test-dependency",
+      "upstreamSha256": "da565c9cd6205d5640f5ec8e4219099174b2d9be8c4e47d55949acaea0170b79",
+      "sha256": "1a82d7c7c483f8629da6fc58dcd83fa1aa46e69a7973524b486ae8f24186219f",
+      "bytecodeSha256": "b09b8647f5a1308e475a551f81c89a2b87dabc567b9b4c9be8b1bd3d5e645494"
+    }
+  },
+  "abiPreparation": "Retain only test and SDK ABI entries; remove parameter names and internalType metadata. Creation bytecode is unchanged."
+}

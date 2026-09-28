@@ -1,0 +1,57 @@
+{
+  "format": "guardian-coverage-digest-v1",
+  "generator": {
+    "tool": "cast 1.7.1",
+    "method": "Each anchor was encoded with f(address,bytes32,bytes32,uint256,bytes32,address) and hashed. Sorted anchor hashes were encoded with f(bytes32,uint256,address,address,address,bytes32,bytes32,bytes32[]) and hashed. Expected digests were copied from cast output, independently of the SDK implementation."
+  },
+  "vectors": [
+    {
+      "name": "empty bootstrap work",
+      "bounds": {
+        "chainId": 1,
+        "core": "0x00000000000000000000000000000000000000bb",
+        "registry": "0x00000000000000000000000000000000000000aa",
+        "guardian": "0x00000000000000000000000000000000000000cc",
+        "previousCoverage": null,
+        "reportBlock": "0x000000000000000000000000000000000000000000000000000000000000000a"
+      },
+      "anchors": [],
+      "anchorHashes": [],
+      "expectedDigest": "0xd0abd076d5c7cf60e8890c95e5c44d1ae7da31b9589ee7d3fedaee350fe9e1e5"
+    },
+    {
+      "name": "two anchors with previous coverage",
+      "bounds": {
+        "chainId": 1,
+        "core": "0x00000000000000000000000000000000000000bb",
+        "registry": "0x00000000000000000000000000000000000000aa",
+        "guardian": "0x00000000000000000000000000000000000000cc",
+        "previousCoverage": "0x000000000000000000000000000000000000000000000000000000000000000b",
+        "reportBlock": "0x000000000000000000000000000000000000000000000000000000000000000a"
+      },
+      "anchors": [
+        {
+          "core": "0x00000000000000000000000000000000000000bb",
+          "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000009",
+          "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000007",
+          "logIndex": 5,
+          "marketId": "0x0000000000000000000000000000000000000000000000000000000000000001",
+          "borrower": "0x00000000000000000000000000000000000000ee"
+        },
+        {
+          "core": "0x00000000000000000000000000000000000000bb",
+          "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000010",
+          "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000008",
+          "logIndex": 9,
+          "marketId": "0x0000000000000000000000000000000000000000000000000000000000000002",
+          "borrower": "0x00000000000000000000000000000000000000ef"
+        }
+      ],
+      "anchorHashes": [
+        "0x4cb58d72cbf4fdf5828ce8d8865732b70fdb2e173d1ea93b62dea6e65d4419d5",
+        "0x51328ce58cb04d6caa51946b3ae96a2240b69b03bec44025385a06b67de13348"
+      ],
+      "expectedDigest": "0xb73420f5131513013c4b7ccf666e14b7481b56fc57226b221b04de79ea3241d8"
+    }
+  ]
+}

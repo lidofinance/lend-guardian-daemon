@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+
+      - name: Install Anvil 1.7.1
+        env:
+          FOUNDRY_ARCHIVE: foundry_v1.7.1_linux_amd64.tar.gz
+          FOUNDRY_SHA256: cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b
+        run: |
+          curl --fail --location --silent --show-error \
+            "https://github.com/foundry-rs/foundry/releases/download/v1.7.1/${FOUNDRY_ARCHIVE}" \
+            --output "${RUNNER_TEMP}/${FOUNDRY_ARCHIVE}"
+          echo "${FOUNDRY_SHA256}  ${RUNNER_TEMP}/${FOUNDRY_ARCHIVE}" | sha256sum --check --strict
+          mkdir "${RUNNER_TEMP}/foundry"
+          tar --extract --gzip --file "${RUNNER_TEMP}/${FOUNDRY_ARCHIVE}" --directory "${RUNNER_TEMP}/foundry"
+          echo "${RUNNER_TEMP}/foundry" >> "${GITHUB_PATH}"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run audit gate
+        run: npm run check
+
+      - name: Verify clean package installation
+        run: npm run check:package

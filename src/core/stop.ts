@@ -1,0 +1,45 @@
+// The specification's `REQUIRE`: the attempt cannot continue, and no heartbeat is sent. It is an
+// exception rather than a returned value because it can arise several calls deep, and the phases
+// read better without threading a failure through every step. The reason is a closed set because
+// the daemon writes it into the cycle record and decides from it whether to alert.
+
+/** Why the attempt stopped: a missing requirement or an SDK mode restriction. */
+export type StopReason =
+  /** An observe-only Guardian was asked to submit reports or a heartbeat. */
+  | 'submission-disabled'
+  /** The node serves another chain than the deployment names. */
+  | 'chain-id-mismatch'
+  | 'guardian-not-member'
+  /** The configured signer is neither the Guardian nor its expected delegate. */
+  | 'signer-not-authorized'
+  /** The registry names another delegate for the Guardian than the expected one, none included. */
+  | 'delegate-mismatch'
+  | 'guardian-added-event-missing'
+  /** The log before a supply was not its controller's classification of that supply. */
+  | 'supply-without-controller-event'
+  /** An endpoint no longer holds the block the plan was built on. */
+  | 'node-behind-the-plan'
+  /** A log a query returned does not decode as the event it was selected for. */
+  | 'log-undecodable'
+  /** The head a submission is measured from is not the block the nodes hold at its number. */
+  | 'head-not-canonical'
+  /** A candidate position has no controller history at all, which cannot be. */
+  | 'position-without-history'
+  /** The controller's events for a position do not compose into the position they record. */
+  | 'position-history-broken'
+  /** The provider answered in a shape the cycle cannot act on: a status nobody defined, a report left out. */
+  | 'screening-result-malformed'
+  /** The provider answered for a different number of anchors than it was asked about. */
+  | 'screening-result-missing'
+  /** A provider could not judge an anchor, so this cycle cannot attest that it was judged. */
+  | 'screening-result-incomplete';
+
+export class GuardianStop extends Error {
+  readonly reason: StopReason;
+
+  constructor(reason: StopReason) {
+    super(reason);
+    this.name = 'GuardianStop';
+    this.reason = reason;
+  }
+}

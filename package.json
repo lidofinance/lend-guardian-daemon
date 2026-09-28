@@ -1,0 +1,61 @@
+{
+  "name": "guardian-daemon-sdk",
+  "version": "0.2.0",
+  "private": true,
+  "license": "GPL-2.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lidofinance/lido-lend-guardian-providers.git"
+  },
+  "description": "Reference Guardian cycle SDK with a caller-supplied screening provider.",
+  "type": "module",
+  "exports": {
+    "./core": {
+      "types": "./dist/src/core/index.d.ts",
+      "default": "./dist/src/core/index.js"
+    },
+    "./clients": {
+      "types": "./dist/src/chain/viem-client.d.ts",
+      "default": "./dist/src/chain/viem-client.js"
+    }
+  },
+  "files": [
+    "abi",
+    "dist",
+    "docs/guardian-specification.md",
+    "example",
+    "src"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test 'tests/**/*.test.ts'",
+    "test:coverage": "node --experimental-test-coverage --test-coverage-include='src/**/*.ts' --test-coverage-lines=97 --test-coverage-branches=94 --test-coverage-functions=98 --test 'tests/**/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write \"**/*.{ts,js,json,md}\"",
+    "format:check": "prettier --check \"**/*.{ts,js,json,md}\"",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run build && npm run check:surface && npm run test:coverage",
+    "build": "node -e \"fs.rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "check:surface": "node scripts/check-surface.ts",
+    "check:package": "node scripts/check-package.ts",
+    "test:core": "node --test 'tests/core/**/*.test.ts'",
+    "test:example": "node --test 'tests/example/**/*.test.ts'",
+    "test:conformance": "node --test 'tests/conformance/*.test.ts'"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.10.1",
+    "eslint": "10.10.0",
+    "ethers": "6.16.0",
+    "prettier": "3.8.1",
+    "typescript": "5.8.3",
+    "typescript-eslint": "8.70.0"
+  },
+  "dependencies": {
+    "viem": "2.55.19"
+  }
+}
