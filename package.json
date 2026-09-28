@@ -5,7 +5,7 @@
   "license": "GPL-2.0-only",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lidofinance/lido-lend-guardian-providers.git"
+    "url": "git+https://github.com/lidofinance/lido-lend-guardian-daemon-sdk.git"
   },
   "description": "Reference Guardian cycle SDK with a caller-supplied screening provider.",
   "type": "module",
@@ -50,7 +50,7 @@
     "@eslint/js": "10.0.1",
     "@types/node": "24.10.1",
     "eslint": "10.10.0",
-    "ethers": "6.16.0",
+    "ethers": "6.17.0",
     "prettier": "3.8.1",
     "typescript": "5.8.3",
     "typescript-eslint": "8.70.0"

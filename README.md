@@ -96,10 +96,12 @@ Pass the original phase values through the same Guardian's attempt in order. The
 A Guardian's repository depends on a maintainer-published SDK commit. `prepare` builds `dist/` on install, so the installing machine needs Node 24 or newer. Use the public repository over HTTPS:
 
 ```bash
-npm install git+https://github.com/lidofinance/lido-lend-guardian-providers.git#<commit>
+npm install git+https://github.com/lidofinance/lido-lend-guardian-daemon-sdk.git#<commit>
 ```
 
-The package includes compiled output, source, ABI fragments, the specification and example, plus npm's standard package metadata, README and license. The `private` flag remains set until registry publication is arranged. A local link can be used while SDK and daemon changes are developed together; a clean installation must still be checked against the published commit.
+The `files` list in [`package.json`](package.json) includes `dist/`, `src/`, `abi/`, `docs/guardian-specification.md` and `example/` in the package produced by `npm pack` or installed from Git. `dist/` contains compiled JavaScript and TypeScript declarations; `prepare` generates it, and Git does not track it. npm also includes `package.json`, README and LICENSE.
+
+The package is installed from Git; `private: true` prevents publication to the npm registry. Use `npm run check:package` to verify the archive's contents and installation in a clean consumer.
 
 ## Development
 
