@@ -11,7 +11,7 @@ import type {
   TransactionRequest,
   TxHash,
 } from '../../src/core/index.ts';
-import { rpcRequest } from './client.ts';
+import { rpcRequest, SEND_TIMEOUT_MS } from './client.ts';
 
 const SIGNER: Address = '0x00000000000000000000000000000000000000d1';
 const GUARDIAN: Address = '0x000000000000000000000000000000000000009a';
@@ -65,7 +65,7 @@ function nonceClient(
     signer: SIGNER,
     transactionPolicy: {
       maxFeePerGas: overrides.maxFeePerGas ?? 100n,
-      sendTimeoutMs: overrides.sendTimeoutMs ?? 1_000,
+      sendTimeoutMs: overrides.sendTimeoutMs ?? SEND_TIMEOUT_MS,
       replacementFeeBumpBps: overrides.replacementFeeBumpBps ?? 1_250,
       replacementTimeoutMs: overrides.replacementTimeoutMs ?? 1,
       sendAttempts: overrides.sendAttempts ?? 3,
