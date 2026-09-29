@@ -19,6 +19,13 @@ import type {
 import type { Address, Hex, TxHash } from '../common/types.ts';
 import { requireDefined, requireInteger } from '../common/validation.ts';
 
+/**
+ * The gas limit adds a fifth to the node's estimate. A registry report costs more gas for every
+ * report another guardian makes on the same account between the estimate and inclusion, and for
+ * every report that expires meanwhile; with the exact estimate the report would run out of gas.
+ */
+const GAS_HEADROOM_DIVISOR = 5n;
+
 export interface ViemRpcClientOptions {
   readonly publicClient: PublicClient;
   /** Omit for reads only; send requires a configured signing account. */
@@ -179,7 +186,7 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
       value: transaction.value,
       data: transaction.data,
       nonce: prepared.nonce,
-      gas: prepared.gas,
+      gas: prepared.gas + prepared.gas / GAS_HEADROOM_DIVISOR,
       maxFeePerGas: prepared.maxFeePerGas,
       maxPriorityFeePerGas: prepared.maxPriorityFeePerGas,
     });

@@ -176,6 +176,14 @@ test('a heartbeat is written with the block as the ABI states it and returns its
   );
 });
 
+test('the signed gas limit adds a fifth to the estimate', async () => {
+  const { options, observe, signer } = harness();
+
+  await registryDelivery(options, observe).sendHeartbeat(REPORT_BLOCK, DIGEST, 1);
+
+  assert.equal(signer.signTransaction.calls[0]?.[0].gas, 60_000n);
+});
+
 test('a second write while one is unresolved is refused', async () => {
   const { options, observe } = harness();
   const submitter = registryDelivery(options, observe);
