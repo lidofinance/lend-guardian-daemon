@@ -42,6 +42,12 @@ export type {
   TransactionDeliveryEvent,
 } from '../events.ts';
 
-export type { TransactionContext, RpcEvent, RpcRequestStartedEvent, RpcRequestFinishedEvent } from '../events.ts';
+export type {
+  TransactionContext,
+  RpcEvent,
+  RpcRequestStartedEvent,
+  RpcRequestFinishedEvent,
+  RpcAnswersDifferEvent,
+} from '../events.ts';
 
 export type { TransactionPolicy, PreparedTransaction, TransactionAttempt } from '../chain/rpc.ts';

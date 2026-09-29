@@ -2,13 +2,13 @@
 // is one decision of `docs/guardian-specification.md`, section A.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { padHex } from 'viem';
+import { padHex, toEventSelector } from 'viem';
 import { privateKeyToAddress } from 'viem/accounts';
 import type { GuardianSetup } from '../../src/core/guardian.ts';
 import type { BlockRef } from '../../src/common/types.ts';
 import { GuardianStop } from '../../src/core/stop.ts';
 import type { StopReason } from '../../src/core/stop.ts';
-import { blockAt, REGISTRY } from './fake-node.ts';
+import { blockAt, GUARDIAN, REGISTRY } from './fake-node.ts';
 import type { Script } from './fake-node.ts';
 import { CORE_DEPLOYED, guardianOver, REGISTRY_DEPLOYED } from './setup.ts';
 
@@ -33,10 +33,9 @@ async function planOver(
 ) {
   const { guardian, node } = guardianOver(script, parts);
   const planned = await guardian.buildScanPlan(previousHeartbeatBlock);
-  const registryQueries = node.logQueries
-    .filter((query) => query.address === REGISTRY)
-    .map((query) => [query.fromBlock, query.toBlock]);
-  return { planned, registryQueries };
+  const registryLogQueries = node.logQueries.filter((query) => query.address === REGISTRY);
+  const registryQueries = registryLogQueries.map((query) => [query.fromBlock, query.toBlock]);
+  return { planned, registryQueries, registryLogQueries };
 }
 
 async function assertStops(
@@ -193,6 +192,33 @@ test('a heartbeat event that does not decode stops the attempt rather than namin
   );
 });
 
+// Event layouts of IGuardianSignals: the Guardian is the first indexed field of both events.
+const HEARTBEAT_TOPIC = toEventSelector('Heartbeat(address,uint256,uint256,bytes)');
+const GUARDIAN_ADDED_TOPIC = toEventSelector('GuardianAdded(address)');
+
+test('the heartbeat history query binds the indexed Guardian address', async () => {
+  const covered = blockAt(180_000);
+  const { registryLogQueries } = await planOver({
+    head: HEAD,
+    heartbeatTimestamp: covered.timestamp,
+    heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
+  });
+  const heartbeatQueries = registryLogQueries.filter((query) => query.topics[0] === HEARTBEAT_TOPIC);
+  assert.ok(heartbeatQueries.length > 0);
+  for (const query of heartbeatQueries) {
+    assert.equal(query.topics[1], padHex(GUARDIAN, { size: 32 }));
+  }
+});
+
+test('the membership history query binds the indexed Guardian address', async () => {
+  const { registryLogQueries } = await planOver(JOINED);
+  const membershipQueries = registryLogQueries.filter((query) => query.topics[0] === GUARDIAN_ADDED_TOPIC);
+  assert.ok(membershipQueries.length > 0);
+  for (const query of membershipQueries) {
+    assert.equal(query.topics[1], padHex(GUARDIAN, { size: 32 }));
+  }
+});
+
 test('a stored heartbeat is matched to the block it reported, not the block it landed in', async () => {
   const covered = blockAt(180_000);
   const { planned } = await planOver({
@@ -325,6 +351,24 @@ test('a hint later than the stored heartbeat does not narrow the search', async 
   assert.ok(planned.kind === 'plan');
   assert.deepEqual(planned.previousHeartbeatBlock, covered);
   assert.deepEqual(registryQueries, [[REGISTRY_DEPLOYED, HEAD]]);
+});
+
+test('a failure to read the hinted block stops heartbeat recovery', async () => {
+  const covered = blockAt(180_000);
+  const unknownHint = blockAt(190_000);
+  await assert.rejects(
+    planOver(
+      {
+        head: HEAD,
+        heartbeatTimestamp: covered.timestamp,
+        heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
+        missingBlocks: [unknownHint.number],
+      },
+      {},
+      unknownHint,
+    ),
+    /RPC block is missing or pending/,
+  );
 });
 
 test('a hint whose block is no longer canonical does not narrow the search', async () => {

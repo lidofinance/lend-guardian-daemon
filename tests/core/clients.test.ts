@@ -30,6 +30,6 @@ for (const chain of [mainnet, hoodi]) {
   });
 }
 
-test('the clients module exposes the viem client and transport at runtime', () => {
-  assert.deepEqual(Object.keys(clients).sort(), ['ViemRpcClient', 'createViemRpcTransport']);
+test('the clients module exposes the viem client, its transport and the transport error at runtime', () => {
+  assert.deepEqual(Object.keys(clients).sort(), ['LogsNotConfirmedError', 'ViemRpcClient', 'createViemRpcTransport']);
 });

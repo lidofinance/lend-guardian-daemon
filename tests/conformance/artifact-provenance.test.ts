@@ -21,26 +21,26 @@ const ARTIFACT_HASHES: Readonly<Record<ArtifactName, { readonly sha256: string; 
     bytecodeSha256: '5618732d389b8c746134b41da82f679335584c18372d533109f10490e4477e19',
   },
   'Core.json': {
-    sha256: '44f866c69d643595e84b27f0598290c68015f7d0432e5c8175e4c287485b2868',
+    sha256: '5b7007b7556dabd60e4ff5b40be00f3e8066467e9d544aafe2571eee449b819b',
     bytecodeSha256: '8f042a44ed49296e547c8e4b386f6dcfbdd4f02c58c28bf16aeeec6f375ef35c',
   },
   'MarketController.json': {
-    sha256: '9a8a9641b7f484456a2708e549dfcd55c2398db4472ad44f1e8f0f75563a6bc8',
-    bytecodeSha256: 'c91447e0033e8eac03881120a329e486e6a0ce6d8029e64fcb23bdf84356605f',
+    sha256: 'f72e6f895984bbff0a77ee3fc09ddbd962937c4114df5a45304e2ab048ac285b',
+    bytecodeSha256: '58a12440a63d8a40663568b1117bd159bc3cc9e743280e5a276d6da9b847884f',
   },
   'MockERC20.json': {
     sha256: 'bd83b9b0ea56fdec31f734fffc44b41bb660cfd6399b2c5c45c3d70c8c3be82d',
     bytecodeSha256: 'ef28462f7d098de4820ff10e7c8df944a7f42b6bb6b215a6875e54db733a8432',
   },
   'MockPriceOracle.json': {
-    sha256: '1a82d7c7c483f8629da6fc58dcd83fa1aa46e69a7973524b486ae8f24186219f',
+    sha256: '45d61d70f91e968729dd3974dde87e140eedd06fe145a4018d637f80b06b9cce',
     bytecodeSha256: 'b09b8647f5a1308e475a551f81c89a2b87dabc567b9b4c9be8b1bd3d5e645494',
   },
 };
 
 test('records the approved source revision, build and exact artifact hashes', () => {
   const manifest = objectOf(readJson('upstream-manifest.json'), 'manifest');
-  assert.equal(objectOf(manifest.repository, 'repository').revision, '158633403243d8ceafd7a1fb7d14d0fd009c3a4b');
+  assert.equal(objectOf(manifest.repository, 'repository').revision, 'bdf9e5047525c5b6f7489385fd494d53242db9a3');
   assert.partialDeepStrictEqual(manifest.build, {
     forge: 'forge Version: 1.7.1',
     compiler: '0.8.36+commit.8a079791',

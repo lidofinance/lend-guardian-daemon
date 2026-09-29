@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { access, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -22,7 +22,9 @@ try {
   const archive = join(workspace, archives[0] ?? '');
   const consumer = join(workspace, 'consumer');
   await mkdir(consumer);
-  await writeFile(join(consumer, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
+  // The peer range admits later viem releases; the consumer installs the version the tests ran against.
+  const consumerManifest = { private: true, type: 'module', dependencies: { viem: await readTestedViemVersion() } };
+  await writeFile(join(consumer, 'package.json'), JSON.stringify(consumerManifest));
   await npm(['install', '--ignore-scripts', '--no-audit', '--no-fund', archive], consumer);
   await execute(
     process.execPath,
@@ -49,4 +51,19 @@ try {
 
 async function npm(arguments_: readonly string[], cwd: string): Promise<void> {
   await execute(process.execPath, [npmCli, ...arguments_], { cwd });
+}
+
+async function readTestedViemVersion(): Promise<string> {
+  const manifest: unknown = JSON.parse(await readFile(join(process.cwd(), 'package.json'), 'utf8'));
+  const version = readMember(readMember(manifest, 'devDependencies'), 'viem');
+  if (typeof version !== 'string') {
+    throw new Error('package.json does not pin viem as a development dependency');
+  }
+  return version;
+}
+
+function readMember(value: unknown, name: string): unknown {
+  const isObject = typeof value === 'object' && value !== null;
+  const members = isObject ? Object.entries(value) : [];
+  return members.find(([key]) => key === name)?.[1];
 }

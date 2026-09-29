@@ -31,8 +31,34 @@ const node = fakeNode({
   ],
 });
 
+/** What the example has shown so far; the scripted RPC and screening fail by it. */
+const seen = { startedCycles: 0, failedCycles: 0, nonceReadsAfterLastFailure: 0 };
+
+/** The attempt whose start ends the run: the one after the last scripted failure. */
+const lastAttempt = scenario === 'failed-send-then-screening' ? 3 : 2;
+
+function failsBroadcast(): boolean {
+  if (scenario === 'failed-send-then-screening') {
+    return seen.startedCycles === 1;
+  }
+  return scenario === 'failed-send' || scenario === 'failed-clearing';
+}
+
+function rpcFailure(method: string): string | undefined {
+  if (method === 'eth_sendRawTransaction' && failsBroadcast()) {
+    return 'synthetic broadcast failure';
+  }
+  // Between a failed attempt and the next one only the clearing of pending nonces reads them.
+  const isBetweenAttempts = seen.failedCycles === seen.startedCycles;
+  if (method !== 'eth_getTransactionCount' || !isBetweenAttempts) {
+    return undefined;
+  }
+  seen.nonceReadsAfterLastFailure += 1;
+  return scenario === 'failed-clearing' ? 'synthetic nonce outage' : undefined;
+}
+
 // No HTTP request can leave this process, even if the example unexpectedly changes its endpoint.
-globalThis.fetch = async (_input, init) => {
+globalThis.fetch = async (input, init) => {
   assert.equal(typeof init?.body, 'string');
   assert.ok(typeof init?.body === 'string');
   const body: unknown = JSON.parse(init.body);
@@ -41,13 +67,33 @@ globalThis.fetch = async (_input, init) => {
   assert.ok(typeof body.method === 'string');
   const params: unknown = 'params' in body ? body.params : [];
   assert.ok(Array.isArray(params));
-  const result = await node.transport(body.method, params);
+  const failure = rpcFailure(body.method);
+  if (failure !== undefined) {
+    return Response.json({ jsonrpc: '2.0', id: body.id, error: { code: -32000, message: failure } });
+  }
+  const url = input instanceof Request ? input.url : input.toString();
+  // A lagging endpoint answers a log read without the logs and without an error.
+  const lacksLogs = url.includes('lagging') && body.method === 'eth_getLogs';
+  const result = lacksLogs ? [] : await node.transport(body.method, params);
   return Response.json({ jsonrpc: '2.0', id: body.id, result });
 };
 
 function print(...values: unknown[]): void {
   const message = values.map(String).join(' ');
   process.stdout.write(`${message}\n`);
+  const [shown] = values;
+  const isCycleStart =
+    typeof shown === 'object' && shown !== null && 'event' in shown && shown.event === 'cycle.started';
+  if (isCycleStart) {
+    seen.startedCycles += 1;
+  }
+  if (seen.startedCycles === lastAttempt) {
+    assert.deepEqual(node.sent.calls, []);
+    process.stdout.write(
+      `Attempt ${lastAttempt} started; nonces were read ${seen.nonceReadsAfterLastFailure} times before it.\n`,
+    );
+    process.exit(0);
+  }
   const observed = message.startsWith('observed:');
   const incomplete = message.includes('screening-result-incomplete');
   if (scenario === 'observe' && observed) {
@@ -57,6 +103,14 @@ function print(...values: unknown[]): void {
   if (scenario === 'unconfigured' && incomplete) {
     assert.deepEqual(node.sent.calls, []);
     process.exit(0);
+  }
+  if (scenario === 'lagging-endpoint' && message.startsWith('cycle failed:')) {
+    assert.deepEqual(node.sent.calls, []);
+    process.exit(0);
+  }
+  if (message.startsWith('cycle failed:')) {
+    seen.failedCycles += 1;
+    seen.nonceReadsAfterLastFailure = 0;
   }
 }
 
@@ -68,7 +122,8 @@ if (scenario !== 'unconfigured') {
     screen: (request) => {
       assert.equal(request.chainId, chainId);
       assert.equal(request.anchors.length, 1);
-      if (scenario === 'failed-signal') {
+      const failsScreening = scenario === 'failed-signal' || seen.startedCycles === 2;
+      if (failsScreening) {
         return Promise.reject(new Error('synthetic provider outage'));
       }
       return Promise.resolve([{ status: 'judged', requiresSuspect: false, requiresFlag: true }]);
@@ -80,11 +135,11 @@ if (scenario !== 'unconfigured') {
   });
 }
 
+// The example waits minutes between attempts; the scripted runs do not.
+mock.module('node:timers/promises', {
+  namedExports: { setTimeout: () => new Promise((resolve) => setImmediate(resolve)) },
+});
+
 // Execute the same entry point as `node example/daemon.ts`, with this fixture's scripted RPC.
 process.argv[1] = fileURLToPath(new URL('../../../example/daemon.ts', import.meta.url));
 await import('../../../example/daemon.ts');
-if (scenario === 'failed-signal') {
-  assert.equal(process.exitCode, 1);
-  assert.deepEqual(node.sent.calls, []);
-  process.stdout.write('Signal failure returned without retrying.\n');
-}

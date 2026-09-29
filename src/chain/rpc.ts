@@ -72,7 +72,11 @@ export interface TransactionRequest {
 
 export interface TransactionPolicy {
   readonly maxFeePerGas: bigint;
-  /** Total time budget for one send, including preparation, inclusion and confirmation. */
+  /**
+   * Total time budget for one send, including preparation, inclusion and confirmation. Guardian
+   * requires an integer from 1 to 2_147_483_647 and applies the same budget to its shared
+   * report-confirmation wait and to nonce clearing.
+   */
   readonly sendTimeoutMs: number;
   /** Minimum fee increase for both EIP-1559 fields on replacement, in basis points. */
   readonly replacementFeeBumpBps: number;

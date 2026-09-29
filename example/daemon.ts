@@ -53,12 +53,22 @@ const SEND_ATTEMPTS = 5;
 /**
  * Schedule [scan attempts](../docs/guardian-specification.md#scan-cycle). The intervals below are
  * example policy and must be chosen for the operator's agreed SLA; the SDK supplies no scheduler.
- * [Failed attempts](../docs/guardian-specification.md#failure-handling) leave the heartbeat hint unchanged;
- * signal exceptions stop for reconciliation, while observe retries after a delay.
+ * [Failed attempts](../docs/guardian-specification.md#failure-handling) leave the heartbeat hint unchanged
+ * and are followed by another attempt after a delay.
  */
 async function main(): Promise<void> {
   const mode = env.mode('MODE');
-  const guardian = createGuardian(mode);
+  // Only an attempt that reached sending can have left a transaction pending.
+  const attempt = { hasReachedSending: false };
+  const guardian = createGuardian(mode, (event) => {
+    if (event.event === 'cycle.started') {
+      attempt.hasReachedSending = false;
+    }
+    if (event.event.startsWith('transaction.')) {
+      attempt.hasReachedSending = true;
+    }
+    logEvent(event);
+  });
 
   // This block only spares the next plan a wider event search, so losing it on restart costs nothing else.
   let previousHeartbeatBlock: BlockRef | null = null;
@@ -67,11 +77,11 @@ async function main(): Promise<void> {
       previousHeartbeatBlock = await cycle(guardian, previousHeartbeatBlock);
     } catch (error) {
       console.error('cycle failed:', error);
-      // A failed send may still have reached the chain. This example has no pending-write journal.
-      if (mode === 'signal') {
-        console.error('Signal mode stopped; reconcile pending transactions before restarting.');
-        process.exitCode = 1;
-        return;
+      if (attempt.hasReachedSending) {
+        // The next attempt must not meet a transaction of this one. The signer belongs to this
+        // example alone, so each of its pending transactions is awaited or cancelled. An error
+        // here ends the process: the operator reconciles the signer before restarting.
+        await guardian.clearPendingNonces();
       }
 
       await sleep(RETRY_INTERVAL_MS);
@@ -121,13 +131,14 @@ function logEvent(event: SdkEvent): void {
 }
 
 /** Build the example Guardian with its configuration, event handler and RPC/signing connection. */
-function createGuardian(mode: Mode): Guardian {
+function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
   const chain = env.chain('CHAIN_ID');
   const nodeUrls = env.rpcUrls('RPC_URLS');
   const guardianAddress = env.address('GUARDIAN');
-  const onEvent: EventHandler = logEvent;
   const transport = createViemRpcTransport({
     urls: nodeUrls,
+    // Unset, one endpoint answers a log read like any other request.
+    logQuorum: env.optionalPositiveInteger('RPC_LOG_QUORUM'),
     timeoutMs: RPC_REQUEST_TIMEOUT_MS,
     maxResponseBodySize: MAX_RPC_RESPONSE_BODY_SIZE,
     retryCount: RPC_RETRY_COUNT,

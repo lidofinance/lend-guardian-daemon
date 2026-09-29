@@ -85,6 +85,9 @@ test('records method, endpoint, status, timing and exact transferred byte counts
   const [started, completed] = fixture.events;
   assert.ok(started?.event === 'rpc.requestStarted');
   assert.ok(completed?.event === 'rpc.requestFinished');
+  assert.equal(started.requestId, 1);
+  assert.equal(completed.requestId, started.requestId);
+  assert.ok(!('params' in started));
   assert.equal(completed.startedAt, started.startedAt);
   assert.ok(completed.finishedAt >= completed.startedAt);
   assert.equal(completed.rpcIndex, 0);
@@ -93,6 +96,18 @@ test('records method, endpoint, status, timing and exact transferred byte counts
   assert.equal(completed.requestBytes, Buffer.byteLength(JSON.stringify(jsonRequest(requestInit))));
   assert.ok(completed.responseBytes > 0);
   assert.equal(new Headers(requestInit?.headers).get('user-agent'), 'transport-test');
+});
+
+test('records the original JSON-RPC parameters on both request events', async (context) => {
+  const fixture = transportFixture(context, (_input, init) => Promise.resolve(answer(init)));
+  const params = ['0x0000000000000000000000000000000000000001', 'latest'] as const;
+
+  assert.equal(await fixture.request({ method: 'eth_getBalance', params }), '0x1');
+  const [started, completed] = fixture.events;
+  assert.ok(started?.event === 'rpc.requestStarted');
+  assert.ok(completed?.event === 'rpc.requestFinished');
+  assert.deepEqual(started.params, params);
+  assert.deepEqual(completed.params, params);
 });
 
 test('moves URL credentials into Basic authorization without sending them in the target URL', async (context) => {
@@ -198,6 +213,128 @@ test('rejects malformed JSON returned with HTTP 200', async (context) => {
   });
 });
 
+const REVERT = { code: 3, message: 'execution reverted', data: '0x1234' };
+
+const MALFORMED_REPLIES = [
+  {
+    name: 'neither a result nor an error',
+    reply: { jsonrpc: '2.0', id: 1 },
+    message: 'The RPC endpoint returned neither a result nor a valid error.',
+  },
+  {
+    name: 'a null error and no result',
+    reply: { jsonrpc: '2.0', id: 1, error: null },
+    message: 'The RPC endpoint returned neither a result nor a valid error.',
+  },
+  {
+    name: 'a list instead of an object',
+    reply: [{ jsonrpc: '2.0', id: 1, result: '0x1' }],
+    message: 'The RPC endpoint returned neither a result nor a valid error.',
+  },
+  {
+    name: 'a text instead of an object',
+    reply: 'ok',
+    message: 'The RPC endpoint returned neither a result nor a valid error.',
+  },
+  {
+    name: 'an error whose code is not a number',
+    reply: { jsonrpc: '2.0', id: 1, error: { code: '3', message: 'execution reverted' } },
+    message: 'The RPC endpoint returned an invalid error.',
+  },
+  {
+    name: 'an error that is not an object',
+    reply: { jsonrpc: '2.0', id: 1, error: 'rate limited' },
+    message: 'The RPC endpoint returned an invalid error.',
+  },
+  {
+    name: 'a result beside an error',
+    reply: { jsonrpc: '2.0', id: 1, result: '0x1', error: REVERT },
+    message: 'The RPC endpoint returned both result and error.',
+  },
+];
+
+for (const { name, reply, message } of MALFORMED_REPLIES) {
+  test(`rejects an HTTP 200 reply with ${name}`, async (context) => {
+    const fixture = transportFixture(context, () => Promise.resolve(Response.json(reply)), {
+      urls: [URLS[0]],
+      retryCount: 0,
+    });
+
+    await assert.rejects(fixture.request(CHAIN_ID_REQUEST));
+    const failure = nestedError(
+      finished(fixture.events)[0]?.error,
+      (candidate) => candidate instanceof HttpRequestError,
+    );
+    assert.ok(failure instanceof HttpRequestError);
+    assert.ok(failure.cause instanceof TypeError);
+    assert.equal(failure.cause.message, message);
+  });
+}
+
+test('returns the result of a reply whose error field is null', async (context) => {
+  let calls = 0;
+  const fixture = transportFixture(context, () => {
+    calls += 1;
+    return Promise.resolve(Response.json({ jsonrpc: '2.0', id: 1, result: '0x1', error: null }));
+  });
+
+  assert.equal(await fixture.request(CHAIN_ID_REQUEST), '0x1');
+  assert.equal(calls, 1);
+});
+
+test('an error reply whose result field is null keeps its code and data', async (context) => {
+  let calls = 0;
+  const fixture = transportFixture(context, () => {
+    calls += 1;
+    return Promise.resolve(Response.json({ jsonrpc: '2.0', id: 1, result: null, error: REVERT }));
+  });
+
+  await assert.rejects(fixture.request(CHAIN_ID_REQUEST), (error: unknown) => {
+    const refusal = nestedError(error, (candidate) => candidate instanceof RpcRequestError);
+    return refusal instanceof RpcRequestError && refusal.code === 3 && refusal.data === '0x1234';
+  });
+  assert.equal(calls, 1);
+});
+
+test('a malformed reply to a failed HTTP request keeps the status and retry headers', async (context) => {
+  const reply = { jsonrpc: '2.0', id: 1, result: '0x1', error: REVERT };
+  const fixture = transportFixture(
+    context,
+    () => Promise.resolve(Response.json(reply, { status: 429, headers: { 'retry-after': '1' } })),
+    { urls: [URLS[0]], retryCount: 0 },
+  );
+
+  await assert.rejects(fixture.request(CHAIN_ID_REQUEST));
+  const failure = nestedError(finished(fixture.events)[0]?.error, (candidate) => candidate instanceof HttpRequestError);
+  assert.ok(failure instanceof HttpRequestError);
+  assert.equal(failure.status, 429);
+  assert.equal(failure.headers?.get('retry-after'), '1');
+});
+
+test('an observer that edits request parameters cannot change a later attempt', async (context) => {
+  const sentFilters: unknown[] = [];
+  const fixture = transportFixture(
+    context,
+    (_input, init) => {
+      sentFilters.push(jsonRequest(init).params);
+      const isFirstAttempt = sentFilters.length === 1;
+      return Promise.resolve(isFirstAttempt ? new Response('busy', { status: 503 }) : answer(init, []));
+    },
+    {
+      onEvent: (event) => {
+        if (event.event === 'rpc.requestStarted' && Array.isArray(event.params)) {
+          event.params[0] = { fromBlock: '0x3', toBlock: '0x3' };
+        }
+      },
+    },
+  );
+  const params = [{ fromBlock: '0x1', toBlock: '0x3' }] as const;
+
+  assert.deepEqual(await fixture.request({ method: 'eth_getLogs', params }), []);
+  assert.deepEqual(sentFilters, [[{ fromBlock: '0x1', toBlock: '0x3' }], [{ fromBlock: '0x1', toBlock: '0x3' }]]);
+  assert.deepEqual(params, [{ fromBlock: '0x1', toBlock: '0x3' }]);
+});
+
 test('rejects a JSON result carried by an unsuccessful HTTP response', async (context) => {
   const fixture = transportFixture(
     context,
@@ -265,6 +402,12 @@ test('concurrent physical attempts retain separate measurements', async (context
       .sort(),
     ['eth_blockNumber', 'eth_chainId'],
   );
+  assert.deepEqual(
+    finished(fixture.events)
+      .map((event) => event.requestId)
+      .sort(),
+    [1, 2],
+  );
 });
 
 test('the fallback retains native watcher and endpoint metadata', (context) => {
@@ -273,7 +416,9 @@ test('the fallback retains native watcher and endpoint metadata', (context) => {
   const stop = client.watchBlockNumber({ onBlockNumber: () => undefined });
 
   stop();
-  assert.equal(client.transport.transports.length, 2);
+  const fallbackTransports: unknown = client.transport.transports;
+  assert.ok(Array.isArray(fallbackTransports));
+  assert.equal(fallbackTransports.length, 2);
   assert.equal(fixture.transport.endpoints.length, 2);
 });
 
@@ -388,4 +533,15 @@ test('observer failures cannot change a successful request', async (context) => 
   });
 
   assert.equal(await fixture.request(CHAIN_ID_REQUEST), '0x1');
+});
+
+test('asynchronous observer failures cannot change a successful request', async (context) => {
+  const fixture = transportFixture(context, (_input, init) => Promise.resolve(answer(init)), {
+    onEvent: () => Promise.reject(new Error('observer failed asynchronously')),
+  });
+
+  assert.equal(await fixture.request(CHAIN_ID_REQUEST), '0x1');
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
 });

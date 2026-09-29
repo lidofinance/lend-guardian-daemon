@@ -10,6 +10,17 @@
       ],
       "outputs": [],
       "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "setPrice",
+      "inputs": [
+        {
+          "type": "uint256"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
     }
   ],
   "bytecode": "0x6080604052348015600e575f5ffd5b50608b80601a5f395ff3fe6080604052348015600e575f5ffd5b5060043610603a575f3560e01c806391b7f5ed14603e578063a035b1fe14604f578063fe4b84df14603e575b5f5ffd5b604d60493660046068565b5f55565b005b60565f5481565b60405190815260200160405180910390f35b5f602082840312156077575f5ffd5b503591905056fea164736f6c6343000824000a"
