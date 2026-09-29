@@ -102,7 +102,17 @@ test('CLI rejects unsupported networks before reading RPC configuration', () => 
   assert.match(child.stderr, /CHAIN_ID must be 1 \(mainnet\) or 560048 \(Hoodi\)/);
 });
 
-type Scenario = 'observe' | 'unconfigured' | 'failed-signal' | 'lagging-endpoint';
+type Scenario = 'observe' | 'unconfigured' | 'lagging-endpoint' | SignalScenario;
+
+/** Signal attempts that fail: in screening, in the broadcast, and in the recovery after it. */
+type SignalScenario = 'failed-signal' | 'failed-send' | 'failed-send-then-screening' | 'failed-clearing';
+
+const SIGNAL_SCENARIOS: readonly string[] = [
+  'failed-signal',
+  'failed-send',
+  'failed-send-then-screening',
+  'failed-clearing',
+];
 
 function runExample(scenario: Scenario, chainId?: string, rpc: Record<string, string> = {}) {
   return spawnSync(
@@ -112,7 +122,7 @@ function runExample(scenario: Scenario, chainId?: string, rpc: Record<string, st
       cwd: new URL('../../', import.meta.url),
       // Deliberately do not inherit the host environment or any real credentials.
       env: {
-        ...(scenario === 'failed-signal' ? { MODE: 'signal' } : {}),
+        ...(SIGNAL_SCENARIOS.includes(scenario) ? { MODE: 'signal' } : {}),
         ...(chainId === undefined ? {} : { CHAIN_ID: chainId }),
         RPC_URLS: 'http://rpc.invalid',
         GUARDIAN,
@@ -120,7 +130,7 @@ function runExample(scenario: Scenario, chainId?: string, rpc: Record<string, st
         GUARDIAN_SIGNALS: REGISTRY,
         LIDO_LEND_DEPLOYMENT_BLOCK: '1000',
         GUARDIAN_SIGNALS_DEPLOYMENT_BLOCK: '900',
-        SIGNER_KEY: scenario === 'failed-signal' ? padHex('0x02', { size: 32 }) : 'must-not-be-read',
+        SIGNER_KEY: SIGNAL_SCENARIOS.includes(scenario) ? padHex('0x02', { size: 32 }) : 'must-not-be-read',
         ...rpc,
       },
       encoding: 'utf8',
@@ -148,13 +158,35 @@ test('default observe leaves requested screening incomplete and stops before sub
   assert.doesNotMatch(child.stdout, /attested block|observed:/);
 });
 
-test('a signal failure stops the scheduler instead of starting another attempt', () => {
+test('a signal failure before sending is followed by another attempt without reading nonces', () => {
   const child = runExample('failed-signal');
   assert.equal(child.error, undefined);
-  assert.equal(child.status, 1, child.stderr);
-  assert.match(child.stdout, /synthetic provider outage/);
-  assert.match(child.stdout, /reconcile the reports and transactions already sent before restarting/);
-  assert.match(child.stdout, /Signal failure returned without retrying/);
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /cycle failed: Error: synthetic provider outage/);
+  assert.match(child.stdout, /Attempt 2 started; nonces were read 0 times before it/);
+});
+
+test('a signal failure after sending clears the pending nonces before another attempt', () => {
+  const child = runExample('failed-send');
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /synthetic broadcast failure/);
+  assert.match(child.stdout, /Attempt 2 started; nonces were read 2 times before it/);
+});
+
+test('a failure before sending reads no nonces although an earlier attempt reached sending', () => {
+  const child = runExample('failed-send-then-screening');
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /Attempt 3 started; nonces were read 0 times before it/);
+});
+
+test('the example ends when the pending nonces cannot be cleared', () => {
+  const child = runExample('failed-clearing');
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 1);
+  assert.match(child.stderr, /synthetic nonce outage/);
+  assert.doesNotMatch(child.stdout, /Attempt 2 started/);
 });
 
 test('observe with a log quorum screens when the endpoints return the same logs', () => {
