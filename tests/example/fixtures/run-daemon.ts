@@ -32,7 +32,7 @@ const node = fakeNode({
 });
 
 // No HTTP request can leave this process, even if the example unexpectedly changes its endpoint.
-globalThis.fetch = async (_input, init) => {
+globalThis.fetch = async (input, init) => {
   assert.equal(typeof init?.body, 'string');
   assert.ok(typeof init?.body === 'string');
   const body: unknown = JSON.parse(init.body);
@@ -41,7 +41,10 @@ globalThis.fetch = async (_input, init) => {
   assert.ok(typeof body.method === 'string');
   const params: unknown = 'params' in body ? body.params : [];
   assert.ok(Array.isArray(params));
-  const result = await node.transport(body.method, params);
+  const url = input instanceof Request ? input.url : input.toString();
+  // A lagging endpoint answers a log read without the logs and without an error.
+  const lacksLogs = url.includes('lagging') && body.method === 'eth_getLogs';
+  const result = lacksLogs ? [] : await node.transport(body.method, params);
   return Response.json({ jsonrpc: '2.0', id: body.id, result });
 };
 
@@ -55,6 +58,10 @@ function print(...values: unknown[]): void {
     process.exit(0);
   }
   if (scenario === 'unconfigured' && incomplete) {
+    assert.deepEqual(node.sent.calls, []);
+    process.exit(0);
+  }
+  if (scenario === 'lagging-endpoint' && message.startsWith('cycle failed:')) {
     assert.deepEqual(node.sent.calls, []);
     process.exit(0);
   }

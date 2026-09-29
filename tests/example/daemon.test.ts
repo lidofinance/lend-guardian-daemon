@@ -102,7 +102,9 @@ test('CLI rejects unsupported networks before reading RPC configuration', () => 
   assert.match(child.stderr, /CHAIN_ID must be 1 \(mainnet\) or 560048 \(Hoodi\)/);
 });
 
-function runExample(scenario: 'observe' | 'unconfigured' | 'failed-signal', chainId?: string) {
+type Scenario = 'observe' | 'unconfigured' | 'failed-signal' | 'lagging-endpoint';
+
+function runExample(scenario: Scenario, chainId?: string, rpc: Record<string, string> = {}) {
   return spawnSync(
     process.execPath,
     ['--experimental-test-module-mocks', 'tests/example/fixtures/run-daemon.ts', scenario, chainId ?? '1'],
@@ -119,6 +121,7 @@ function runExample(scenario: 'observe' | 'unconfigured' | 'failed-signal', chai
         LIDO_LEND_DEPLOYMENT_BLOCK: '1000',
         GUARDIAN_SIGNALS_DEPLOYMENT_BLOCK: '900',
         SIGNER_KEY: scenario === 'failed-signal' ? padHex('0x02', { size: 32 }) : 'must-not-be-read',
+        ...rpc,
       },
       encoding: 'utf8',
       timeout: 10_000,
@@ -153,3 +156,42 @@ test('a signal failure stops the scheduler instead of starting another attempt',
   assert.match(child.stdout, /reconcile the reports and transactions already sent before restarting/);
   assert.match(child.stdout, /Signal failure returned without retrying/);
 });
+
+test('observe with a log quorum screens when the endpoints return the same logs', () => {
+  const rpc = { RPC_URLS: 'http://first.invalid,http://second.invalid', RPC_LOG_QUORUM: '2' };
+  const child = runExample('observe', undefined, rpc);
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /observed: 1 screened, 0 targets already flagged, 0 suspects, 1 flags/);
+});
+
+test('a log quorum fails the cycle when an endpoint lacks the logs of the other', () => {
+  const rpc = { RPC_URLS: 'http://first.invalid,http://lagging.invalid', RPC_LOG_QUORUM: '2' };
+  const child = runExample('lagging-endpoint', undefined, rpc);
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /did not confirm eth_getLogs: answers-differ/);
+  assert.doesNotMatch(child.stdout, /observed:/);
+});
+
+test('without a log quorum an endpoint that lacks logs is not noticed', () => {
+  const rpc = { RPC_URLS: 'http://first.invalid,http://lagging.invalid' };
+  const child = runExample('observe', undefined, rpc);
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /observed: 1 screened/);
+});
+
+for (const [name, rpc, message] of [
+  ['that is not a number', { RPC_LOG_QUORUM: 'two' }, /RPC_LOG_QUORUM is not a positive integer/],
+  ['that is empty', { RPC_LOG_QUORUM: '' }, /RPC_LOG_QUORUM is not a positive integer/],
+  ['of one', { RPC_LOG_QUORUM: '1' }, /logQuorum must be between 2 and 1/],
+  ['above the number of endpoints', { RPC_LOG_QUORUM: '2' }, /logQuorum must be between 2 and 1/],
+] as const) {
+  test(`the example refuses a log quorum ${name} before reaching RPC`, () => {
+    const child = runExample('observe', undefined, rpc);
+    assert.equal(child.error, undefined);
+    assert.equal(child.status, 1);
+    assert.match(child.stderr, message);
+  });
+}

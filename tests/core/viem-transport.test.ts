@@ -416,7 +416,9 @@ test('the fallback retains native watcher and endpoint metadata', (context) => {
   const stop = client.watchBlockNumber({ onBlockNumber: () => undefined });
 
   stop();
-  assert.equal(client.transport.transports.length, 2);
+  const fallbackTransports: unknown = client.transport.transports;
+  assert.ok(Array.isArray(fallbackTransports));
+  assert.equal(fallbackTransports.length, 2);
   assert.equal(fixture.transport.endpoints.length, 2);
 });
 

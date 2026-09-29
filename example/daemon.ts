@@ -129,6 +129,8 @@ function createGuardian(mode: Mode): Guardian {
   const onEvent: EventHandler = logEvent;
   const transport = createViemRpcTransport({
     urls: nodeUrls,
+    // Unset, one endpoint answers a log read like any other request.
+    logQuorum: env.optionalPositiveInteger('RPC_LOG_QUORUM'),
     timeoutMs: RPC_REQUEST_TIMEOUT_MS,
     maxResponseBodySize: MAX_RPC_RESPONSE_BODY_SIZE,
     retryCount: RPC_RETRY_COUNT,

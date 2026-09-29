@@ -86,6 +86,11 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
+/** An unset variable leaves the setting off; a set one must be a positive integer. */
+export function optionalPositiveInteger(name: string): number | undefined {
+  return process.env[name] === undefined ? undefined : positiveInteger(name);
+}
+
 /** An empty value reads as zero, so it fails here too rather than passing as zero. */
 export function positiveInteger(name: string): number {
   const value = Number(required(name));

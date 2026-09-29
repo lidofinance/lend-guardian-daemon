@@ -379,7 +379,7 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
   }
 }
 
-export { createViemRpcTransport } from './viem-transport.ts';
+export { createViemRpcTransport, LogsNotConfirmedError } from './viem-transport.ts';
 export type { ViemRpcTransport, ViemRpcTransportOptions } from './viem-transport.ts';
 
 export type { TransactionPolicy } from './rpc.ts';

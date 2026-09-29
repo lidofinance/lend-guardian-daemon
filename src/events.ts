@@ -184,4 +184,14 @@ export interface RpcRequestFinishedEvent extends Omit<RpcRequestStartedEvent, 'e
   readonly error?: unknown;
 }
 
-export type RpcEvent = RpcRequestStartedEvent | RpcRequestFinishedEvent;
+/** Providers returned different logs for one read; indexes are positions in the configured URLs. */
+export interface RpcAnswersDifferEvent {
+  readonly event: 'rpc.answersDiffer';
+  readonly method: string;
+  /** Providers whose answer was returned; empty when the read was rejected. */
+  readonly acceptedRpcIndexes: readonly number[];
+  /** Providers that returned other logs. */
+  readonly otherRpcIndexes: readonly number[];
+}
+
+export type RpcEvent = RpcRequestStartedEvent | RpcRequestFinishedEvent | RpcAnswersDifferEvent;

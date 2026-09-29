@@ -62,7 +62,7 @@ if (leaks.length > 0) {
 
 // Resolve the actual package subpath after the clean build, not a source-only export.
 const clients = await import('guardian-daemon-sdk/clients');
-if (Object.keys(clients).sort().join(',') !== 'ViemRpcClient,createViemRpcTransport') {
-  throw new Error('The /clients entry point must expose the viem client and transport');
+if (Object.keys(clients).sort().join(',') !== 'LogsNotConfirmedError,ViemRpcClient,createViemRpcTransport') {
+  throw new Error('The /clients entry point must expose the viem client, its transport and the transport error');
 }
 console.log('/clients resolves the built viem client and transport');
