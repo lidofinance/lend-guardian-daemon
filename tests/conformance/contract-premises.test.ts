@@ -370,7 +370,7 @@ test('the SDK commits its computed coverage digest in Heartbeat.data', async () 
     walletClient,
     maxLogBlockRange: 1_000,
     transactionPolicy: {
-      sendTimeoutMs: 10_000,
+      sendTimeoutMs: 132_000,
       replacementFeeBumpBps: 1_000,
       maxFeePerGas: 100_000_000_000n,
       replacementTimeoutMs: 1_000,

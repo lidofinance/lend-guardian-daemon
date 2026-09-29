@@ -1,5 +1,5 @@
 import type { NodeRequest } from './client.ts';
-import { rpcRequest } from './client.ts';
+import { rpcRequest, SEND_TIMEOUT_MS } from './client.ts';
 import { BaseRpcProvider } from '../../src/core/index.ts';
 // These report-phase guards were moved from the daemon with batching and confirmation ownership.
 import assert from 'node:assert/strict';
@@ -94,7 +94,7 @@ function reportClient(
     signer: GUARDIAN,
     transactionPolicy: {
       maxFeePerGas: 100n,
-      sendTimeoutMs: 10_000,
+      sendTimeoutMs: SEND_TIMEOUT_MS,
       replacementFeeBumpBps: 1_000,
       replacementTimeoutMs: 1_000,
       sendAttempts: 2,

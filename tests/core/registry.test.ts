@@ -1,4 +1,4 @@
-import { rpcRequest } from './client.ts';
+import { rpcRequest, SEND_TIMEOUT_MS } from './client.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { BaseError, ContractFunctionRevertedError, encodeErrorResult, padHex, parseAbi } from 'viem';
@@ -45,7 +45,7 @@ function writingClient(
     signer: GUARDIAN,
     transactionPolicy: {
       maxFeePerGas: 100n,
-      sendTimeoutMs: 10_000,
+      sendTimeoutMs: SEND_TIMEOUT_MS,
       replacementFeeBumpBps: 1_000,
       replacementTimeoutMs: 1_000,
       sendAttempts: 2,

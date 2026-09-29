@@ -8,6 +8,7 @@ import { isRecord } from '../../src/common/validation.ts';
 import { createViemRpcTransport, LogsNotConfirmedError, ViemRpcClient } from '../../src/chain/viem-client.ts';
 import { Guardian } from '../../src/core/index.ts';
 import type { CycleOutcome } from '../../src/core/index.ts';
+import { SEND_TIMEOUT_MS } from './client.ts';
 import { blockAt, CORE, fakeNode, GUARDIAN, GUARDIAN_KEY, REGISTRY } from './fake-node.ts';
 import type { FakeNode, Lot } from './fake-node.ts';
 import { failingProvider, scriptedProvider } from './scripted-providers.ts';
@@ -88,7 +89,7 @@ function guardianOver(providers: readonly ScriptedProvider[], mode: 'observe' | 
     walletClient,
     maxLogBlockRange: 100_000,
     transactionPolicy: {
-      sendTimeoutMs: 20_000,
+      sendTimeoutMs: SEND_TIMEOUT_MS,
       replacementFeeBumpBps: 1_000,
       maxFeePerGas: 1_000_000_000_000n,
       replacementTimeoutMs: 2_000,
