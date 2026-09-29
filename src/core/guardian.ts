@@ -885,10 +885,6 @@ function validateSetup(setup: GuardianState): void {
   requireAddress('guardian', setup.guardian);
   requireAddress('deployment.lidoLend.address', deployment.lidoLend.address);
   requireAddress('deployment.guardianSignals.address', deployment.guardianSignals.address);
-  if (setup.mode === 'signal') {
-    requireAddress('expectedDelegate', setup.expectedDelegate);
-    requireInteger('client.transactionPolicy.sendTimeoutMs', setup.sendTimeoutMs, { min: 1, max: 2_147_483_647 });
-  }
   requireInteger('deployment.chainId', deployment.chainId, { min: 1 });
   requireInteger('deployment.slotSeconds', deployment.slotSeconds, { min: 1 });
   requireInteger('maxSignalBatchSize', setup.maxSignalBatchSize, { min: 1 });
@@ -906,6 +902,16 @@ function validateSetup(setup: GuardianState): void {
     min: 1,
     max: BLOCKHASH_LOOKBACK - setup.reportBlockLag,
   });
+  if (setup.mode === 'signal') {
+    requireAddress('expectedDelegate', setup.expectedDelegate);
+    // SDK guard: the heartbeat needs a slot for inclusion and one per further confirmation, plus one
+    // for preparation and polling. A shorter budget could never attest, so construction rejects it.
+    const minimumSendTimeoutMs = (setup.txConfirmationBlocks + 1) * deployment.slotSeconds * MILLISECONDS_PER_SECOND;
+    requireInteger('client.transactionPolicy.sendTimeoutMs', setup.sendTimeoutMs, {
+      min: minimumSendTimeoutMs,
+      max: 2_147_483_647,
+    });
+  }
 }
 
 /** viem caches its verdict by the text of a value, so only a string may reach it. */

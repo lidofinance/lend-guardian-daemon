@@ -95,7 +95,8 @@ for (const mode of ['signal', 'observe'] as const) {
 
 test('numeric setup accepts its documented limits and rejects values outside them', () => {
   const node = fakeNode({ head: HEAD });
-  const setup = { ...configuration(), client: signingClient([{ node: node.transport }]) };
+  // Observe isolates each field: in signal mode the send budget also bounds slotSeconds and txConfirmationBlocks.
+  const setup = { ...configuration(), mode: 'observe' as const, client: signingClient([{ node: node.transport }]) };
   const ranges = [
     { field: 'chainId', min: 1, max: Number.MAX_SAFE_INTEGER },
     { field: 'slotSeconds', min: 1, max: Number.MAX_SAFE_INTEGER },
@@ -191,16 +192,31 @@ test('signal rejects a client whose send budget is not an integer', () => {
   }
 });
 
-test('signal accepts a send budget from 1 to 2_147_483_647 ms and rejects values outside', () => {
-  for (const sendTimeoutMs of [1, 2_147_483_647]) {
+test('signal accepts a send budget from the confirmation depth plus one slot to 2_147_483_647 ms', () => {
+  // Twelve confirmations of 12-second slots: 13 slots, 156 seconds.
+  for (const sendTimeoutMs of [156_000, 2_147_483_647]) {
     assert.doesNotThrow(() => new Guardian({ ...configuration(), client: createClientWithSendBudget(sendTimeoutMs) }));
   }
-  for (const sendTimeoutMs of [0, -1, 2_147_483_648]) {
+  for (const sendTimeoutMs of [155_999, 60_000, 1, 0, -1, 2_147_483_648]) {
     assert.throws(() => new Guardian({ ...configuration(), client: createClientWithSendBudget(sendTimeoutMs) }), {
       name: 'RangeError',
-      message: 'client.transactionPolicy.sendTimeoutMs must be between 1 and 2147483647',
+      message: 'client.transactionPolicy.sendTimeoutMs must be between 156000 and 2147483647',
     });
   }
+});
+
+test('the minimum send budget follows the confirmation depth and the slot duration', () => {
+  const setup = {
+    ...configuration(),
+    deployment: { ...configuration().deployment, slotSeconds: 2 },
+    txConfirmationBlocks: 1,
+  };
+  // One confirmation of 2-second slots: two slots, four seconds.
+  assert.doesNotThrow(() => new Guardian({ ...setup, client: createClientWithSendBudget(4_000) }));
+  assert.throws(() => new Guardian({ ...setup, client: createClientWithSendBudget(3_999) }), {
+    name: 'RangeError',
+    message: 'client.transactionPolicy.sendTimeoutMs must be between 4000 and 2147483647',
+  });
 });
 
 test('setup rejects missing and empty node endpoints before constructing a client', () => {
