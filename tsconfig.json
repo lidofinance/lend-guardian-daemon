@@ -14,5 +14,13 @@
     "noImplicitOverride": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["abi/**/*.ts", "src/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts", "example/**/*.ts", "daemon/**/*.ts"]
+  "include": [
+    "abi/**/*.ts",
+    "src/**/*.ts",
+    "scripts/**/*.ts",
+    "tests/**/*.ts",
+    "example/**/*.ts",
+    "daemon/**/*.ts",
+    "benchmarks/**/*.ts"
+  ]
 }

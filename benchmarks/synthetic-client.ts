@@ -1,0 +1,97 @@
+// A signing client for benchmarks. The synthetic chain mines each registry call, and waiting for
+// inclusion or confirmations moves its virtual head instead of wall-clock time. Reads, receipts and
+// confirmation checks run through the SDK's own BaseRpcProvider over the measured node, so they are
+// counted like any other request. Fees, signing and replacement are not modelled.
+
+import { BaseRpcProvider } from '../src/chain/base-rpc-provider.ts';
+import type {
+  PreparedTransaction,
+  ReceiptRef,
+  RpcClient,
+  SendOptions,
+  TransactionPolicy,
+  TransactionRequest,
+} from '../src/chain/rpc.ts';
+import type { Address, TxHash } from '../src/common/types.ts';
+import { typedRequest } from './synthetic-rpc.ts';
+import type { MinedTransaction, NodeRequest, SyntheticChain } from './synthetic-rpc.ts';
+
+/**
+ * Delivery policy the SDK reads from its client. Only `sendTimeoutMs` matters here: Guardian uses it
+ * as the wall-clock bound of each report kind's shared confirmation wait, and requires it to cover
+ * the confirmation depth plus one slot. Ten minutes covers the deepest scenario, 32 blocks.
+ */
+const POLICY: TransactionPolicy = Object.freeze({
+  maxFeePerGas: 100_000_000_000n,
+  sendTimeoutMs: 600_000,
+  replacementFeeBumpBps: 1_000,
+  replacementTimeoutMs: 36_000,
+  sendAttempts: 5,
+});
+
+/** A registry transaction the client delivered, with the head when it was broadcast. */
+export interface Delivery extends MinedTransaction {
+  /** Position among this client's deliveries, from zero. */
+  readonly sequence: number;
+  readonly headAtBroadcast: number;
+}
+
+export interface SyntheticClientOptions {
+  readonly node: NodeRequest;
+  readonly chain: SyntheticChain;
+  readonly signer: Address;
+  readonly maxLogBlockRange: number;
+  /** Blocks from broadcast to inclusion. */
+  readonly inclusionBlocks: number;
+  /** Called after each inclusion and before confirmations accumulate; faults are injected here. */
+  readonly onIncluded?: ((delivery: Delivery) => void) | undefined;
+}
+
+export class SyntheticClient extends BaseRpcProvider implements RpcClient {
+  readonly signer: Address;
+
+  readonly transactionPolicy = POLICY;
+
+  readonly #chain: SyntheticChain;
+
+  readonly #inclusionBlocks: number;
+
+  readonly #onIncluded: ((delivery: Delivery) => void) | undefined;
+
+  readonly #deliveries: Delivery[] = [];
+
+  constructor(options: SyntheticClientOptions) {
+    super({ request: typedRequest(options.node), maxLogBlockRange: options.maxLogBlockRange });
+    this.signer = options.signer;
+    this.#chain = options.chain;
+    this.#inclusionBlocks = options.inclusionBlocks;
+    this.#onIncluded = options.onIncluded;
+  }
+
+  /** Every delivery so far, in order. */
+  deliveries(): readonly Delivery[] {
+    return this.#deliveries;
+  }
+
+  prepareTransaction(): Promise<PreparedTransaction> {
+    return Promise.reject(new Error('The synthetic client delivers through send only'));
+  }
+
+  broadcastTransaction(): Promise<TxHash> {
+    return Promise.reject(new Error('The synthetic client delivers through send only'));
+  }
+
+  /** Mine the call, let the fault hook act, then advance the head to the requested depth. */
+  send(transaction: TransactionRequest, options: SendOptions): Promise<ReceiptRef> {
+    const headAtBroadcast = this.#chain.head();
+    const mined = this.#chain.include(transaction.data, this.#inclusionBlocks);
+    const delivery: Delivery = { ...mined, sequence: this.#deliveries.length, headAtBroadcast };
+    this.#deliveries.push(delivery);
+    this.#onIncluded?.(delivery);
+    this.#chain.advanceTo(mined.blockNumber + options.confirmations - 1);
+    if (mined.status === 'reverted') {
+      return Promise.reject(new Error(`Synthetic ${mined.method} transaction reverted`));
+    }
+    return Promise.resolve({ transactionHash: mined.hash, blockNumber: mined.blockNumber, blockHash: mined.blockHash });
+  }
+}

@@ -7,3 +7,6 @@ dist/
 
 # Local audit planning.
 /audit-scope.md
+
+# Local benchmark measurements.
+benchmarks/results/
