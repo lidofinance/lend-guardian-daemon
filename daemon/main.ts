@@ -34,6 +34,7 @@ const MAX_RESTARTS_PER_CYCLE = 5;
 // Guardian policy of this daemon, the same as the reference example's.
 const REPORT_BLOCK_LAG = 2;
 const FLAGGER_READ_CONCURRENCY = 8;
+const HISTORY_READ_CONCURRENCY = 8;
 const INTER_BATCH_CONFIRMATION_BLOCKS = 2;
 const CONFIRMATION_POLL_INTERVAL_MS = 12_000;
 const MAX_SIGNAL_BATCH_SIZE = 20;
@@ -228,6 +229,7 @@ function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
     screening: new HttpScreening(readUrl('SCREENING_URL')),
     reportBlockLag: REPORT_BLOCK_LAG,
     flaggerReadConcurrency: FLAGGER_READ_CONCURRENCY,
+    historyReadConcurrency: HISTORY_READ_CONCURRENCY,
     interBatchConfirmationBlocks: INTER_BATCH_CONFIRMATION_BLOCKS,
     confirmationPollIntervalMs: CONFIRMATION_POLL_INTERVAL_MS,
     maxSignalBatchSize: MAX_SIGNAL_BATCH_SIZE,

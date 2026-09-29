@@ -56,6 +56,8 @@ interface GuardianConfig {
   readonly reportBlockLag?: number;
   /** Maximum concurrent flagger reads. Defaults to 8. */
   readonly flaggerReadConcurrency?: number;
+  /** Maximum supplies classified, or candidate positions reconstructed, at once. Defaults to 1. */
+  readonly historyReadConcurrency?: number;
   /** Confirmations between report batches, capped at txConfirmationBlocks. Defaults to 2. */
   readonly interBatchConfirmationBlocks?: number;
   /** Interval between shared report-confirmation checks. Defaults to one network slot. */
@@ -96,6 +98,8 @@ const DEFAULT_REPORT_BLOCK_LAG = 2;
 
 const DEFAULT_FLAGGER_READ_CONCURRENCY = 8;
 
+const DEFAULT_HISTORY_READ_CONCURRENCY = 1;
+
 const DEFAULT_INTER_BATCH_CONFIRMATION_BLOCKS = 2;
 
 const MILLISECONDS_PER_SECOND = 1_000;
@@ -108,7 +112,11 @@ type GuardianState = GuardianConfig &
   Required<
     Pick<
       GuardianConfig,
-      'reportBlockLag' | 'flaggerReadConcurrency' | 'interBatchConfirmationBlocks' | 'confirmationPollIntervalMs'
+      | 'reportBlockLag'
+      | 'flaggerReadConcurrency'
+      | 'historyReadConcurrency'
+      | 'interBatchConfirmationBlocks'
+      | 'confirmationPollIntervalMs'
     >
   > &
   (
@@ -274,7 +282,11 @@ export class Guardian {
   async discoverCandidatePositions(plan: ScanPlan): Promise<Discovered> {
     const markets = new Markets(this.#rpc, this.#setup.deployment.lidoLend);
     await this.#requireCanonicalBlock(plan.discoveryRange.to);
-    const positions = await markets.discoverCandidatePositions(plan, this.#setup.deployment.guardianSignals.address);
+    const positions = await markets.discoverCandidatePositions(
+      plan,
+      this.#setup.deployment.guardianSignals.address,
+      this.#setup.historyReadConcurrency,
+    );
     await this.#requireCanonicalBlock(plan.discoveryRange.to);
     return new Discovered(plan, positions);
   }
@@ -286,7 +298,7 @@ export class Guardian {
   async reconstructWork(discovered: Discovered): Promise<Work> {
     const plan = discovered.plan();
     const markets = new Markets(this.#rpc, this.#setup.deployment.lidoLend);
-    const byPosition = await markets.reconstructWork(plan, discovered.all());
+    const byPosition = await markets.reconstructWork(plan, discovered.all(), this.#setup.historyReadConcurrency);
     return new Work(plan, byPosition);
   }
 
@@ -896,6 +908,7 @@ function validateSetup(setup: GuardianState): void {
   requireInteger('txConfirmationBlocks', setup.txConfirmationBlocks, { min: 1 });
   requireInteger('reportBlockLag', setup.reportBlockLag, { min: 1, max: BLOCKHASH_LOOKBACK - 1 });
   requireInteger('flaggerReadConcurrency', setup.flaggerReadConcurrency, { min: 1 });
+  requireInteger('historyReadConcurrency', setup.historyReadConcurrency, { min: 1 });
   requireInteger('interBatchConfirmationBlocks', setup.interBatchConfirmationBlocks, { min: 1 });
   requireInteger('confirmationPollIntervalMs', setup.confirmationPollIntervalMs, { min: 1, max: 2_147_483_647 });
   requireInteger('heartbeatReserveBlocks', setup.heartbeatReserveBlocks, {
@@ -935,6 +948,7 @@ function snapshotSetup(setup: GuardianSetup): GuardianState {
   const {
     reportBlockLag = DEFAULT_REPORT_BLOCK_LAG,
     flaggerReadConcurrency = DEFAULT_FLAGGER_READ_CONCURRENCY,
+    historyReadConcurrency = DEFAULT_HISTORY_READ_CONCURRENCY,
     interBatchConfirmationBlocks = DEFAULT_INTER_BATCH_CONFIRMATION_BLOCKS,
     confirmationPollIntervalMs = setup.deployment.slotSeconds * MILLISECONDS_PER_SECOND,
   } = setup;
@@ -944,6 +958,7 @@ function snapshotSetup(setup: GuardianSetup): GuardianState {
     screening: setup.screening,
     reportBlockLag,
     flaggerReadConcurrency,
+    historyReadConcurrency,
     interBatchConfirmationBlocks,
     confirmationPollIntervalMs,
     idleHeartbeatInterval: setup.idleHeartbeatInterval,
