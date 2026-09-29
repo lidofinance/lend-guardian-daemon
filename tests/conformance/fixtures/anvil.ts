@@ -2,9 +2,10 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { createPublicClient, createTestClient, defineChain, http, isHex } from 'viem';
-import type { Abi, Chain, Hex } from 'viem';
+import type { Abi, Chain, Hex, PublicClient } from 'viem';
 import { isRecord } from '../../../src/common/validation.ts';
 
 export type ArtifactName =
@@ -22,7 +23,7 @@ export interface ContractArtifact {
 
 export interface AnvilFixture {
   readonly chain: Chain;
-  readonly publicClient: ReturnType<typeof createPublicClient>;
+  readonly publicClient: PublicClient;
   readonly testClient: ReturnType<typeof createTestClient>;
   readonly rpcUrl: string;
   stop(): void;
@@ -43,20 +44,32 @@ export function readArtifact(name: ArtifactName): ContractArtifact {
 
 /** Start an isolated Anvil chain and stop it if readiness cannot be established. */
 export async function startAnvil(port: number): Promise<AnvilFixture> {
+  await requireFreePort(port);
   const rpcUrl = `http://127.0.0.1:${port}`;
   const chain = localChain(rpcUrl);
   const executable = process.env.ANVIL_BIN ?? 'anvil';
-  const child = spawn(
-    executable,
-    ['--port', String(port), '--chain-id', '1', '--code-size-limit', '30000', '--silent'],
-    { stdio: 'ignore' },
-  );
+  const child = spawn(executable, ['--port', String(port), '--chain-id', '1', '--silent'], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk: string) => {
+    stderr += chunk;
+  });
 
   try {
     await once(child, 'spawn');
     const publicClient = createPublicClient({ chain, transport: http(rpcUrl), cacheTime: 0 });
     const testClient = createTestClient({ chain, mode: 'anvil', transport: http(rpcUrl) });
-    await waitUntilReady(publicClient);
+    const exited = once(child, 'exit').then(([code, signal]) => {
+      const reason = stderr.trim();
+      throw new Error(
+        `Anvil exited before readiness (code=${String(code)}, signal=${String(signal)})${
+          reason === '' ? '' : `: ${reason}`
+        }`,
+      );
+    });
+    await Promise.race([waitUntilReady(publicClient), exited]);
 
     return {
       chain,
@@ -101,4 +114,22 @@ function isAbi(value: unknown): value is Abi {
 
 function isAbiItem(value: unknown): value is Abi[number] {
   return isRecord(value) && typeof value.type === 'string';
+}
+
+async function requireFreePort(port: number): Promise<void> {
+  const server = createServer();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, '127.0.0.1', resolve);
+    });
+  } catch (error) {
+    throw new Error(`Anvil port ${port} is already in use`, { cause: error });
+  } finally {
+    if (server.listening) {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+    }
+  }
 }

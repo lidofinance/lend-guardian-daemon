@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { zeroAddress } from 'viem';
 import { Guardian } from '../../src/core/guardian.ts';
 import type { GuardianSetup } from '../../src/core/guardian.ts';
+import type { RpcClient } from '../../src/core/index.ts';
 import { SUPPLY_COLLATERAL_TOPICS } from '../../abi/Core.abi.ts';
 import { BaseRpcProvider } from '../../src/chain/base-rpc-provider.ts';
 import { blockAt, CORE, fakeNode, GUARDIAN, REGISTRY } from './fake-node.ts';
@@ -94,7 +95,8 @@ for (const mode of ['signal', 'observe'] as const) {
 
 test('numeric setup accepts its documented limits and rejects values outside them', () => {
   const node = fakeNode({ head: HEAD });
-  const setup = { ...configuration(), client: signingClient([{ node: node.transport }]) };
+  // Observe isolates each field: in signal mode the send budget also bounds slotSeconds and txConfirmationBlocks.
+  const setup = { ...configuration(), mode: 'observe' as const, client: signingClient([{ node: node.transport }]) };
   const ranges = [
     { field: 'chainId', min: 1, max: Number.MAX_SAFE_INTEGER },
     { field: 'slotSeconds', min: 1, max: Number.MAX_SAFE_INTEGER },
@@ -111,6 +113,110 @@ test('numeric setup accepts its documented limits and rejects values outside the
     assert.throws(() => new Guardian(withNumber(setup, field, min - 1)), RangeError);
     assert.throws(() => new Guardian(withNumber(setup, field, max + 1)), RangeError);
   }
+});
+
+const ADDRESS_FIELDS = ['guardian', 'deployment.lidoLend.address', 'deployment.guardianSignals.address'] as const;
+
+type AddressField = (typeof ADDRESS_FIELDS)[number] | 'expectedDelegate';
+
+function withAddress(setup: GuardianSetup, field: AddressField, value: unknown): GuardianSetup {
+  if (field === 'deployment.lidoLend.address') {
+    const lidoLend = Object.assign({}, setup.deployment.lidoLend, { address: value });
+    return { ...setup, deployment: { ...setup.deployment, lidoLend } };
+  }
+  if (field === 'deployment.guardianSignals.address') {
+    const guardianSignals = Object.assign({}, setup.deployment.guardianSignals, { address: value });
+    return { ...setup, deployment: { ...setup.deployment, guardianSignals } };
+  }
+  return Object.assign({}, setup, { [field]: value });
+}
+
+/** A short value, a broken checksum, and a list whose text is an address viem has already accepted. */
+function listMalformedAddresses(): unknown[] {
+  assert.doesNotThrow(() => new Guardian(configuration()));
+  return ['0x1234', '0x52908400098527886E0F7030069857D2E4169Ee7', [GUARDIAN]];
+}
+
+for (const mode of ['signal', 'observe'] as const) {
+  for (const field of ADDRESS_FIELDS) {
+    test(`${mode} rejects a malformed ${field} before any RPC, screening or submission`, () => {
+      const setup = { ...configuration(), mode, client: configuration().client };
+      for (const value of listMalformedAddresses()) {
+        assert.throws(() => new Guardian(withAddress(setup, field, value)), {
+          name: 'TypeError',
+          message: `${field} must be a valid address`,
+        });
+      }
+    });
+  }
+}
+
+test('signal rejects a malformed expectedDelegate before any RPC, screening or submission', () => {
+  for (const value of listMalformedAddresses()) {
+    assert.throws(() => new Guardian(withAddress(configuration(), 'expectedDelegate', value)), {
+      name: 'TypeError',
+      message: 'expectedDelegate must be a valid address',
+    });
+  }
+});
+
+/** A client another library could supply: the reads of a provider, and a delivery policy of its own. */
+function createClientWithSendBudget(sendTimeoutMs: unknown): RpcClient {
+  const provider = new BaseRpcProvider({
+    request: rpcRequest(fakeNode({ head: HEAD }).transport),
+    maxLogBlockRange: 1_000,
+  });
+  const refuse = (): Promise<never> => Promise.reject(new Error('the setup must not deliver'));
+  const policy = {
+    maxFeePerGas: 1n,
+    sendTimeoutMs: 1,
+    replacementFeeBumpBps: 1_000,
+    replacementTimeoutMs: 1,
+    sendAttempts: 1,
+  };
+  return Object.assign(provider, {
+    signer: GUARDIAN,
+    transactionPolicy: Object.assign(policy, { sendTimeoutMs }),
+    prepareTransaction: refuse,
+    broadcastTransaction: refuse,
+    send: refuse,
+  });
+}
+
+test('signal rejects a client whose send budget is not an integer', () => {
+  for (const sendTimeoutMs of [NaN, Infinity, 1.5, null, undefined, '264000']) {
+    assert.throws(() => new Guardian({ ...configuration(), client: createClientWithSendBudget(sendTimeoutMs) }), {
+      name: 'RangeError',
+      message: 'client.transactionPolicy.sendTimeoutMs must be a safe integer',
+    });
+  }
+});
+
+test('signal accepts a send budget from the confirmation depth plus one slot to 2_147_483_647 ms', () => {
+  // Twelve confirmations of 12-second slots: 13 slots, 156 seconds.
+  for (const sendTimeoutMs of [156_000, 2_147_483_647]) {
+    assert.doesNotThrow(() => new Guardian({ ...configuration(), client: createClientWithSendBudget(sendTimeoutMs) }));
+  }
+  for (const sendTimeoutMs of [155_999, 60_000, 1, 0, -1, 2_147_483_648]) {
+    assert.throws(() => new Guardian({ ...configuration(), client: createClientWithSendBudget(sendTimeoutMs) }), {
+      name: 'RangeError',
+      message: 'client.transactionPolicy.sendTimeoutMs must be between 156000 and 2147483647',
+    });
+  }
+});
+
+test('the minimum send budget follows the confirmation depth and the slot duration', () => {
+  const setup = {
+    ...configuration(),
+    deployment: { ...configuration().deployment, slotSeconds: 2 },
+    txConfirmationBlocks: 1,
+  };
+  // One confirmation of 2-second slots: two slots, four seconds.
+  assert.doesNotThrow(() => new Guardian({ ...setup, client: createClientWithSendBudget(4_000) }));
+  assert.throws(() => new Guardian({ ...setup, client: createClientWithSendBudget(3_999) }), {
+    name: 'RangeError',
+    message: 'client.transactionPolicy.sendTimeoutMs must be between 4000 and 2147483647',
+  });
 });
 
 test('setup rejects missing and empty node endpoints before constructing a client', () => {

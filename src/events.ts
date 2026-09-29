@@ -144,21 +144,32 @@ export type SdkEvent =
       readonly receiptBlockHash: Bytes32;
     };
 
-export type EventHandler = (event: SdkEvent) => void;
+/**
+ * The SDK neither awaits a handler nor uses its result, and a thrown error or a rejected promise
+ * does not change the operation being observed. A client that calls the handler itself provides
+ * the same isolation.
+ */
+export type EventHandler = (event: SdkEvent) => unknown;
 
 /** Notify an optional observer without allowing diagnostics to change SDK behavior. */
 export function emitEvent(handler: EventHandler | undefined, event: SdkEvent): void {
   try {
-    handler?.(event);
+    void Promise.resolve(handler?.(event)).catch(() => {
+      // An asynchronous observer failure must not change the operation being observed.
+    });
   } catch {
-    // An observer failure must not change the operation being observed.
+    // A synchronous observer failure must not change the operation being observed.
   }
 }
 
 /** One physical HTTP attempt, including attempts made by viem retries or failover. */
 export interface RpcRequestStartedEvent {
   readonly event: 'rpc.requestStarted';
+  /** Monotonic within one RPC endpoint; pair with rpcIndex. */
+  readonly requestId: number;
   readonly method: string;
+  /** A frozen copy of the parameters sent; absent when the request has none. */
+  readonly params?: unknown;
   readonly rpcIndex: number;
   readonly startedAt: number;
 }
@@ -169,7 +180,18 @@ export interface RpcRequestFinishedEvent extends Omit<RpcRequestStartedEvent, 'e
   readonly httpStatus: number;
   readonly requestBytes: number;
   readonly responseBytes: number;
+  /** The error the caller receives; it names the endpoint URL and the request, unlike `rpcIndex`. */
   readonly error?: unknown;
 }
 
-export type RpcEvent = RpcRequestStartedEvent | RpcRequestFinishedEvent;
+/** Providers returned different logs for one read; indexes are positions in the configured URLs. */
+export interface RpcAnswersDifferEvent {
+  readonly event: 'rpc.answersDiffer';
+  readonly method: string;
+  /** Providers whose answer was returned; empty when the read was rejected. */
+  readonly acceptedRpcIndexes: readonly number[];
+  /** Providers that returned other logs. */
+  readonly otherRpcIndexes: readonly number[];
+}
+
+export type RpcEvent = RpcRequestStartedEvent | RpcRequestFinishedEvent | RpcAnswersDifferEvent;

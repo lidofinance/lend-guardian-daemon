@@ -1,7 +1,7 @@
 import type { NodeRequest } from './client.ts';
 // Submission decisions are checked at the signed JSON-RPC boundary, without a substitute sender.
 import assert from 'node:assert/strict';
-import { signingClient } from './client.ts';
+import { SEND_TIMEOUT_MS, signingClient } from './client.ts';
 import test from 'node:test';
 import * as core from '../../src/core/index.ts';
 import { coverageDigest } from '../../src/core/digest.ts';
@@ -76,6 +76,14 @@ test('a clean cycle sends only the heartbeat for the report block', async () => 
   assert.deepEqual(sent.flags, []);
   assert.deepEqual(sent.calls, ['heartbeat']);
   assert.equal(sent.heartbeats[0]?.block, blockAt(REPORT).hash);
+});
+
+test('an invalid digest input stops before the first report transaction', async () => {
+  const built = await submitOver({ ...ONE_DUE, invalidBlockHashAt: REPORT }, 'flag');
+
+  await assert.rejects(built.guardian.signalAndHeartbeat(built.screened));
+
+  assert.deepEqual(built.sent.calls, []);
 });
 
 test('suspects and flags are signed by the configured account for the registry before heartbeat', async () => {
@@ -198,6 +206,48 @@ for (const nextHead of [REPORT, REPORT + 250]) {
     assert.deepEqual(sent.calls, []);
   });
 }
+
+test('a stored heartbeat rollback invalidates the plan before any transaction', async () => {
+  const covered = blockAt(95_000);
+  const built = await submitOver(
+    {
+      ...ONE_DUE,
+      heartbeatTimestamp: covered.timestamp,
+      heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
+    },
+    'clean',
+  );
+  built.node.setHeartbeatTimestamp(covered.timestamp - 1);
+
+  assert.deepEqual(await built.guardian.signalAndHeartbeat(built.screened), {
+    kind: 'stale',
+    reason: 'stored-heartbeat-moved',
+  });
+  assert.deepEqual(built.sent.calls, []);
+});
+
+test('heartbeat digest binds the recovered previous coverage block', async () => {
+  const covered = blockAt(95_000);
+  const { outcome, sent, work } = await cycle(
+    {
+      ...ONE_DUE,
+      heartbeatTimestamp: covered.timestamp,
+      heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
+    },
+    'clean',
+  );
+  assert.equal(outcome.kind, 'attested');
+  const expected = coverageDigest(work.all(), {
+    chainId: CHAIN_ID,
+    core: CORE,
+    registry: REGISTRY,
+    guardian: GUARDIAN,
+    previousBlockHash: covered.hash,
+    reportBlockHash: blockAt(REPORT).hash,
+  });
+  assert.equal(outcome.digest, expected);
+  assert.equal(sent.heartbeats[0]?.digest, expected);
+});
 
 test('a plan that expires during report confirmation stops before flags and heartbeat', async () => {
   const after = afterInclusion((node) => {
@@ -411,6 +461,71 @@ for (const [interBatchConfirmationBlocks, txConfirmationBlocks] of [
     assert.deepEqual(depths, [intermediate, intermediate, txConfirmationBlocks]);
   });
 }
+
+/** Counts the head reads that follow the first report, so a test can wait for the shared wait to poll. */
+function trackHeadReads() {
+  const waiters: { readonly count: number; readonly resolve: () => void }[] = [];
+  let count = 0;
+  return {
+    record(): void {
+      count += 1;
+      for (const waiter of waiters.filter((entry) => count >= entry.count)) {
+        waiter.resolve();
+      }
+    },
+    further(reads: number): Promise<void> {
+      return new Promise((resolve) => {
+        waiters.push({ count: count + reads, resolve });
+      });
+    },
+  };
+}
+
+test('shared report confirmation stops when the client delivery budget ends', { timeout: 2_000 }, async (context) => {
+  // Only the clock is mocked: a send cannot use up its own budget, while the wait keeps polling.
+  context.mock.timers.enable({ apis: ['Date'] });
+  const headReads = trackHeadReads();
+  const built = await submitOver(
+    ONE_DUE,
+    'flag',
+    (node, method, params) => {
+      if (method === 'eth_sendRawTransaction') {
+        const transaction = node.sent.transactions[0];
+        assert.ok(transaction !== undefined);
+        // Deep enough for the batch, and one block short of every deeper requirement.
+        node.setReceipt(transaction.hash, {
+          transactionHash: transaction.hash,
+          blockNumber: HEAD,
+          blockHash: blockAt(HEAD).hash,
+          status: 'success',
+        });
+      }
+      const isLatestRead = method === 'eth_getBlockByNumber' && params[0] === 'latest';
+      if (node.sent.calls.length === 1 && isLatestRead) {
+        headReads.record();
+      }
+    },
+    { interBatchConfirmationBlocks: 1, confirmationPollIntervalMs: 1 },
+  );
+  // An aged-out plan ends the wait under any verdict, so a failing run cannot keep polling.
+  context.after(() => {
+    built.node.advanceTo(REPORT + 250);
+  });
+  const submitting = built.guardian.signalAndHeartbeat(built.screened);
+  const settled = submitting.then(
+    () => 'settled',
+    () => 'settled',
+  );
+
+  await headReads.further(2);
+  context.mock.timers.tick(SEND_TIMEOUT_MS - 1);
+  await headReads.further(4);
+  assert.equal(await Promise.race([settled, Promise.resolve('waiting')]), 'waiting');
+  context.mock.timers.tick(1);
+
+  await assert.rejects(submitting, { reason: 'report-confirmation-timeout' });
+  assert.deepEqual(built.sent.calls, ['flags']);
+});
 
 test('shared report confirmation uses the configured polling interval', { timeout: 1000 }, async () => {
   let latestReads = 0;

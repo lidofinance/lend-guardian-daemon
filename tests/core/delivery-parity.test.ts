@@ -8,6 +8,7 @@ import { Screened, Work } from '../../src/core/outcomes.ts';
 import type { Signed } from './delivery-fakes.ts';
 import type { TransactionRequestEIP1559 as PreparationArguments } from 'viem';
 import type { Hex } from '../../src/core/index.ts';
+import { SEND_TIMEOUT_MS } from './client.ts';
 import { registryDelivery } from './delivery-fixture.ts';
 import {
   answering,
@@ -47,6 +48,7 @@ for (const status of ['success', 'reverted'] as const) {
 
 test('an orphaned first report stops Guardian before its second batch or heartbeat', async () => {
   const fake = harness({
+    policy: { sendTimeoutMs: SEND_TIMEOUT_MS },
     node: { getBlockNumber: answering(value(11n)) },
     request: (method, params) => {
       if (method === 'eth_call') {

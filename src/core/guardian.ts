@@ -4,7 +4,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { isAddressEqual, zeroAddress } from 'viem';
+import { isAddress, isAddressEqual, zeroAddress } from 'viem';
 import { Markets } from '../contracts/markets.ts';
 import { GuardianSignals } from '../contracts/guardian-signals.ts';
 import type { PreviousHeartbeatEvidence } from '../contracts/guardian-signals.ts';
@@ -74,7 +74,10 @@ interface GuardianConfig {
   readonly expectedDelegate?: Address | undefined;
 }
 
-/** Observe checks chain and membership; signal also signs and submits authorized registry writes. */
+/**
+ * Signal runs the specified cycle and submits authorized registry writes. Observe is an SDK
+ * extension: it checks chain and membership and screens the same work without a signer or a write.
+ */
 export type GuardianSetup = GuardianConfig &
   (
     | { readonly mode: 'observe'; readonly client: RpcProvider }
@@ -110,7 +113,13 @@ type GuardianState = GuardianConfig &
   > &
   (
     | { readonly mode: 'observe'; readonly client: RpcProvider }
-    | { readonly mode: 'signal'; readonly client: RpcClient; readonly expectedDelegate: Address }
+    | {
+        readonly mode: 'signal';
+        readonly client: RpcClient;
+        readonly expectedDelegate: Address;
+        /** The client's delivery budget, which also bounds the shared report wait and nonce clearing. */
+        readonly sendTimeoutMs: number;
+      }
   );
 
 /** Fixed gas for an EOA self-transfer with no calldata. */
@@ -308,6 +317,8 @@ export class Guardian {
    * reports in one SEND; the SDK groups each kind by market and waits for full depth once per kind.
    * Plan checks between batches and during the shared wait stop stale attempts. Every report must
    * still be canonical before heartbeat; the cycle ends only after the heartbeat is confirmed.
+   * The client's `sendTimeoutMs` bounds each send and the shared wait of each report kind. When
+   * the wait ends first the attempt stops with `report-confirmation-timeout`, its reports included.
    */
   async signalAndHeartbeat(screened: Screened): Promise<Attested | Stale | NothingDue> {
     if (this.#isWriting) {
@@ -318,12 +329,16 @@ export class Guardian {
       if (this.#setup.mode === 'observe') {
         throw new GuardianStop('submission-disabled');
       }
+      const reportConfirmationTimeoutMs = this.#setup.sendTimeoutMs;
       const work = screened.work();
       if (!this.#isHeartbeatDue(work)) {
         return nothingDue(work.previousHeartbeatBlock, 'no-work-and-idle-heartbeat-not-due');
       }
+      // Appendix runCycle hashes before screening. Work is an immutable snapshot, so hashing here
+      // commits the same set, and a malformed input stops the attempt before the first report.
+      const digest = coverageDigest(work.all(), this.#coverageDigestBounds(work));
 
-      const reported = await this.#submitRequiredSignals(screened);
+      const reported = await this.#submitRequiredSignals(screened, reportConfirmationTimeoutMs);
       if ('kind' in reported) {
         return reported;
       }
@@ -336,7 +351,7 @@ export class Guardian {
         return { kind: 'stale', reason: 'report-no-longer-confirmed' };
       }
 
-      return await this.#submitHeartbeat(work);
+      return await this.#submitHeartbeat(work, digest);
     } finally {
       this.#isWriting = false;
     }
@@ -362,7 +377,7 @@ export class Guardian {
       operationId: randomUUID(),
       ...(this.#activeCycle ?? {}),
     });
-    const deadline = Date.now() + client.transactionPolicy.sendTimeoutMs;
+    const deadline = Date.now() + this.#setup.sendTimeoutMs;
     this.#isWriting = true;
     try {
       await this.#requireChain();
@@ -515,18 +530,16 @@ export class Guardian {
 
   // ─── Planning: where coverage stands, and how far back the window reaches.
 
-  /**
-   * What must hold before any plan: the nodes serve the configured chain, the Guardian is a member at
-   * the observed block. In signal mode the signer must be the Guardian or its expected delegate,
-   * and the registry must name exactly that delegate. Observe is an SDK extension: it skips signer
-   * and delegate checks, keeps membership checks, and cannot submit writes.
-   */
   async #requireChain(): Promise<void> {
     if ((await this.#rpc.getChainId()) !== this.#setup.deployment.chainId) {
       throw new GuardianStop('chain-id-mismatch');
     }
   }
 
+  /**
+   * Require the configured chain and membership at the observed block. Signal mode also requires
+   * the configured signer and delegate relation; observe mode has no signer and cannot submit writes.
+   */
   async #requireGuardianConfiguration(at: Bytes32): Promise<void> {
     await this.#requireChain();
 
@@ -669,7 +682,10 @@ export class Guardian {
   }
 
   /** Reports are grouped by kind and market; all targets in a group share one registry call. */
-  async #submitRequiredSignals(screened: Screened): Promise<readonly ReceiptRef[] | Stale> {
+  async #submitRequiredSignals(
+    screened: Screened,
+    reportConfirmationTimeoutMs: number,
+  ): Promise<readonly ReceiptRef[] | Stale> {
     const work = screened.work();
     const reports: ReceiptRef[] = [];
     const groups = [
@@ -694,6 +710,7 @@ export class Guardian {
       const stale = await this.#confirmSignalTransactions(
         work,
         landed.map((report) => report.receipt),
+        reportConfirmationTimeoutMs,
       );
       if (stale !== null) {
         return stale;
@@ -725,11 +742,20 @@ export class Guardian {
     );
   }
 
-  /** Wait once for the whole report kind, checking the plan while the required depth accumulates. */
-  async #confirmSignalTransactions(work: Work, receipts: readonly ReceiptRef[]): Promise<Stale | null> {
+  /**
+   * Wait once for the whole report kind, checking the plan while the required depth accumulates.
+   * The deadline is an SDK safeguard: an endpoint whose head stops advancing must not hold the
+   * attempt forever. The reports are included by then, so the stop leaves repeating them to the caller.
+   */
+  async #confirmSignalTransactions(
+    work: Work,
+    receipts: readonly ReceiptRef[],
+    timeoutMs: number,
+  ): Promise<Stale | null> {
     if (receipts.length === 0) {
       return null;
     }
+    const deadline = Date.now() + timeoutMs;
     while (true) {
       const reason = await this.#planInvalidationReason(work);
       if (reason !== null) {
@@ -744,16 +770,17 @@ export class Guardian {
           ? null
           : { kind: 'stale', reason: 'report-no-longer-confirmed' };
       }
-      await sleep(this.#setup.confirmationPollIntervalMs);
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new GuardianStop('report-confirmation-timeout');
+      }
+      await sleep(Math.min(this.#setup.confirmationPollIntervalMs, remainingMs));
     }
   }
 
   /** Commit coverage only after every required report has passed the final check. */
-  async #submitHeartbeat(work: Work): Promise<Attested> {
+  async #submitHeartbeat(work: Work, digest: Bytes32): Promise<Attested> {
     const depth = this.#setup.txConfirmationBlocks;
-    // Appendix runCycle hashes before screening. Work is an immutable snapshot, so computing
-    // here commits the same complete set, including own-flagged anchors, without a cached digest.
-    const digest = coverageDigest(work.all(), this.#coverageDigestBounds(work));
     const context = this.#startReportOperation({
       method: 'heartbeat',
       reportBlock: work.reportBlock,
@@ -852,9 +879,12 @@ export class Guardian {
   }
 }
 
-/** Validate the supported profile and numeric inputs before creating a node or starting a cycle. */
+/** Validate the supported profile, addresses and numeric inputs before creating a node or starting a cycle. */
 function validateSetup(setup: GuardianState): void {
   const deployment = setup.deployment;
+  requireAddress('guardian', setup.guardian);
+  requireAddress('deployment.lidoLend.address', deployment.lidoLend.address);
+  requireAddress('deployment.guardianSignals.address', deployment.guardianSignals.address);
   requireInteger('deployment.chainId', deployment.chainId, { min: 1 });
   requireInteger('deployment.slotSeconds', deployment.slotSeconds, { min: 1 });
   requireInteger('maxSignalBatchSize', setup.maxSignalBatchSize, { min: 1 });
@@ -872,6 +902,25 @@ function validateSetup(setup: GuardianState): void {
     min: 1,
     max: BLOCKHASH_LOOKBACK - setup.reportBlockLag,
   });
+  if (setup.mode === 'signal') {
+    requireAddress('expectedDelegate', setup.expectedDelegate);
+    // SDK guard: the heartbeat needs a slot for inclusion and one per further confirmation, plus one
+    // for preparation and polling. A shorter budget can time out even when every slot has a block,
+    // so construction rejects it.
+    const minimumSendTimeoutMs = (setup.txConfirmationBlocks + 1) * deployment.slotSeconds * MILLISECONDS_PER_SECOND;
+    requireInteger('client.transactionPolicy.sendTimeoutMs', setup.sendTimeoutMs, {
+      min: minimumSendTimeoutMs,
+      max: 2_147_483_647,
+    });
+  }
+}
+
+/** viem caches its verdict by the text of a value, so only a string may reach it. */
+function requireAddress(field: string, value: unknown): void {
+  const isText = typeof value === 'string';
+  if (!isText || !isAddress(value)) {
+    throw new TypeError(`${field} must be a valid address`);
+  }
 }
 
 function nothingDue(previousHeartbeatBlock: BlockRef | null, reason: NothingDueReason): NothingDue {
@@ -908,5 +957,6 @@ function snapshotSetup(setup: GuardianSetup): GuardianState {
   }
   requireDefined('client.signer in signal mode', setup.client.signer);
   const expectedDelegate = requireDefined('expectedDelegate in signal mode', setup.expectedDelegate);
-  return { ...common, mode: 'signal', client: setup.client, expectedDelegate };
+  const { sendTimeoutMs } = setup.client.transactionPolicy;
+  return { ...common, mode: 'signal', client: setup.client, expectedDelegate, sendTimeoutMs };
 }

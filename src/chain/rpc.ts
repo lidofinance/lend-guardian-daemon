@@ -72,11 +72,15 @@ export interface TransactionRequest {
 
 export interface TransactionPolicy {
   readonly maxFeePerGas: bigint;
-  /** Total time budget for one send, including preparation, inclusion and confirmation. */
+  /**
+   * Total time budget for one send, including preparation, inclusion and confirmation. Guardian
+   * requires an integer from `(txConfirmationBlocks + 1) * slotSeconds * 1000` to 2_147_483_647 and
+   * applies the same budget to its shared report-confirmation wait and to nonce clearing.
+   */
   readonly sendTimeoutMs: number;
   /** Minimum fee increase for both EIP-1559 fields on replacement, in basis points. */
   readonly replacementFeeBumpBps: number;
-  /** Inclusion wait before preparing a replacement at the same nonce. */
+  /** Inclusion wait before preparing a replacement at the same nonce; it sets how soon a stuck transaction is repriced. */
   readonly replacementTimeoutMs: number;
   /** Preparation attempts, including the initial transaction and estimates above the fee cap. */
   readonly sendAttempts: number;

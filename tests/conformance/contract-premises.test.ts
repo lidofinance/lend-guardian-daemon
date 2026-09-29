@@ -1,9 +1,11 @@
 // Independent probes of the pinned production contracts consumed by the SDK reconstruction.
 import assert from 'node:assert/strict';
 import { after, afterEach, before, beforeEach, test } from 'node:test';
-import { parseEventLogs } from 'viem';
+import { createWalletClient, http, parseEventLogs, size } from 'viem';
 import { BORROWER, DEFAULT_ACTIVATION_CONFIG, deployProtocolFixture } from './fixtures/protocol.ts';
 import type { ActivationConfig } from './fixtures/protocol.ts';
+import { ViemRpcClient } from '../../src/chain/viem-client.ts';
+import { Guardian } from '../../src/core/guardian.ts';
 
 const deployed = deployProtocolFixture(8620);
 const snapshot: { value: `0x${string}` } = { value: '0x0' };
@@ -26,6 +28,19 @@ afterEach(async () => {
 
 after(async () => {
   (await deployed).anvil.stop();
+});
+
+/** EIP-170 limits the runtime code of a deployed contract to 24,576 bytes. */
+const EIP_170_LIMIT_BYTES = 24_576;
+
+test('deploys the production controller within the default EIP-170 limit', async () => {
+  const fixture = await deployed;
+  // The limit applies to the implementation; the proxy the core calls is a separate, small contract.
+  const code = await fixture.anvil.publicClient.getCode({ address: fixture.primaryMarket.controllerImplementation });
+  assert.ok(code !== undefined);
+  const runtimeBytes = size(code);
+  assert.ok(runtimeBytes <= EIP_170_LIMIT_BYTES);
+  assert.equal(runtimeBytes, 24_482);
 });
 
 test('binds the production controller and pairs its activation log with core supply', async () => {
@@ -143,6 +158,135 @@ test('matures a position under its historical delay after the current config cha
   });
 });
 
+test('holds activation for Guardian quorum and releases it only at the configured fallback', async () => {
+  const fixture = await deployed;
+  const market = fixture.primaryMarket;
+  await market.setActivationConfig({ ...fixedDelay(60), maxGuardiansQuorumDelay: 120 });
+  await market.supply(10n);
+
+  await fixture.anvil.testClient.increaseTime({ seconds: 61 });
+  await fixture.anvil.testClient.mine({ blocks: 1 });
+  await assert.rejects(market.withdraw(1n));
+
+  await fixture.anvil.testClient.increaseTime({ seconds: 60 });
+  await fixture.anvil.testClient.mine({ blocks: 1 });
+  const withdrawal = await market.withdraw(1n);
+  const activated = parseEventLogs({
+    abi: market.controllerAbi,
+    logs: withdrawal.logs,
+    eventName: 'CollateralActivated',
+    strict: true,
+  });
+  assert.partialDeepStrictEqual(lifecycleArguments(activated[0]?.args), {
+    borrower: BORROWER,
+    amount: 10n,
+    position: { dust: 0n, activating: 0n },
+  });
+});
+
+test('records a trusted caller supply as instant activation without changing delayed buckets', async () => {
+  const fixture = await deployed;
+  const market = fixture.primaryMarket;
+  await market.setInstantActivation(fixture.admin.address, true);
+
+  const supplied = await market.supply(4n);
+  const activated = parseEventLogs({
+    abi: market.controllerAbi,
+    logs: supplied.logs,
+    eventName: 'CollateralActivated',
+    strict: true,
+  });
+  assert.partialDeepStrictEqual(lifecycleArguments(activated[0]?.args), {
+    borrower: BORROWER,
+    amount: 4n,
+    position: { dust: 0n, activating: 0n, activatingStart: 0, activatingDelay: 0 },
+  });
+});
+
+test('liquidation consumes active collateral before draining a fresh activating lot', async () => {
+  const fixture = await deployed;
+  const market = fixture.primaryMarket;
+  await market.setActivationConfig(fixedDelay(60));
+  await market.supplyLoan(1_000n);
+  await market.supply(100n);
+  await fixture.anvil.testClient.increaseTime({ seconds: 61 });
+  await fixture.anvil.testClient.mine({ blocks: 1 });
+  await market.borrow(50n);
+  const fresh = await market.supply(20n);
+  const before = lifecycleArguments(
+    parseEventLogs({
+      abi: market.controllerAbi,
+      logs: fresh.logs,
+      eventName: 'CollateralActivating',
+      strict: true,
+    })[0]?.args,
+  );
+
+  await market.setPrice(380_000_000_000_000_000_000_000_000_000_000_000n);
+  const liquidated = await market.liquidate(105n);
+  const drained = lifecycleArguments(
+    parseEventLogs({
+      abi: market.controllerAbi,
+      logs: liquidated.logs,
+      eventName: 'CollateralDrained',
+      strict: true,
+    })[0]?.args,
+  );
+  assert.equal(drained.borrower, BORROWER);
+  assert.equal(drained.amount, 5n);
+  assert.partialDeepStrictEqual(drained.position, {
+    dust: 0n,
+    activating: 15n,
+    activatingStart: before.position.activatingStart,
+    activatingDelay: before.position.activatingDelay,
+  });
+});
+
+test('settlement uses the same active-first forced-seizure accounting', async () => {
+  const fixture = await deployed;
+  const market = fixture.primaryMarket;
+  await market.setActivationConfig(fixedDelay(60));
+  await market.supplyLoan(1_000n);
+  await market.supply(10n);
+  await fixture.anvil.testClient.increaseTime({ seconds: 61 });
+  await fixture.anvil.testClient.mine({ blocks: 1 });
+  await market.borrow(8n);
+  const fresh = await market.supply(100n);
+  const before = lifecycleArguments(
+    parseEventLogs({
+      abi: market.controllerAbi,
+      logs: fresh.logs,
+      eventName: 'CollateralActivating',
+      strict: true,
+    })[0]?.args,
+  );
+
+  await market.setPrice(100_000_000_000_000_000_000_000_000_000_000_000n);
+  await market.setSettlementLtv(500_000_000_000_000_000n);
+  const [personal] = await market.settlementFor();
+  assert.deepEqual(personal, [5_000_000n, 5_000_000n, 3_000_000n]);
+  const settled = await market.settle(personal[1]);
+  const drained = lifecycleArguments(
+    parseEventLogs({
+      abi: market.controllerAbi,
+      logs: settled.logs,
+      eventName: 'CollateralDrained',
+      strict: true,
+    })[0]?.args,
+  );
+  // The settlement seizes 50 of the 110 supplied: the 10 active first, then 40 of the activating 100.
+  assert.equal(drained.borrower, BORROWER);
+  assert.equal(drained.amount, 40n);
+  assert.deepEqual(drained.position, {
+    dust: 0n,
+    activating: 60n,
+    activatingStart: before.position.activatingStart,
+    activatingDelay: before.position.activatingDelay,
+  });
+  // The core position holds supply shares, the borrow shares left and the remaining collateral.
+  assert.deepEqual(await market.position(), [0n, 3_000_000n, 60n]);
+});
+
 test('records delegate reports under the guardian and keeps a quorum ban latched', async () => {
   const fixture = await deployed;
   const market = fixture.primaryMarket;
@@ -214,6 +358,69 @@ test('accepts the exact canonical heartbeat block and rejects a forged hash', as
   await assert.rejects(fixture.heartbeat({ ...block, hash: `0x${'00'.repeat(32)}` }, '0x'));
 });
 
+test('the SDK commits its computed coverage digest in Heartbeat.data', async () => {
+  const fixture = await deployed;
+  const walletClient = createWalletClient({
+    account: fixture.delegate,
+    chain: fixture.anvil.chain,
+    transport: http(fixture.anvil.rpcUrl),
+  });
+  const client = new ViemRpcClient({
+    publicClient: fixture.anvil.publicClient,
+    walletClient,
+    maxLogBlockRange: 1_000,
+    transactionPolicy: {
+      sendTimeoutMs: 132_000,
+      replacementFeeBumpBps: 1_000,
+      maxFeePerGas: 100_000_000_000n,
+      replacementTimeoutMs: 1_000,
+      sendAttempts: 2,
+    },
+  });
+  const guardian = new Guardian({
+    mode: 'signal',
+    client,
+    expectedDelegate: fixture.delegate.address,
+    deployment: {
+      chainId: 1,
+      slotSeconds: 12,
+      lidoLend: { address: fixture.core, deploymentBlock: 0 },
+      guardianSignals: { address: fixture.guardianSignals, deploymentBlock: 0 },
+    },
+    guardian: fixture.admin.address,
+    screening: {
+      screen: (request) =>
+        Promise.resolve(
+          request.anchors.map(() => ({ status: 'judged' as const, requiresSuspect: false, requiresFlag: false })),
+        ),
+    },
+    reportBlockLag: 2,
+    flaggerReadConcurrency: 2,
+    interBatchConfirmationBlocks: 1,
+    confirmationPollIntervalMs: 10,
+    idleHeartbeatInterval: 1,
+    heartbeatReserveBlocks: 8,
+    txConfirmationBlocks: 1,
+    maxSignalBatchSize: 20,
+  });
+
+  const outcome = await guardian.cycle();
+  assert.equal(outcome.kind, 'attested');
+  const receipt = await fixture.anvil.publicClient.getTransactionReceipt({ hash: outcome.heartbeat });
+  const heartbeats = parseEventLogs({
+    abi: fixture.guardianAbi,
+    logs: receipt.logs,
+    eventName: 'Heartbeat',
+    strict: true,
+  });
+  assert.deepEqual(heartbeats[0]?.args, [
+    fixture.admin.address,
+    BigInt(outcome.previousHeartbeatBlock.number),
+    BigInt(outcome.previousHeartbeatBlock.timestamp),
+    outcome.digest,
+  ]);
+});
+
 function fixedDelay(seconds: number): ActivationConfig {
   return {
     ...DEFAULT_ACTIVATION_CONFIG,
@@ -228,8 +435,22 @@ function argumentsOf(value: unknown): readonly unknown[] {
 }
 
 /** Interpret the positional lifecycle ABI independently of the SDK's named fragments. */
-function lifecycleArguments(value: unknown) {
+function lifecycleArguments(value: unknown): {
+  readonly borrower: unknown;
+  readonly amount: bigint;
+  readonly position: {
+    readonly dust: bigint;
+    readonly activating: bigint;
+    readonly activatingStart: number;
+    readonly activatingDelay: number;
+  };
+} {
   const [borrower, amount, position] = argumentsOf(value);
   const [dust, activating, activatingStart, activatingDelay] = argumentsOf(position);
+  const hasBigintAmounts = typeof amount === 'bigint' && typeof dust === 'bigint' && typeof activating === 'bigint';
+  const hasNumericTimer = typeof activatingStart === 'number' && typeof activatingDelay === 'number';
+  if (!hasBigintAmounts || !hasNumericTimer) {
+    throw new TypeError('Lifecycle event has unexpected numeric types');
+  }
   return { borrower, amount, position: { dust, activating, activatingStart, activatingDelay } };
 }

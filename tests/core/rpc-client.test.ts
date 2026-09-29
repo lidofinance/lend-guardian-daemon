@@ -6,7 +6,7 @@ import { createPublicClient, createWalletClient, custom, HttpRequestError, padHe
 import { BaseRpcProvider } from '../../src/core/index.ts';
 import type { ChainLog } from '../../src/core/index.ts';
 import { mainnet } from 'viem/chains';
-import { CORE, GUARDIAN } from './fake-node.ts';
+import { blockAt, CORE, fakeNode, GUARDIAN } from './fake-node.ts';
 
 const FILTER = { address: CORE, fromBlock: 1, toBlock: 8 };
 const rawLog = (index: number) => ({
@@ -49,6 +49,21 @@ test('latest-log search sorts a batch, decodes every returned log and stops befo
     }),
     (error: unknown) => error === failure,
   );
+});
+
+test('receipt confirmation requires the inclusion block to remain canonical', async () => {
+  const transactionHash = padHex('0x99', { size: 32 });
+  const receipt = {
+    transactionHash,
+    blockNumber: 100,
+    blockHash: blockAt(100).hash,
+    status: 'success' as const,
+  };
+  const node = fakeNode({ head: 200, receipts: [receipt] });
+  node.reorgBlock(receipt.blockNumber);
+  const provider = new BaseRpcProvider({ request: rpcRequest(node.transport), maxLogBlockRange: 10 });
+
+  assert.equal(await provider.isConfirmed(receipt, blockAt(200), 1), false);
 });
 
 test('ordinary SDK reads retain the configured viem request retry policy', async () => {
