@@ -95,7 +95,7 @@ const DEFAULT_SETTINGS: GuardianSettings = {
   maxLogBlockRange: 10_000,
   flaggerReadConcurrency: 8,
   historyReadConcurrency: 8,
-  maxSignalBatchSize: 20,
+  maxSignalBatchSize: 50,
   txConfirmationBlocks: 12,
   interBatchConfirmationBlocks: 2,
   inclusionBlocks: 1,

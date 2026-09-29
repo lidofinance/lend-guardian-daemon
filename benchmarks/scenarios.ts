@@ -397,7 +397,7 @@ function fullLiveness(): LivenessScenario[] {
     ...[2, 32].map((txConfirmationBlocks) => ({ ...LIVENESS, txConfirmationBlocks })),
     { ...LIVENESS, interBatchConfirmationBlocks: 1 },
     { ...LIVENESS, inclusionBlocks: 2 },
-    { ...LIVENESS, maxSignalBatchSize: 100 },
+    ...[50, 100].map((maxSignalBatchSize) => ({ ...LIVENESS, maxSignalBatchSize })),
   ];
 }
 

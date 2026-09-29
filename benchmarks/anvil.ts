@@ -37,7 +37,8 @@ const DEADLINE_INTERVAL_SECONDS = 3_600;
 
 const TX_CONFIRMATION_BLOCKS = 12;
 
-const MAX_SIGNAL_BATCH_SIZE = 20;
+/** The example application's report batch size. */
+const MAX_SIGNAL_BATCH_SIZE = 50;
 
 /** The example application's history read concurrency; the SDK reads one supply or position at a time. */
 const HISTORY_READ_CONCURRENCY = 8;

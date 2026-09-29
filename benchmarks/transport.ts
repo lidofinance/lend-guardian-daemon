@@ -311,7 +311,7 @@ export function observeGuardian(
     idleHeartbeatInterval: 43_200,
     heartbeatReserveBlocks: 8,
     txConfirmationBlocks: 12,
-    maxSignalBatchSize: 20,
+    maxSignalBatchSize: 50,
   });
 }
 
