@@ -97,6 +97,7 @@ Useful targeted commands:
 ```bash
 npm run test:core
 npm run test:example
+npm run test:daemon
 npm run test:conformance
 node example/daemon.ts
 ```
@@ -110,7 +111,8 @@ Tests use scripted nodes and isolated local Anvil processes; they make no extern
 - [`src/chain/`](src/chain/): generic RPC reads, viem transport and transaction delivery.
 - [`abi/`](abi/): minimal ABI fragments used by the SDK.
 - [`example/`](example/README.md): reference Guardian application.
-- [`tests/`](tests/): core, example and contract-conformance tests.
+- [`daemon/`](daemon/README.md): deployable daemon with HTTP screening, event forwarding and a Docker image.
+- [`tests/`](tests/): core, example, daemon and contract-conformance tests.
 - [`docs/guardian-specification.md`](docs/guardian-specification.md): Guardian specification 0.2.0.
 
 ## License

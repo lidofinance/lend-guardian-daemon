@@ -1,0 +1,7 @@
+# The build context holds only what the image copies; the local configuration with its keys stays out.
+*
+!abi
+!src
+!example/env.ts
+!daemon
+daemon/.env
