@@ -4,7 +4,7 @@ import { encodeAbiParameters, getAbiItem, pad, toEventSelector } from 'viem';
 import { MARKET_CONTROLLER_ABI } from '../../abi/MarketController.abi.ts';
 import { SUPPLY_COLLATERAL_ABI } from '../../abi/Core.abi.ts';
 import { BaseRpcProvider } from '../../src/chain/base-rpc-provider.ts';
-import type { ChainLog } from '../../src/chain/rpc.ts';
+import type { BlockLogFilter, ChainLog, LogFilter } from '../../src/chain/rpc.ts';
 import { Markets } from '../../src/contracts/markets.ts';
 import { blockAt, BORROWER, CONTROLLER, CORE, MARKET } from './fake-node.ts';
 
@@ -34,6 +34,8 @@ const CLASSIFICATION: ChainLog = {
 
 /** Deliberately return supplied evidence regardless of the query to exercise the contract boundary. */
 class EvidenceProvider extends BaseRpcProvider {
+  readonly filters: (LogFilter | BlockLogFilter)[] = [];
+
   readonly #logs: ChainLog[];
 
   constructor(logs: ChainLog[]) {
@@ -44,7 +46,8 @@ class EvidenceProvider extends BaseRpcProvider {
     this.#logs = logs;
   }
 
-  override getLogs(): Promise<ChainLog[]> {
+  override getLogs(filter: LogFilter | BlockLogFilter): Promise<ChainLog[]> {
+    this.filters.push(filter);
     return Promise.resolve(this.#logs);
   }
 }
@@ -117,3 +120,22 @@ for (const [condition, logs] of [
     await assert.rejects(markets.supplyAfter(POSITION, ACTIVATION), { reason: 'position-history-broken' });
   });
 }
+
+test("the zero-boundary shortcut asks only for the position's supplies in the activation block", async () => {
+  const provider = new EvidenceProvider([SUPPLY_EVENT]);
+  const markets = new Markets(provider, { address: CORE, deploymentBlock: 1_000 });
+  await markets.supplyAfter(POSITION, ACTIVATION);
+  assert.deepEqual(provider.filters, [
+    {
+      address: CORE,
+      topics: [
+        toEventSelector(getAbiItem({ abi: SUPPLY_COLLATERAL_ABI, name: 'SupplyCollateral' })),
+        MARKET,
+        null,
+        pad(BORROWER),
+      ],
+      fromBlock: BLOCK.number,
+      toBlock: BLOCK.number,
+    },
+  ]);
+});

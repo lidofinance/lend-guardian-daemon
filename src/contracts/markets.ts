@@ -1,6 +1,7 @@
 // Core and controller reads return typed market evidence; Guardian decides what the cycle covers.
 
 import {
+  encodeEventTopics,
   encodeFunctionData,
   decodeFunctionResult,
   getAbiItem,
@@ -105,8 +106,9 @@ export class Markets {
   readonly #rpc: RpcProvider;
   readonly #core: Address;
   readonly #deploymentBlock: number;
-  readonly #controllers = new Map<MarketId, Address>();
-  readonly #registries = new Map<Address, Address>();
+  // Pending reads are cached, so supplies classified at once share one read per market and controller.
+  readonly #controllers = new Map<MarketId, Promise<Address>>();
+  readonly #registries = new Map<Address, Promise<Address>>();
   readonly #blockLogs = new Map<string, Promise<ChainLog[]>>();
 
   constructor(rpc: RpcProvider, deployment: ContractDeployment) {
@@ -115,15 +117,21 @@ export class Markets {
     this.#deploymentBlock = deployment.deploymentBlock;
   }
 
-  /** Discover every position that may require screening under Appendix B. */
-  async discoverCandidatePositions(plan: ScanPlan, targetRegistry: Address): Promise<PositionKey[]> {
+  /** Discover every position that may require screening under Appendix B, `concurrency` supplies at a time. */
+  async discoverCandidatePositions(
+    plan: ScanPlan,
+    targetRegistry: Address,
+    concurrency: number,
+  ): Promise<PositionKey[]> {
     const supplies = await this.supplies({
       fromBlock: plan.discoveryRange.from.number,
       toBlock: plan.discoveryRange.to.number,
     });
+    const positions = await readInBatches(supplies, concurrency, (supply) =>
+      this.#candidatePositionFromSupply(plan, supply, targetRegistry),
+    );
     const candidatesByPosition = new Map<string, PositionKey>();
-    for (const supply of supplies) {
-      const position = await this.#candidatePositionFromSupply(plan, supply, targetRegistry);
+    for (const position of positions) {
       if (position !== null) {
         candidatesByPosition.set(`${position.marketId}:${position.borrower}`, position);
       }
@@ -131,14 +139,21 @@ export class Markets {
     return [...candidatesByPosition.values()];
   }
 
-  /** Reconstruct the uncovered contributors for every candidate position under Appendix C. */
+  /**
+   * Reconstruct the uncovered contributors for every candidate position under Appendix C,
+   * `concurrency` positions at a time.
+   */
   async reconstructWork(
     plan: ScanPlan,
     positions: readonly PositionKey[],
+    concurrency: number,
   ): Promise<ReadonlyMap<PositionKey, readonly SupplyAnchor[]>> {
+    const walks = await readInBatches(positions, concurrency, async (position) => ({
+      position,
+      anchors: await this.#reconstructPosition(plan, position),
+    }));
     const byPosition = new Map<PositionKey, readonly SupplyAnchor[]>();
-    for (const position of positions) {
-      const anchors = await this.#reconstructPosition(plan, position);
+    for (const { position, anchors } of walks) {
       if (anchors.length > 0) {
         byPosition.set(position, anchors);
       }
@@ -146,7 +161,7 @@ export class Markets {
     return byPosition;
   }
 
-  /** Read the discovery window or one historical block without applying cycle policy. */
+  /** Read the discovery window's supplies without applying cycle policy. */
   async supplies(range: { readonly fromBlock: number; readonly toBlock: number }): Promise<SupplyLog[]> {
     const raw = await this.#rpc.getLogs({
       address: this.#core,
@@ -157,7 +172,7 @@ export class Markets {
     return decodeLogs(SUPPLY_COLLATERAL_ABI, raw).map((log) => this.#supplyOf(log));
   }
 
-  async controllerOf(marketId: MarketId, at: Bytes32): Promise<Address> {
+  controllerOf(marketId: MarketId, at: Bytes32): Promise<Address> {
     const cachedController = this.#controllers.get(marketId);
     if (cachedController !== undefined) {
       return cachedController;
@@ -168,14 +183,15 @@ export class Markets {
       functionName: 'marketController',
       args: [marketId],
     } as const;
-    const data = await this.#rpc.call(this.#core, encodeFunctionData(request), at);
-    const controller = decodeFunctionResult({ ...request, data });
+    const controller = this.#rpc
+      .call(this.#core, encodeFunctionData(request), at)
+      .then((data) => decodeFunctionResult({ ...request, data }));
 
     this.#controllers.set(marketId, controller);
     return controller;
   }
 
-  async registryOf(controller: Address, at: Bytes32): Promise<Address> {
+  registryOf(controller: Address, at: Bytes32): Promise<Address> {
     const cachedRegistry = this.#registries.get(controller);
     if (cachedRegistry !== undefined) {
       return cachedRegistry;
@@ -185,8 +201,9 @@ export class Markets {
       abi: MARKET_CONTROLLER_ABI,
       functionName: 'guardianSignals',
     } as const;
-    const data = await this.#rpc.call(controller, encodeFunctionData(request), at);
-    const registry = decodeFunctionResult({ ...request, data });
+    const registry = this.#rpc
+      .call(controller, encodeFunctionData(request), at)
+      .then((data) => decodeFunctionResult({ ...request, data }));
 
     this.#registries.set(controller, registry);
     return registry;
@@ -215,12 +232,24 @@ export class Markets {
     return this.#activationOf(log, supply.borrower);
   }
 
-  /** The zero-boundary shortcut requires exactly one core supply paired with the activation. */
+  /**
+   * The zero-boundary shortcut requires exactly one core supply paired with the activation. The
+   * query names the position's market and borrower, so a block of many borrowers' supplies returns
+   * only this position's; the pairing below checks them as before.
+   */
   async supplyAfter(position: PositionKey, activation: LifecycleEvent): Promise<SupplyLog> {
-    const supplies = await this.supplies({
-      fromBlock: Number(activation.at.blockNumber),
-      toBlock: Number(activation.at.blockNumber),
+    const block = Number(activation.at.blockNumber);
+    const raw = await this.#rpc.getLogs({
+      address: this.#core,
+      topics: encodeEventTopics({
+        abi: SUPPLY_COLLATERAL_ABI,
+        eventName: 'SupplyCollateral',
+        args: { id: position.marketId, onBehalf: position.borrower },
+      }),
+      fromBlock: block,
+      toBlock: block,
     });
+    const supplies = decodeLogs(SUPPLY_COLLATERAL_ABI, raw).map((log) => this.#supplyOf(log));
     const paired = supplies.filter((supply) => this.#isPairedWith(supply, activation, position));
     const supply = paired.length === 1 ? paired[0] : undefined;
     if (supply === undefined) {
@@ -491,4 +520,26 @@ export class Markets {
       },
     };
   }
+}
+
+/**
+ * Read `items` `concurrency` at a time, in their order. Every read of a batch settles before the first
+ * failure in item order ends the call, so no read outlives it.
+ */
+async function readInBatches<Item, Result>(
+  items: readonly Item[],
+  concurrency: number,
+  read: (item: Item) => Promise<Result>,
+): Promise<Result[]> {
+  const results: Result[] = [];
+  for (let from = 0; from < items.length; from += concurrency) {
+    const batch = await Promise.allSettled(items.slice(from, from + concurrency).map(read));
+    for (const outcome of batch) {
+      if (outcome.status === 'rejected') {
+        throw outcome.reason;
+      }
+      results.push(outcome.value);
+    }
+  }
+  return results;
 }
