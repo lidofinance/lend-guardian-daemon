@@ -4,7 +4,7 @@ import { signingClient } from '../core/client.ts';
 // Internal phase values isolate submission here; guardian-cycle.test.ts also runs all five phases.
 import assert from 'node:assert/strict';
 import { after, afterEach, before, beforeEach, test } from 'node:test';
-import { createWalletClient, http, isHex, numberToHex, padHex } from 'viem';
+import { createWalletClient, http, isHex, numberToHex, padHex, parseAbi } from 'viem';
 import type { PrivateKeyAccount } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { Guardian } from '../../src/core/index.ts';
@@ -115,7 +115,8 @@ test('a report lands when another guardian reports its accounts between the esti
   const [late, ...early] = await otherGuardians(fixture, 4);
   assert.ok(late !== undefined);
   const accounts = Array.from({ length: 20 }, (_unused, index) => padHex(numberToHex(0x2000 + index), { size: 20 }));
-  // Every earlier report on an account makes a further one on it cost more gas.
+  // With reports that stay current, every earlier report on an account makes a further one cost more gas.
+  await keepReportsForADay(fixture);
   for (const guardian of early) {
     await suspectAs(fixture, guardian, accounts);
   }
@@ -309,6 +310,26 @@ function estimatedGas(method: string, response: unknown): bigint | undefined {
   }
   const transaction = isRecord(response) ? response.tx : undefined;
   return isRecord(transaction) && typeof transaction.gas === 'string' ? BigInt(transaction.gas) : undefined;
+}
+
+/**
+ * The fixture's registry starts with no suspect window, so a report expires in the next second and a
+ * later report prunes it; a day keeps every report of a test current. Test-only ABI entry.
+ */
+async function keepReportsForADay(fixture: ProtocolFixture): Promise<void> {
+  const admin = createWalletClient({
+    account: fixture.admin,
+    chain: fixture.anvil.chain,
+    transport: http(fixture.anvil.rpcUrl),
+  });
+  const hash = await admin.writeContract({
+    address: fixture.guardianSignals,
+    abi: parseAbi(['function setSuspectWindow(uint256 suspectWindow)']),
+    functionName: 'setSuspectWindow',
+    args: [86_400n],
+    gas: 200_000n,
+  });
+  assert.equal((await fixture.anvil.publicClient.waitForTransactionReceipt({ hash })).status, 'success');
 }
 
 /** Further guardians with funded keys; the snapshot taken before each test removes them again. */
