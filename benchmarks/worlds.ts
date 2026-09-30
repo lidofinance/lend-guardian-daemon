@@ -7,6 +7,7 @@ import type {
   CycleProfile,
   CycleScenario,
   DiscoveryScenario,
+  GriefingScenario,
   HistoryPattern,
   ReconstructionScenario,
 } from './scenarios.ts';
@@ -67,6 +68,12 @@ export interface ReconstructionWorld {
   readonly supplies: number;
   readonly anchors: number;
   readonly events: number;
+}
+
+export interface GriefingWorld {
+  readonly chain: SyntheticChain;
+  /** Positions the scan must reconstruct: none for a discovery flood, one per lot otherwise. */
+  readonly candidates: number;
 }
 
 export interface CycleWorld {
@@ -422,6 +429,55 @@ function writeLongGap(input: PatternInput): Written {
   supplyAt(input, input.firstBlock, input.minimumActivation);
   supplyAt(input, input.lastBlock - input.position, input.minimumActivation);
   return { supplies: 2, anchors: 2, events: 2 };
+}
+
+// ─── Griefing: an attacker's operations in the discovery window of a Guardian's first cycle.
+
+/** The attacker's own borrower, which recycles one deposit through dust and withdrawal. */
+const ATTACKER_INDEX = 10_000_000;
+
+/**
+ * `operations` of the scenario's attack, spread evenly over the first `spreadBlocks` blocks of the
+ * discovery window:
+ * - `discovery-flood`: a dust deposit to the attacker's own address and its withdrawal;
+ * - `candidate-flood`: a lot deposited to a new address and withdrawn in full;
+ * - `report-flood`: a lot deposited to a new address and kept.
+ */
+export function griefingWorld(parameters: GriefingScenario, operations: number, clock: VirtualClock): GriefingWorld {
+  const chain = syntheticChain(HISTORY_BLOCKS, clock);
+  const history = new HistoryBuilder(chain, { minimumActivation: MINIMUM_ACTIVATION });
+  history.guardianAdded(REPORT_BLOCK);
+  const [market] = marketsOf(history, 1);
+  if (market === undefined) {
+    throw new RangeError('A griefing world needs its market');
+  }
+  const firstBlock = chain.layout.coreDeploymentBlock;
+  const spreadBlocks = Math.min(parameters.spreadBlocks, REPORT_BLOCK - DUE_MARGIN_BLOCKS - firstBlock);
+  for (let index = 0; index < operations; index += 1) {
+    const blockNumber = firstBlock + Math.floor((index * spreadBlocks) / operations);
+    writeAttack(history, { attack: parameters.attack, market, index, blockNumber });
+  }
+  chain.seal();
+  return { chain, candidates: parameters.attack === 'discovery-flood' ? 0 : operations };
+}
+
+function writeAttack(
+  history: HistoryBuilder,
+  operation: {
+    readonly attack: GriefingScenario['attack'];
+    readonly market: Market;
+    readonly index: number;
+    readonly blockNumber: number;
+  },
+): void {
+  const { market, blockNumber } = operation;
+  const isDust = operation.attack === 'discovery-flood';
+  const borrower = borrowerAt(isDust ? ATTACKER_INDEX : operation.index);
+  const assets = isDust ? 1n : MINIMUM_ACTIVATION;
+  history.supply(blockNumber, { market, borrower, assets, delaySeconds: DELAY_SECONDS });
+  if (operation.attack !== 'report-flood') {
+    history.drain(blockNumber, { market, borrower, amount: assets });
+  }
 }
 
 // ─── Shared identities.

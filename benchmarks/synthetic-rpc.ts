@@ -107,8 +107,13 @@ export class VirtualClock {
 
   /** A timer the SDK awaits: simulated time passes and the promise settles at once. */
   sleep(milliseconds: number): Promise<void> {
-    this.#simulatedMs += milliseconds;
+    this.pass(milliseconds);
     return Promise.resolve();
+  }
+
+  /** Let simulated time pass without anything waiting for it. */
+  pass(milliseconds: number): void {
+    this.#simulatedMs += milliseconds;
   }
 
   /** Move to the start of the slot `count` slots after the current one. */
@@ -119,6 +124,52 @@ export class VirtualClock {
 
   #elapsedMs(): number {
     return this.#simulatedMs + this.#realTimeScale * (performance.now() - this.#startedAt);
+  }
+}
+
+/**
+ * Round trips to a remote node, charged to the chain clock. Requests sent together share one round
+ * trip, which ends once the process has sent all it can: a batch of concurrent reads costs one round
+ * trip and a sequence of dependent reads costs one per read.
+ */
+export class RoundTrips {
+  readonly #clock: VirtualClock;
+
+  readonly #roundTripMs: number;
+
+  #waiting: (() => void)[] = [];
+
+  #completed = 0;
+
+  constructor(clock: VirtualClock, roundTripMs: number) {
+    this.#clock = clock;
+    this.#roundTripMs = roundTripMs;
+  }
+
+  /** Settles when the round trip that carries this request ends. */
+  wait(): Promise<void> {
+    return new Promise((resolve) => {
+      this.#waiting.push(resolve);
+      if (this.#waiting.length === 1) {
+        setImmediate(() => {
+          this.#complete();
+        });
+      }
+    });
+  }
+
+  completed(): number {
+    return this.#completed;
+  }
+
+  #complete(): void {
+    const answered = this.#waiting;
+    this.#waiting = [];
+    this.#completed += 1;
+    this.#clock.pass(this.#roundTripMs);
+    for (const resolve of answered) {
+      resolve();
+    }
   }
 }
 
@@ -659,6 +710,38 @@ export function measuredNode(chain: SyntheticChain, observer: RpcObserver, laten
     const latencyMs = latency.byLabelMs.get(answer.label) ?? latency.everyRequestMs;
     observer.answered(answer, handlerMs, latencyMs);
     await realDelay(latencyMs);
+    return answer.value;
+  };
+}
+
+/** The daemon's transport refuses a response body above ten megabytes (`maxResponseBodySize`). */
+const TRANSPORT_RESPONSE_LIMIT_BYTES = 10 * 1_048_576;
+
+/** A public provider as a cycle meets it: a round trip per exchange, and the largest log list it serves. */
+export interface ProviderProfile {
+  readonly roundTrips: RoundTrips;
+  /** Undefined when the provider serves a log list of any length. */
+  readonly logLimit: number | undefined;
+}
+
+/**
+ * The node behind a public provider: every answer arrives after its round trip, and a log list above
+ * the provider's limit or a response above the transport's limit fails as those do.
+ */
+export function providerNode(chain: SyntheticChain, observer: RpcObserver, profile: ProviderProfile): NodeRequest {
+  return async (method, params) => {
+    const { answer, handlerMs } = answerOrRecordFailure(chain, observer, method, params);
+    await profile.roundTrips.wait();
+    const isOverLogLimit = profile.logLimit !== undefined && answer.logs > profile.logLimit;
+    if (isOverLogLimit) {
+      observer.failed(method, handlerMs);
+      throw new Error(`query returned more than ${String(profile.logLimit)} results`);
+    }
+    if (answer.bytes > TRANSPORT_RESPONSE_LIMIT_BYTES) {
+      observer.failed(method, handlerMs);
+      throw new Error(`response body of ${String(answer.bytes)} bytes exceeds the transport limit`);
+    }
+    observer.answered(answer, handlerMs, 0);
     return answer.value;
   };
 }

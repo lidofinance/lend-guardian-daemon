@@ -22,6 +22,8 @@ import type {
   CycleScenario,
   Decision,
   DiscoveryScenario,
+  GriefingAttack,
+  GriefingScenario,
   LivenessScenario,
   ReconstructionScenario,
   ReportsScenario,
@@ -31,8 +33,16 @@ import type {
 } from './scenarios.ts';
 import { SyntheticClient } from './synthetic-client.ts';
 import type { Delivery } from './synthetic-client.ts';
-import { BLOCKHASH_LOOKBACK, CHAIN_ID, SLOT_SECONDS, measuredNode, timestampOf } from './synthetic-rpc.ts';
-import type { RpcLatency, SyntheticChain, VirtualClock } from './synthetic-rpc.ts';
+import {
+  BLOCKHASH_LOOKBACK,
+  CHAIN_ID,
+  RoundTrips,
+  SLOT_SECONDS,
+  measuredNode,
+  providerNode,
+  timestampOf,
+} from './synthetic-rpc.ts';
+import type { ProviderProfile, RpcLatency, SyntheticChain, VirtualClock } from './synthetic-rpc.ts';
 import { runAnvil } from './anvil.ts';
 import { runDaemon } from './daemon.ts';
 import { runTransport } from './transport.ts';
@@ -47,6 +57,7 @@ import {
   buildWorld,
   cycleWorld,
   discoveryWorld,
+  griefingWorld,
   positionAt,
   quietWorld,
   reconstructionWorld,
@@ -87,8 +98,12 @@ interface GuardianSettings {
   readonly interBatchConfirmationBlocks: number;
   readonly inclusionBlocks: number;
   readonly rpcLatency: RpcLatency;
+  /** A public provider's round trips and limits instead of `rpcLatency`, when set. */
+  readonly providerProfile: ProviderProfile | undefined;
   readonly provider: ProviderPlan;
   readonly onIncluded: ((delivery: Delivery) => void) | undefined;
+  /** Sees every SDK event after the harness's own observers. */
+  readonly onEvent: ((event: SdkEvent) => void) | undefined;
 }
 
 const DEFAULT_SETTINGS: GuardianSettings = {
@@ -100,8 +115,10 @@ const DEFAULT_SETTINGS: GuardianSettings = {
   interBatchConfirmationBlocks: 2,
   inclusionBlocks: 1,
   rpcLatency: NO_LATENCY,
+  providerProfile: undefined,
   provider: { decide: () => CLEAN, latency: { kind: 'real', ms: 0 } },
   onIncluded: undefined,
+  onEvent: undefined,
 };
 
 /** The report blocks the cycle planned, from its `cycle.planned` events. */
@@ -174,6 +191,8 @@ export function runScenario(scenario: Scenario, clock: VirtualClock, presetName:
       return runTransport(parameters, { presetName, scenarioId: scenario.id });
     case 'daemon':
       return runDaemon(parameters, { presetName, scenarioId: scenario.id });
+    case 'griefing':
+      return runGriefing(parameters, context);
     case 'anvil':
       return runAnvil(parameters);
   }
@@ -677,6 +696,238 @@ async function submissionProbe(parameters: LivenessScenario, targets: number, co
   return { targets, harness, outcome: result.outcome };
 }
 
+// ─── Griefing: the largest attack a first cycle still attests through, and what exceeding it costs.
+
+/** The log list limit of a capped provider, as major public providers set it. */
+const PROVIDER_LOG_LIMIT = 10_000;
+
+/** Memory a cycle may add to the process before the attack counts as exceeding the Guardian. */
+const MEMORY_LIMIT_MB = 4_096;
+
+const MEMORY_SAMPLE_INTERVAL_MS = 50;
+
+/** Base fees the attacker pays, in gwei: about today's, and a busier chain's. */
+const LOW_BASE_FEE_GWEI = 0.1;
+
+const HIGH_BASE_FEE_GWEI = 0.5;
+
+const GWEI_PER_ETH = 1e9;
+
+/**
+ * Gas of one attacker operation on the pinned contracts, measured on Anvil with single transactions:
+ * a dust deposit to its own address and its withdrawal; a lot deposit to a new address and its
+ * withdrawal; a lot deposit to a new address.
+ */
+const OPERATION_GAS: Readonly<Record<GriefingAttack, number>> = {
+  'discovery-flood': 156_846 + 106_119,
+  'candidate-flood': 205_320 + 109_868,
+  'report-flood': 205_320,
+};
+
+/** The first attack size tried; the search doubles it until the cycle breaks. */
+const FIRST_PROBE_OPERATIONS = 100;
+
+/** The search stops once the break lies within this share above the largest attack that attested. */
+const SEARCH_PRECISION = 0.02;
+
+/** One attack of `operations` against a Guardian's first cycle. */
+interface GriefingProbe {
+  readonly operations: number;
+  readonly outcome: string;
+  /** Why the attack exceeded the Guardian, or null when the cycle attested within the memory limit. */
+  readonly failure: string | null;
+  readonly candidates: number;
+  readonly metrics: Readonly<Record<string, number>>;
+}
+
+async function runGriefing(parameters: GriefingScenario, context: RunContext): Promise<RunReport> {
+  const window = new ResourceWindow();
+  const search = await searchCapacity(parameters, context);
+  const usage = window.close();
+  const { fits, breaks } = search;
+  const capacity = fits?.operations ?? 0;
+  const beyond = breaks === undefined ? 'search bound reached' : `beyond: ${breaks.failure ?? 'none'}`;
+  // The attack that attested must have made the scan do the work the attack stands for.
+  const checks =
+    fits === undefined
+      ? []
+      : [
+          check('capacity probe', 'attested', fits.outcome),
+          check('positions scanned', expectedCandidates(parameters.attack, capacity), fits.candidates),
+        ];
+  return {
+    outcome: `capacity ${String(capacity)}; ${beyond}`,
+    metrics: {
+      ...usage,
+      ...fits?.metrics,
+      capacity,
+      probes: search.probes,
+      ...attackCost(parameters.attack, capacity + 1),
+    },
+    rpcByPhase: {},
+    checks,
+  };
+}
+
+function expectedCandidates(attack: GriefingAttack, operations: number): number {
+  return attack === 'discovery-flood' ? 0 : operations;
+}
+
+/** The probes that bracket a Guardian's capacity, and how many the search ran. */
+interface CapacitySearch {
+  readonly fits: GriefingProbe | undefined;
+  readonly breaks: GriefingProbe | undefined;
+  readonly probes: number;
+}
+
+/**
+ * The largest attack that still attests: double from a hundred operations until one breaks the cycle
+ * or the bound is reached, then bisect to within two percent.
+ */
+async function searchCapacity(parameters: GriefingScenario, context: RunContext): Promise<CapacitySearch> {
+  const doubled = await doubleUntilBreak(parameters, context);
+  const { breaks } = doubled;
+  return breaks === undefined ? doubled : bisect(parameters, context, { ...doubled, breaks });
+}
+
+async function doubleUntilBreak(parameters: GriefingScenario, context: RunContext): Promise<CapacitySearch> {
+  let fits: GriefingProbe | undefined;
+  let probes = 0;
+  let operations = Math.min(FIRST_PROBE_OPERATIONS, parameters.maxOperations);
+  while (true) {
+    const probe = await griefingProbe(parameters, operations, context);
+    probes += 1;
+    if (probe.failure !== null) {
+      return { fits, breaks: probe, probes };
+    }
+    fits = probe;
+    if (operations === parameters.maxOperations) {
+      return { fits, breaks: undefined, probes };
+    }
+    operations = Math.min(operations * 2, parameters.maxOperations);
+  }
+}
+
+async function bisect(
+  parameters: GriefingScenario,
+  context: RunContext,
+  bracket: CapacitySearch & { readonly breaks: GriefingProbe },
+): Promise<CapacitySearch> {
+  let { fits, breaks, probes } = bracket;
+  while (true) {
+    const low = fits?.operations ?? 0;
+    if (breaks.operations - low <= Math.max(1, Math.floor(low * SEARCH_PRECISION))) {
+      return { fits, breaks, probes };
+    }
+    const probe = await griefingProbe(parameters, Math.floor((low + breaks.operations) / 2), context);
+    probes += 1;
+    if (probe.failure === null) {
+      fits = probe;
+    } else {
+      breaks = probe;
+    }
+  }
+}
+
+/** Build the attack, run a first cycle against it over the provider, and record what it cost. */
+async function griefingProbe(
+  parameters: GriefingScenario,
+  operations: number,
+  context: RunContext,
+): Promise<GriefingProbe> {
+  const world = griefingWorld(parameters, operations, context.clock);
+  const roundTrips = new RoundTrips(context.clock, parameters.roundTripMs);
+  let candidates = 0;
+  const harness = harnessOf(world.chain, context.clock, {
+    ...DEFAULT_SETTINGS,
+    providerProfile: {
+      roundTrips,
+      logLimit: parameters.provider === 'capped' ? PROVIDER_LOG_LIMIT : undefined,
+    },
+    provider: {
+      decide: () => DECISIONS[parameters.attack === 'report-flood' ? 'suspect' : 'clean'],
+      latency: { kind: 'real', ms: 0 },
+    },
+    onEvent: (event) => {
+      if (event.event === 'cycle.discovered') {
+        candidates = event.positions.length;
+      }
+    },
+  });
+  const memory = new MemoryPeak();
+  const cpuBefore = process.cpuUsage();
+  const outcome = await harness.guardian.cycle(null).then(outcomeOf, griefingFailure);
+  const cpu = process.cpuUsage(cpuBefore);
+  const memoryGrowthMb = memory.stop();
+  const failure = outcome === 'attested' ? memoryFailure(memoryGrowthMb) : outcome;
+  return {
+    operations,
+    outcome,
+    failure,
+    candidates,
+    metrics: {
+      ...livenessCounts(harness),
+      ...harness.rpc.totals(),
+      roundTrips: roundTrips.completed(),
+      memoryGrowthMb,
+      cycleCpuMs: (cpu.user + cpu.system) / 1_000,
+      reportTransactions: transactionCounts(harness.client.deliveries()).reportTransactions,
+    },
+  };
+}
+
+function memoryFailure(memoryGrowthMb: number): string | null {
+  return memoryGrowthMb > MEMORY_LIMIT_MB ? `memory above ${String(MEMORY_LIMIT_MB)} MB` : null;
+}
+
+/** A provider's or transport's refusal is named by its limit; any other failure keeps its outcome. */
+function griefingFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : '';
+  if (message.includes('query returned more than')) {
+    return 'provider log limit';
+  }
+  if (message.includes('exceeds the transport limit')) {
+    return 'transport response limit';
+  }
+  return outcomeOfError(error);
+}
+
+/** The attacker's gas to reach `operations`, and its price at both base fees. */
+function attackCost(attack: GriefingAttack, operations: number): Record<string, number> {
+  const gas = operations * OPERATION_GAS[attack];
+  return {
+    attackGasMillions: gas / 1e6,
+    costEthLowFee: (gas * LOW_BASE_FEE_GWEI) / GWEI_PER_ETH,
+    costEthHighFee: (gas * HIGH_BASE_FEE_GWEI) / GWEI_PER_ETH,
+    ...(attack === 'report-flood' ? { lotsLocked: operations } : {}),
+  };
+}
+
+/** Resident memory above what the process held when sampling began, sampled until stopped. */
+class MemoryPeak {
+  readonly #baseline: number;
+
+  readonly #timer: ReturnType<typeof setInterval>;
+
+  #peak: number;
+
+  constructor() {
+    globalThis.gc?.();
+    this.#baseline = process.memoryUsage().rss;
+    this.#peak = this.#baseline;
+    this.#timer = setInterval(() => {
+      this.#peak = Math.max(this.#peak, process.memoryUsage().rss);
+    }, MEMORY_SAMPLE_INTERVAL_MS);
+  }
+
+  /** Megabytes of the peak above the baseline. */
+  stop(): number {
+    clearInterval(this.#timer);
+    this.#peak = Math.max(this.#peak, process.memoryUsage().rss);
+    return (this.#peak - this.#baseline) / 1_048_576;
+  }
+}
+
 // ─── Shared construction and measurement.
 
 function harnessOf(chain: SyntheticChain, clock: VirtualClock, settings: GuardianSettings): Harness {
@@ -684,8 +935,12 @@ function harnessOf(chain: SyntheticChain, clock: VirtualClock, settings: Guardia
   const providers = new ProviderMeter();
   const phases = new PhaseTimer(rpc);
   const plans = new PlanRecorder();
+  const node =
+    settings.providerProfile === undefined
+      ? measuredNode(chain, rpc, settings.rpcLatency)
+      : providerNode(chain, rpc, settings.providerProfile);
   const client = new SyntheticClient({
-    node: measuredNode(chain, rpc, settings.rpcLatency),
+    node,
     chain,
     signer: DELEGATE,
     maxLogBlockRange: settings.maxLogBlockRange,
@@ -706,6 +961,7 @@ function harnessOf(chain: SyntheticChain, clock: VirtualClock, settings: Guardia
     onEvent: (event) => {
       phases.onEvent(event);
       plans.onEvent(event);
+      settings.onEvent?.(event);
     },
     reportBlockLag: REPORT_BLOCK_LAG,
     flaggerReadConcurrency: settings.flaggerReadConcurrency,

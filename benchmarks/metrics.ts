@@ -54,6 +54,9 @@ export interface RpcTotals {
   /** Sum of the inclusive block spans of every `eth_getLogs` range. */
   readonly rangeSpanBlocks: number;
   readonly largestSpanBlocks: number;
+  /** The longest log list and the largest response of a single answer. */
+  readonly largestLogList: number;
+  readonly largestResponseMb: number;
   /** Time the synthetic node spent answering, which is not SDK time. */
   readonly rpcHandlerMs: number;
   readonly rpcLatencyMs: number;
@@ -75,6 +78,10 @@ export class RpcMeter implements RpcObserver {
 
   #largestSpanBlocks = 0;
 
+  #largestLogList = 0;
+
+  #largestResponseBytes = 0;
+
   #handlerMs = 0;
 
   #latencyMs = 0;
@@ -89,6 +96,8 @@ export class RpcMeter implements RpcObserver {
     this.#bytes += answer.bytes;
     this.#rangeSpanBlocks += answer.spanBlocks;
     this.#largestSpanBlocks = Math.max(this.#largestSpanBlocks, answer.spanBlocks);
+    this.#largestLogList = Math.max(this.#largestLogList, answer.logs);
+    this.#largestResponseBytes = Math.max(this.#largestResponseBytes, answer.bytes);
     this.#handlerMs += handlerMs;
     this.#latencyMs += latencyMs;
   }
@@ -127,6 +136,8 @@ export class RpcMeter implements RpcObserver {
       responseMb: this.#bytes / BYTES_PER_MEGABYTE,
       rangeSpanBlocks: this.#rangeSpanBlocks,
       largestSpanBlocks: this.#largestSpanBlocks,
+      largestLogList: this.#largestLogList,
+      largestResponseMb: this.#largestResponseBytes / BYTES_PER_MEGABYTE,
       rpcHandlerMs: this.#handlerMs,
       rpcLatencyMs: this.#latencyMs,
     };
@@ -455,6 +466,18 @@ const FAMILY_COLUMNS: Readonly<Record<string, readonly Column[]>> = {
     { header: 'p95 ms', metric: 'latencyP95Ms', digits: 1 },
     { header: 'switch ms', metric: 'endpointSwitchMs', digits: 1 },
     { header: 'response MB', metric: 'responseMb', digits: 2 },
+  ],
+  griefing: [
+    { header: 'capacity', metric: 'capacity', digits: 0 },
+    { header: 'blocks used', metric: 'blocksConsumed', digits: 0 },
+    { header: 'round trips', metric: 'roundTrips', digits: 0 },
+    { header: 'RPC', metric: 'rpcCalls', digits: 0 },
+    { header: 'largest log list', metric: 'largestLogList', digits: 0 },
+    { header: 'largest response MB', metric: 'largestResponseMb', digits: 1 },
+    { header: 'memory growth MB', metric: 'memoryGrowthMb', digits: 0 },
+    { header: 'attack gas M', metric: 'attackGasMillions', digits: 0 },
+    { header: 'ETH at 0.1 gwei', metric: 'costEthLowFee', digits: 2 },
+    { header: 'ETH at 0.5 gwei', metric: 'costEthHighFee', digits: 2 },
   ],
   daemon: [
     { header: 'wall ms', metric: 'wallMs', digits: 0 },

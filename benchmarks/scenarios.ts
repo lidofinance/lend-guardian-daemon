@@ -168,6 +168,30 @@ export interface DaemonScenario {
   readonly receiverLatencyMs: number;
 }
 
+/**
+ * - `discovery-flood`: dust deposits the attacker withdraws at once, so one deposit's capital repeats;
+ * - `candidate-flood`: lots on new addresses, withdrawn in full, each a position the scan must walk;
+ * - `report-flood`: lots on new addresses that stay, each a target screening reports as suspect.
+ */
+export type GriefingAttack = 'discovery-flood' | 'candidate-flood' | 'report-flood';
+
+/**
+ * The largest attack a Guardian's first cycle still attests through, found by search, and what
+ * exceeding it costs the attacker.
+ */
+export interface GriefingScenario {
+  readonly family: 'griefing';
+  readonly attack: GriefingAttack;
+  /** Blocks at the start of the discovery window the operations are spread over. */
+  readonly spreadBlocks: number;
+  /** Round trip of every RPC exchange, charged to chain time. */
+  readonly roundTripMs: number;
+  /** Whether the provider refuses a log list above 10,000 entries. */
+  readonly provider: 'capped' | 'uncapped';
+  /** Upper bound of the search. */
+  readonly maxOperations: number;
+}
+
 /** A cycle over the pinned production contracts on a local Anvil chain, through the SDK's own clients. */
 export interface AnvilScenario {
   readonly family: 'anvil';
@@ -190,6 +214,7 @@ export type ScenarioParameters =
   | LivenessScenario
   | TransportScenario
   | DaemonScenario
+  | GriefingScenario
   | AnvilScenario;
 
 export type Family = ScenarioParameters['family'];
@@ -297,6 +322,15 @@ const DAEMON: DaemonScenario = {
   runner: 'daemon',
   positions: 1_000,
   receiverLatencyMs: 0,
+};
+
+const GRIEFING: GriefingScenario = {
+  family: 'griefing',
+  attack: 'discovery-flood',
+  spreadBlocks: 10_000,
+  roundTripMs: 50,
+  provider: 'capped',
+  maxOperations: 200_000,
 };
 
 const ANVIL: AnvilScenario = {
@@ -424,6 +458,19 @@ function fullDaemon(): DaemonScenario[] {
   return [{ ...DAEMON, runner: 'sdk' }, DAEMON, { ...DAEMON, receiverLatencyMs: 1_000 }];
 }
 
+/** Every attack at both round trips and against both providers; the discovery flood also spread over the window. */
+function fullGriefing(): GriefingScenario[] {
+  const conditions = [50, 100].flatMap((roundTripMs) =>
+    (['capped', 'uncapped'] as const).map((provider) => ({ ...GRIEFING, roundTripMs, provider })),
+  );
+  return conditions.flatMap((condition) => [
+    condition,
+    { ...condition, spreadBlocks: 50_400 },
+    { ...condition, attack: 'candidate-flood', spreadBlocks: 50_400 },
+    { ...condition, attack: 'report-flood', spreadBlocks: 50_400, maxOperations: 20_000 },
+  ]);
+}
+
 function fullAnvil(): AnvilScenario[] {
   return [
     ANVIL,
@@ -464,6 +511,9 @@ function smokeParameters(): ScenarioParameters[] {
     { ...TRANSPORT, condition: 'observe-cycle', positions: 50 },
     { ...DAEMON, runner: 'sdk', positions: 50 },
     { ...DAEMON, positions: 50 },
+    { ...GRIEFING, maxOperations: 2_000 },
+    { ...GRIEFING, attack: 'candidate-flood', spreadBlocks: 50_400, maxOperations: 500 },
+    { ...GRIEFING, attack: 'report-flood', spreadBlocks: 50_400, maxOperations: 300 },
     { ...ANVIL, supplies: 50, borrowers: 50 },
     { ...ANVIL, mode: 'signal', supplies: 20, borrowers: 20, decision: 'both' },
   ];
@@ -478,6 +528,7 @@ const BASELINES: Readonly<Record<Family, ScenarioParameters>> = {
   liveness: LIVENESS,
   transport: TRANSPORT,
   daemon: DAEMON,
+  griefing: GRIEFING,
   anvil: ANVIL,
 };
 
@@ -518,6 +569,7 @@ export function presetNamed(name: string): Preset {
       ...fullLiveness(),
       ...fullTransport(),
       ...fullDaemon(),
+      ...fullGriefing(),
       ...fullAnvil(),
     ];
     return { name, warmup: 2, repeat: 5, scenarios: scenariosOf(parameters, 1) };

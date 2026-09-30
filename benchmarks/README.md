@@ -1,11 +1,12 @@
 # Guardian SDK benchmarks
 
-The benchmark suite measures what the SDK costs and whether a cycle fits its blockhash budget. It answers four questions:
+The benchmark suite measures what the SDK costs and whether a cycle fits its blockhash budget. It answers five questions:
 
 1. **Workload:** how much history and how large a work set one cycle can process.
 2. **Amplification:** how many RPC requests, returned logs, response bytes, provider decisions and transactions a given amount of useful work creates.
 3. **Liveness:** whether required reports and the heartbeat are confirmed before the report block ages out, including repeated work after faults and reorgs.
 4. **Daemon overhead:** what the deployable daemon in `daemon/` adds to a cycle: CPU time, memory, event posts and the screening request.
+5. **Griefing:** the largest attack a Guardian's first cycle still attests through, and what exceeding it costs the attacker.
 
 The suite is not part of `npm run check`: absolute timings are not stable on shared CI. Its code is typechecked, linted and formatted with the rest of the repository. Correctness tests stay in `tests/`; for example, `tests/core/resources.test.ts` asserts behaviour on large histories but measures no time, memory or amplification.
 
@@ -19,7 +20,11 @@ npm run benchmark:profile -- --from benchmarks/results/<run>/results.json
 
 `benchmark:smoke` runs small deterministic instances of every scenario family once and fails if any scenario's own checks fail. It makes no timing claims. `benchmark` runs the `full` preset: two warm-up runs and five measured runs of every scenario. `benchmark:profile` re-runs the slowest and the most memory-heavy scenario of an earlier run once, by median CPU time and median peak RSS, with Node's CPU profiler and sampling heap profiler; `--profile --preset <preset> --scenario <id>` profiles a named scenario instead.
 
-The `anvil` family and the conformance fixtures it reuses need Anvil 1.7.1 on `PATH` or selected through `ANVIL_BIN`.
+The `anvil` family and the conformance fixtures it reuses need Anvil 1.7.1 on `PATH` or selected through `ANVIL_BIN`. The `griefing` family searches for a capacity in every run and builds histories of hundreds of thousands of logs, so run it once per scenario with a larger heap:
+
+```bash
+npm run benchmark -- --filter griefing --repeat 1 --warmup 0 --max-old-space-mb 16384
+```
 
 Runner options:
 
@@ -48,6 +53,8 @@ The SDK runs unmodified. The benchmark supplies its own implementations of the t
 
 Chain time is virtual. The synthetic head advances when a transaction waits for inclusion or confirmations, when the SDK's poll timer sleeps, and, in the `full` preset, with real processing time at one block per twelve seconds. The child replaces the SDK's `node:timers/promises` timer with the virtual clock through Node's module mocks, so a wait of one slot costs one block and no wall-clock time. Blocks consumed and the remaining blockhash budget are therefore exact for simulated waits and realistic for processing time. Liveness capacity searches use chain time only, so their answer does not depend on the machine.
 
+The `griefing` family runs the synthetic node as a public provider. Every request costs one round trip of chain time, and requests in flight together share it, so a batch of concurrent reads costs one round trip and a chain of dependent reads one each; processing time counts as elsewhere. A capped provider refuses a log list above 10,000 entries, and every provider fails a response above the daemon's 10 MB transport limit. Each scenario writes an attack into the first blocks of a Guardian's discovery window and runs the Guardian's first cycle against it in signal mode: it doubles the attack from 100 operations until the cycle no longer attests, then bisects to within two percent. A cycle fails when the provider or transport refuses an answer, the report block ages out, or the process grows by more than 4 GB above the history it built, sampled every 50 ms. The attack's price uses the gas of each operation measured on Anvil against the pinned contracts, at base fees of 0.1 and 0.5 gwei.
+
 `synthetic-history.ts` generates lending histories with a seeded pseudo-random source: supplies classified by their controller, drains, maturations and absorbed dust, each with the post-event position the controller records. It follows the transitions in the specification; it is not a model of every contract rule. `worlds.ts` builds each family's deployment and history from scenario parameters alone, so a separate server process can rebuild the same chain.
 
 Three families leave the synthetic node. The `transport` family runs the SDK's `createViemRpcTransport` against loopback HTTP endpoints served by a separate process (`loopback-server.ts`), so JSON serialization and sockets do not share CPU time with the measured client; each endpoint answers, lags, hangs, resets, refuses connections or returns HTTP and JSON-RPC errors as the scenario prescribes. The `daemon` family runs the transport family's observe cycle over one loopback node twice: by the SDK alone with a provider in the same process, and as `daemon/main.ts` runs it, with screening through the daemon's `HttpScreening` and every event serialized by `toRecord` and posted by `forward`. The same server process serves a screening service that judges every anchor clean and a receiver that answers each post after `receiverLatencyMs`; both count what they receive, and the run ends once the receiver has answered every event. The `anvil` family deploys the pinned production contracts with the conformance fixtures, writes real supply transactions and runs observe and signal cycles through `ViemRpcClient` and the SDK transport; it keeps real timers and mines a block every `blockIntervalMs` while a submission waits for confirmations.
@@ -64,6 +71,7 @@ Three families leave the synthetic node. The `transport` family runs the SDK's `
 | `liveness`       | The largest number of targets whose reports and heartbeat fit the blockhash budget, by bisection, for several confirmation, batching and inclusion settings.                                                                                                                                                                                                    |
 | `transport`      | HTTP attempts, bytes, latency to a result and time lost on a failing first endpoint: healthy, slow and concurrent endpoints, large and over-limit answers, HTTP 429 and 500, JSON-RPC errors, timeouts, resets, refused connections, exhausted fallbacks, silent log omission, log quorum, and observe cycles over HTTP with and without a hung first endpoint. |
 | `daemon`         | What the daemon adds to an observe cycle of the SDK alone: CPU time, peak memory, event posts and their size, posts open at once with a fast and a slow receiver, and the screening request size.                                                                                                                                                               |
+| `griefing`       | The largest attack a first cycle attests through and its price: dust deposits withdrawn at once, in one log chunk or across the window; lots withdrawn in full; lots kept for screening to report; at 50 and 100 ms round trips, with and without a provider log limit.                                                                                         |
 | `anvil`          | Observe and signal cycles over the pinned contracts with real transactions, ABI decoding and receipts, for a few hundred to a few thousand supplies.                                                                                                                                                                                                            |
 
 Scenario identifiers name the family and every parameter that differs from the family baseline in `scenarios.ts`. Every scenario states checks about its own result, such as the expected outcome, the number of candidate positions or the transaction count `Σ ceil(suspects per market / batch) + Σ ceil(flags per market / batch) + 1`. A run whose checks fail counts as failed, so the suite cannot report numbers for behaviour it did not reproduce.
@@ -74,11 +82,12 @@ Scenario identifiers name the family and every parameter that differs from the f
 
 - resources: `wallMs`, `cpuMs`, `peakRssMb`, `heapBeforeMb`, `heapAfterMb`, `heapRetainedMb`, `eventLoopMaxMs`, `eventLoopP99Ms`;
 - phases: `planMs`, `discoveryMs`, `reconstructionMs`, `screeningMs`, `signalMs`, and `rpcByPhase` with every request label per phase;
-- RPC: `rpcCalls`, `getLogsCalls`, `ethCalls`, `blockReads`, `receiptReads`, `logsReturned`, `responseMb`, `rangeSpanBlocks`, `largestSpanBlocks`, `rpcHandlerMs` (synthetic node time, not SDK time);
+- RPC: `rpcCalls`, `getLogsCalls`, `ethCalls`, `blockReads`, `receiptReads`, `logsReturned`, `responseMb`, `rangeSpanBlocks`, `largestSpanBlocks`, `largestLogList`, `largestResponseMb`, `rpcHandlerMs` (synthetic node time, not SDK time);
 - provider and transactions: `providerCalls`, `providerAnchors`, `providerDecisions`, `reportTransactions`, `heartbeatTransactions`;
 - liveness: `reportBlock`, `headAtPlanning`, `headAtHeartbeat`, `blocksConsumed`, `remainingBudgetBlocks`, `restarts`, `capacityTargets`, `capacityBatches`;
 - amplification: `rpcPerSupply`, `rpcPerAnchor`, `logsPerAnchor`, `kilobytesPerAnchor`, `decisionsPerAnchor`, `reportTransactionsPerTarget`, `reprocessedAnchorShare`;
-- daemon: `events`, `eventPosts`, `eventKb`, `largestEventKb`, `maxConcurrentPosts`, `postsInFlight`, `screeningRequestKb`.
+- daemon: `events`, `eventPosts`, `eventKb`, `largestEventKb`, `maxConcurrentPosts`, `postsInFlight`, `screeningRequestKb`;
+- griefing: `capacity`, `probes`, `roundTrips`, `memoryGrowthMb`, `cycleCpuMs`, `attackGasMillions`, `costEthLowFee` (0.1 gwei), `costEthHighFee` (0.5 gwei), `lotsLocked`; the cycle metrics are those of the largest attack that attested.
 
 Response bytes are estimates: logs are counted at their serialized size, and every block read is counted as a mainnet header with 150 transaction hashes, as `eth_getBlockByNumber(tag, false)` returns it.
 
@@ -87,6 +96,7 @@ Response bytes are estimates: logs are counted at their serialized size, and eve
 - The synthetic client does not model fee estimation, signing, replacement or the delivery RPC calls of `ViemRpcClient`; report and heartbeat delivery is counted in transactions and blocks.
 - Registry reads answer current state at any canonical block, which is enough for the cycles measured here.
 - A successful but incomplete `eth_getLogs` answer from the only endpoint cannot be detected. The `silent-omission` condition records this trust boundary rather than a failure; `log-quorum-lagging` shows what a quorum of independent endpoints adds.
+- The `griefing` family writes the attack into the synthetic history without checking that its operations fit the blocks they occupy, and without the activation delay that heavy inflow adds to later lots. Its price counts gas only: a discovery flood and a candidate flood recycle one deposit's capital, while a report flood locks one lot per target (`lotsLocked`). Round trips advance in lockstep, so a batch waits for its slowest request.
 - The `daemon` family leaves out the daemon's log lines. Its loopback node answers far faster than a live one, so events arrive faster and more posts are open at once than on a live network; the receiver shares the server process with the node.
 - The `transport` family measures the SDK transport and viem's fallback, not a public provider's rate limits or caching. A test of a real network, with the runner, the RPC endpoints and the screening service on separate machines, is a separate exercise.
 - Timings from a laptop or shared CI are indicative only. For reproducible figures, run the `full` preset on one dedicated Linux machine with a fixed CPU type, vCPU count and memory, the Node and Anvil versions pinned in this repository, and no parallel jobs.
