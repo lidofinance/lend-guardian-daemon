@@ -89,8 +89,8 @@ export interface Lot {
   readonly supplied?: bigint;
   /** The borrower the controller event names, or `BORROWER`, whom every supply is on behalf of. */
   readonly borrower?: Address;
-  /** The block hash the lot's receipt names, or the hash of the block its logs sit in. */
-  readonly receiptBlockHash?: Bytes32;
+  /** The block hash the node gives the lot's controller log and receipt, or the hash of the lot's block. */
+  readonly controllerBlockHash?: Bytes32;
 }
 
 /** A report transaction as the node recorded it. */
@@ -109,16 +109,9 @@ interface LogQuery {
   readonly topics: readonly unknown[];
 }
 
-/** One `eth_getLogs` the core sent for a single block by its hash. */
-interface BlockLogQuery {
-  readonly address: string;
-  readonly blockHash: string;
-}
-
 /** What the node records of the queries it was sent. */
 interface Queries {
   readonly ranges: LogQuery[];
-  readonly blocks: BlockLogQuery[];
 }
 
 /** A node's own cap on a query's results, and how it words the refusal. */
@@ -210,8 +203,6 @@ export interface FakeNode {
   setHeartbeatTimestamp(timestamp: number): void;
   readonly transport: (method: string, params: readonly unknown[]) => Promise<unknown>;
   readonly logQueries: LogQuery[];
-  /** The one-block queries by hash, in the order they were sent. */
-  readonly blockLogQueries: BlockLogQuery[];
   /** Moves the chain on, which is how a test reaches the checks a cycle makes against a fresh head. */
   advanceTo(head: number): void;
   /** Reports a head whose hash is not the canonical block at its number. */
@@ -221,7 +212,7 @@ export interface FakeNode {
 }
 
 export function fakeNode(script: Script): FakeNode {
-  const queries: Queries = { ranges: [], blocks: [] };
+  const queries: Queries = { ranges: [] };
   const state: NodeState = {
     ...script,
     isHeadForked: false,
@@ -245,7 +236,6 @@ export function fakeNode(script: Script): FakeNode {
       Object.assign(state, { heartbeatTimestamp: timestamp });
     },
     logQueries: queries.ranges,
-    blockLogQueries: queries.blocks,
     advanceTo: (head) => {
       state.head = head;
     },
@@ -351,11 +341,6 @@ function isWithin(value: number, from: number, to: number): boolean {
 
 function logAnswer(script: Script, params: readonly unknown[], queries: Queries): unknown {
   const filter = params[0];
-  if (isRecord(filter) && typeof filter.blockHash === 'string') {
-    queries.blocks.push({ address: text(filter, 'address'), blockHash: filter.blockHash });
-    return logsOfBlock(script, filter.blockHash);
-  }
-
   const from = Number(BigInt(text(filter, 'fromBlock')));
   const to = Number(BigInt(text(filter, 'toBlock')));
   const topics = list(filter, 'topics');
@@ -377,21 +362,6 @@ function logAnswer(script: Script, params: readonly unknown[], queries: Queries)
 
   const logs = selectedLogs(script, kind, from, to);
   return isBroken(script, kind, from === to) ? logs.map(undecodable) : logs;
-}
-
-/**
- * The controller's logs of one block, by hash: each lot's lifecycle log is served under the block
- * its receipt names, so a lot whose receipt names another block is not found in its supply's.
- */
-function logsOfBlock(script: Script, blockHash: string): LogRecord[] {
-  const lifecycle = lifecycleLogs(script);
-
-  return (script.lots ?? []).flatMap((lot, index) => {
-    const servedUnder = lot.receiptBlockHash ?? blockAt(lot.blockNumber).hash;
-    const record = lifecycle[index];
-
-    return servedUnder === blockHash && record !== undefined ? [record] : [];
-  });
 }
 
 function isBroken(script: Script, kind: LogKind, isOneBlock: boolean): boolean {
@@ -461,6 +431,7 @@ function lifecycleLogs(script: Script): LogRecord[] {
   return (script.lots ?? []).map((lot) =>
     logShape({
       blockNumber: lot.blockNumber,
+      blockHash: lot.controllerBlockHash,
       logIndex: lot.logIndex,
       transactionHash: txOf(lot),
       topics: [TOPIC[lot.kind], padHex(lot.borrower ?? BORROWER, { size: 32 })],
@@ -504,7 +475,7 @@ function receiptAnswer(script: NodeState, params: readonly unknown[]): unknown {
   const supply = supplyLogs(script).filter((log) => text(log, 'transactionHash') === hash);
   const lifecycle = lifecycleLogs(script).filter((log) => text(log, 'transactionHash') === hash);
   return {
-    blockHash: lot.receiptBlockHash ?? blockAt(lot.blockNumber).hash,
+    blockHash: lot.controllerBlockHash ?? blockAt(lot.blockNumber).hash,
     blockNumber: numberToHex(lot.blockNumber),
     transactionHash: hash,
     status: '0x1',
@@ -533,6 +504,8 @@ function heartbeatLog(entry: Heartbeat): LogRecord {
 /** Where a log sits and what it carries. The transaction index is zero unless a fixture orders by it. */
 interface LogFields {
   readonly blockNumber: number;
+  /** The hash the log names, or the hash of the block at its number. */
+  readonly blockHash?: Bytes32 | undefined;
   readonly transactionIndex?: number;
   readonly logIndex: number;
   readonly transactionHash: string;
@@ -549,7 +522,7 @@ function logShape(fields: LogFields): LogRecord {
     topics: fields.topics,
     data: fields.data,
     blockNumber: numberToHex(fields.blockNumber),
-    blockHash: blockAt(fields.blockNumber).hash,
+    blockHash: fields.blockHash ?? blockAt(fields.blockNumber).hash,
     transactionHash: fields.transactionHash,
     transactionIndex: numberToHex(fields.transactionIndex ?? 0),
     logIndex: numberToHex(fields.logIndex),

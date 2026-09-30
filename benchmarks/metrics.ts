@@ -44,8 +44,6 @@ export interface RpcTotals {
   readonly rpcCalls: number;
   readonly rpcFailures: number;
   readonly getLogsCalls: number;
-  readonly getLogsRangeCalls: number;
-  readonly getLogsBlockCalls: number;
   readonly ethCalls: number;
   readonly blockReads: number;
   readonly receiptReads: number;
@@ -127,8 +125,6 @@ export class RpcMeter implements RpcObserver {
       rpcCalls: this.count(null, ''),
       rpcFailures: this.#failures,
       getLogsCalls: this.count(null, 'eth_getLogs'),
-      getLogsRangeCalls: this.#countSuffix('eth_getLogs', '-range'),
-      getLogsBlockCalls: this.#countSuffix('eth_getLogs', '-block'),
       ethCalls: this.count(null, 'eth_call'),
       blockReads: this.count(null, 'eth_getBlockByNumber'),
       receiptReads: this.count(null, 'eth_getTransactionReceipt'),
@@ -152,17 +148,6 @@ export class RpcMeter implements RpcObserver {
     const labels = this.#calls.get(this.#phase) ?? new Map<string, number>();
     labels.set(label, (labels.get(label) ?? 0) + 1);
     this.#calls.set(this.#phase, labels);
-  }
-
-  #countSuffix(labelPrefix: string, labelSuffix: string): number {
-    let total = 0;
-    for (const labels of this.#calls.values()) {
-      for (const [label, calls] of labels) {
-        const isMatch = label.startsWith(labelPrefix) && label.endsWith(labelSuffix);
-        total += isMatch ? calls : 0;
-      }
-    }
-    return total;
   }
 }
 

@@ -58,9 +58,10 @@ export interface Built<World> {
 export interface DiscoveryWorld {
   readonly chain: SyntheticChain;
   readonly candidates: number;
-  readonly controllerBlocks: number;
   readonly markets: number;
   readonly controllers: number;
+  /** Controllers of this Guardian's registry with a supply in the window, whose lifecycle events discovery reads. */
+  readonly targetControllers: number;
 }
 
 export interface ReconstructionWorld {
@@ -72,8 +73,6 @@ export interface ReconstructionWorld {
 
 export interface GriefingWorld {
   readonly chain: SyntheticChain;
-  /** Positions the scan must reconstruct: none for a discovery flood, one per lot otherwise. */
-  readonly candidates: number;
 }
 
 export interface CycleWorld {
@@ -144,13 +143,13 @@ export function logsWorld(supplies: number, clock: VirtualClock): SyntheticChain
 class DiscoveryTally {
   #candidates = 0;
 
-  readonly #controllerBlocks = new Set<string>();
-
   readonly #markets = new Set<string>();
 
   readonly #controllers = new Set<string>();
 
-  add(market: Market, blockNumber: number, isTargetRegistry: boolean, classification: Classification): void {
+  readonly #targetControllers = new Set<string>();
+
+  add(market: Market, isTargetRegistry: boolean, classification: Classification): void {
     this.#markets.add(market.id);
     const { controller } = market;
     if (controller === null) {
@@ -160,7 +159,7 @@ class DiscoveryTally {
     if (!isTargetRegistry) {
       return;
     }
-    this.#controllerBlocks.add(`${controller}:${String(blockNumber)}`);
+    this.#targetControllers.add(controller);
     this.#candidates += classification === 'activating' ? 1 : 0;
   }
 
@@ -168,9 +167,9 @@ class DiscoveryTally {
     return {
       chain,
       candidates: this.#candidates,
-      controllerBlocks: this.#controllerBlocks.size,
       markets: this.#markets.size,
       controllers: this.#controllers.size,
+      targetControllers: this.#targetControllers.size,
     };
   }
 }
@@ -194,7 +193,7 @@ export function discoveryWorld(parameters: DiscoveryScenario, clock: VirtualCloc
       assets,
       delaySeconds: 0,
     });
-    tally.add(market, blockNumber, kind !== 'foreign', classification);
+    tally.add(market, kind !== 'foreign', classification);
   }
   chain.seal();
   return tally.world(chain);
@@ -458,7 +457,7 @@ export function griefingWorld(parameters: GriefingScenario, operations: number, 
     writeAttack(history, { attack: parameters.attack, market, index, blockNumber });
   }
   chain.seal();
-  return { chain, candidates: parameters.attack === 'discovery-flood' ? 0 : operations };
+  return { chain };
 }
 
 function writeAttack(

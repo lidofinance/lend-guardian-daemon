@@ -198,7 +198,7 @@ export function runScenario(scenario: Scenario, clock: VirtualClock, presetName:
   }
 }
 
-// ─── Discovery: supply logs in chunks, controller bindings and paired classification reads.
+// ─── Discovery: supply logs in chunks, controller bindings and lifecycle logs in chunks.
 
 async function runDiscovery(parameters: DiscoveryScenario, context: RunContext): Promise<RunReport> {
   const built = buildWorld(() => discoveryWorld(parameters, context.clock, context.seed));
@@ -211,20 +211,17 @@ async function runDiscovery(parameters: DiscoveryScenario, context: RunContext):
     const discovered = await harness.phases.time('discovery', () => harness.guardian.discoverCandidatePositions(plan));
     const candidates = discovered.all().length;
     const { world } = built;
+    const chunks = Math.ceil(parameters.rangeBlocks / parameters.maxLogBlockRange);
     return {
       outcome: 'discovered',
       counts: { supplies: parameters.supplies, candidates },
       checks: [
         check('candidate positions', world.candidates, candidates),
+        check('core log chunks', chunks, harness.rpc.count('discovery', 'eth_getLogs:core-range')),
         check(
-          'core log chunks',
-          Math.ceil(parameters.rangeBlocks / parameters.maxLogBlockRange),
-          harness.rpc.count('discovery', 'eth_getLogs:core-range'),
-        ),
-        check(
-          'controller block reads',
-          world.controllerBlocks,
-          harness.rpc.count('discovery', 'eth_getLogs:controller-block'),
+          'controller log chunks',
+          world.targetControllers * chunks,
+          harness.rpc.count('discovery', 'eth_getLogs:controller-range'),
         ),
         check('market controller reads', world.markets, harness.rpc.count('discovery', 'eth_call:marketController')),
         check(
@@ -769,8 +766,9 @@ async function runGriefing(parameters: GriefingScenario, context: RunContext): P
   };
 }
 
+/** Only kept lots stay candidates: discovery discards dust and lots withdrawn in full. */
 function expectedCandidates(attack: GriefingAttack, operations: number): number {
-  return attack === 'discovery-flood' ? 0 : operations;
+  return attack === 'report-flood' ? operations : 0;
 }
 
 /** The probes that bracket a Guardian's capacity, and how many the search ran. */

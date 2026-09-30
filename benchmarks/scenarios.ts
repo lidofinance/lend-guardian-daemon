@@ -170,7 +170,7 @@ export interface DaemonScenario {
 
 /**
  * - `discovery-flood`: dust deposits the attacker withdraws at once, so one deposit's capital repeats;
- * - `candidate-flood`: lots on new addresses, withdrawn in full, each a position the scan must walk;
+ * - `candidate-flood`: lots on new addresses, withdrawn in full, which discovery discards before any walk;
  * - `report-flood`: lots on new addresses that stay, each a target screening reports as suspect.
  */
 export type GriefingAttack = 'discovery-flood' | 'candidate-flood' | 'report-flood';

@@ -249,11 +249,6 @@ interface RangeFilter {
   readonly toBlock: number;
 }
 
-interface BlockFilter {
-  readonly address: Address;
-  readonly blockHash: Bytes32;
-}
-
 interface RegistryWrite {
   readonly method: RegistryMethod;
   readonly accounts: number;
@@ -279,8 +274,6 @@ export class SyntheticChain {
   readonly #logsByAddress = new Map<Address, StoredLog[]>();
 
   readonly #logsByTopic = new Map<string, StoredLog[]>();
-
-  readonly #logsByBlock = new Map<number, StoredLog[]>();
 
   readonly #nextLogIndex = new Map<number, number>();
 
@@ -349,7 +342,6 @@ export class SyntheticChain {
     const log: StoredLog = { blockNumber: input.blockNumber, logIndex, topics: input.topics, record, bytes };
     appendTo(this.#logsByAddress, record.address, log);
     appendTo(this.#logsByTopic, topicKey(record.address, input.topics[1]), log);
-    appendTo(this.#logsByBlock, input.blockNumber, log);
     this.#storedLogs += 1;
     this.#storedBytes += bytes;
   }
@@ -372,11 +364,7 @@ export class SyntheticChain {
 
   /** Order the indexes and start the head at `startHead`; generation time does not advance it. */
   seal(): void {
-    for (const logs of [
-      ...this.#logsByAddress.values(),
-      ...this.#logsByTopic.values(),
-      ...this.#logsByBlock.values(),
-    ]) {
+    for (const logs of [...this.#logsByAddress.values(), ...this.#logsByTopic.values()]) {
       logs.sort(compareLogs);
     }
     this.#clockSlotsAtSeal = this.#clock.slots();
@@ -439,7 +427,7 @@ export class SyntheticChain {
       case 'eth_call':
         return this.#callAnswer(params);
       case 'eth_getLogs':
-        return this.#logsAnswer(params[0]);
+        return this.#logsAnswer(logFilterOf(params[0]));
       case 'eth_getTransactionReceipt':
         return this.#receiptAnswer(params[0]);
       default:
@@ -580,15 +568,7 @@ export class SyntheticChain {
     return [...(this.#flags.get(flagKey(marketId, borrower)) ?? [])];
   }
 
-  #logsAnswer(filter: unknown): Answer {
-    const parsed = logFilterOf(filter);
-    if ('blockHash' in parsed) {
-      return this.#blockLogsAnswer(parsed);
-    }
-    return this.#rangeLogsAnswer(parsed);
-  }
-
-  #rangeLogsAnswer(filter: RangeFilter): Answer {
+  #logsAnswer(filter: RangeFilter): Answer {
     if (filter.toBlock > this.head()) {
       throw new Error('The log range extends beyond the synthetic head');
     }
@@ -607,12 +587,6 @@ export class SyntheticChain {
       `eth_getLogs:${this.#roleOf(filter.address)}-range`,
       filter.toBlock - filter.fromBlock + 1,
     );
-  }
-
-  #blockLogsAnswer(filter: BlockFilter): Answer {
-    const blockNumber = this.#canonicalNumberOf(filter.blockHash);
-    const logs = (this.#logsByBlock.get(blockNumber) ?? []).filter((log) => log.record.address === filter.address);
-    return this.#logListAnswer(logs, `eth_getLogs:${this.#roleOf(filter.address)}-block`, 0);
   }
 
   /** The narrowest index for a filter: by address and second topic when the filter fixes one. */
@@ -855,16 +829,12 @@ function decodedCall(data: Hex): { readonly name: string; readonly args: readonl
   return { name: item.name, args: decodeAbiParameters(item.inputs, `0x${data.slice(10)}`) };
 }
 
-function logFilterOf(value: unknown): RangeFilter | BlockFilter {
+function logFilterOf(value: unknown): RangeFilter {
   if (!isRecord(value)) {
     throw new TypeError('eth_getLogs needs a filter object');
   }
-  const address = lower(hexOf(value.address));
-  if (value.blockHash !== undefined) {
-    return { address, blockHash: hexOf(value.blockHash) };
-  }
   return {
-    address,
+    address: lower(hexOf(value.address)),
     topics: topicFilterOf(value.topics),
     fromBlock: quantityOf(value.fromBlock),
     toBlock: quantityOf(value.toBlock),
