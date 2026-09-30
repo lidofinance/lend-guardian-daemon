@@ -29,7 +29,9 @@ const RETRY_INTERVAL_MS = 5 * 60_000;
 const REPORT_BLOCK_LAG = 2;
 const FLAGGER_READ_CONCURRENCY = 8;
 const HISTORY_READ_CONCURRENCY = 8;
-const INTER_BATCH_CONFIRMATION_BLOCKS = 2;
+// A report that a reorg drops is sent again after the shared wait, so a batch waits only for its inclusion.
+const INTER_BATCH_CONFIRMATION_BLOCKS = 1;
+const MAX_REPORT_ATTEMPTS = 3;
 const CONFIRMATION_POLL_INTERVAL_MS = 12_000;
 // A report costs up to about 156,000 gas per borrower, so 50 borrowers stay under half of the
 // 16,777,216 gas one transaction may use.
@@ -194,6 +196,7 @@ function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
     flaggerReadConcurrency: FLAGGER_READ_CONCURRENCY,
     historyReadConcurrency: HISTORY_READ_CONCURRENCY,
     interBatchConfirmationBlocks: INTER_BATCH_CONFIRMATION_BLOCKS,
+    maxReportAttempts: MAX_REPORT_ATTEMPTS,
     confirmationPollIntervalMs: CONFIRMATION_POLL_INTERVAL_MS,
     maxSignalBatchSize: MAX_SIGNAL_BATCH_SIZE,
     idleHeartbeatInterval: IDLE_HEARTBEAT_INTERVAL_SECONDS,

@@ -253,17 +253,16 @@ test('a plan invalidated during the shared confirmation wait returns stale', asy
   assert.deepEqual(confirmedAt, []);
 });
 
-test('a report reorged while later batches land cannot complete the shared confirmation', async () => {
+test('a report reorged while later batches land is sent again before the heartbeat', async () => {
   const { submitter, state, broadcasts, confirmedAt } = batches();
   const checkPlan: CheckPlan = () => {
     state.isFirstReorged = broadcasts.length === 3;
     return Promise.resolve(null);
   };
-  assert.deepEqual(await submitter.sendSuspects(targets(3), DEPTH, checkPlan), {
-    kind: 'stale',
-    reason: 'report-no-longer-confirmed',
-  });
-  assert.deepEqual(confirmedAt, []);
+  const outcome = await submitter.sendSuspects(targets(3), DEPTH, checkPlan);
+  assert.ok(Array.isArray(outcome), 'the heartbeat follows the reports');
+  assert.equal(broadcasts.length, 4, 'the reorged report is sent once more');
+  assert.equal(confirmedAt.length, 3, 'each report is confirmed once');
 });
 
 test('a failing plan check aborts before broadcasting a batch', async () => {

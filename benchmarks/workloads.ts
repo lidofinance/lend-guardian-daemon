@@ -112,7 +112,7 @@ const DEFAULT_SETTINGS: GuardianSettings = {
   historyReadConcurrency: 8,
   maxSignalBatchSize: 50,
   txConfirmationBlocks: 12,
-  interBatchConfirmationBlocks: 2,
+  interBatchConfirmationBlocks: 1,
   inclusionBlocks: 1,
   rpcLatency: NO_LATENCY,
   providerProfile: undefined,
@@ -344,7 +344,7 @@ const FAULT_OUTCOMES: Readonly<Record<SubmissionFault, string>> = {
   'reorg-after-middle': 'stale:report-block-reorged',
   'reorg-after-last': 'stale:report-block-reorged',
   'age-out-after-middle': 'stale:report-block-aged-out',
-  'receipt-lost-after-last': 'stale:report-no-longer-confirmed',
+  'receipt-lost-after-last': 'attested',
 };
 
 async function runReports(parameters: ReportsScenario, context: RunContext): Promise<RunReport> {
@@ -493,7 +493,7 @@ const CYCLE_OUTCOMES: Readonly<Record<Exclude<CycleProfile, 'steady-state'>, str
   'rpc-latency': 'attested',
   'log-failure': 'error',
   'reorg-before-heartbeat': 'stale:report-block-reorged',
-  'lost-confirmation': 'stale:report-no-longer-confirmed',
+  'lost-confirmation': 'attested',
   'restart-after-stale': 'attested',
 };
 

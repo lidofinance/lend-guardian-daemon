@@ -136,9 +136,12 @@ function afterInclusion(change: (node: FakeNode, hash: TxHash) => void): AfterRe
   };
 }
 
-for (const kind of ['missing', 'reverted', 'relocated', 'orphaned', 'wrong-transaction'] as const) {
-  test(`a ${kind} report receipt prevents heartbeat`, async () => {
+for (const kind of ['missing', 'reverted', 'relocated', 'wrong-transaction'] as const) {
+  test(`a ${kind} report receipt is sent again before heartbeat`, async () => {
     const after = afterInclusion((node, hash) => {
+      if (hash !== node.sent.transactions[0]?.hash) {
+        return;
+      }
       if (kind === 'missing') {
         node.setReceipt(hash, null);
         return;
@@ -150,23 +153,46 @@ for (const kind of ['missing', 'reverted', 'relocated', 'orphaned', 'wrong-trans
         blockHash: blockAt(number).hash,
         status: kind === 'reverted' ? 'reverted' : 'success',
       });
-      if (kind === 'orphaned') {
-        node.reorgBlock(number);
-      }
     });
     const { guardian, screened, sent } = await submitOver(ONE_DUE, 'flag', after);
-    if (kind === 'orphaned') {
-      // Delivery now rejects this before Guardian reaches the shared confirmation wait.
-      await assert.rejects(guardian.signalAndHeartbeat(screened), {
-        message: 'Transaction receipt is not canonical',
-      });
-    } else {
-      assert.deepEqual(await guardian.signalAndHeartbeat(screened), {
-        kind: 'stale',
-        reason: 'report-no-longer-confirmed',
-      });
-    }
-    assert.deepEqual(sent.calls, ['flags']);
+    assert.equal((await guardian.signalAndHeartbeat(screened)).kind, 'attested');
+    assert.deepEqual(sent.calls, ['flags', 'flags', 'heartbeat']);
+  });
+}
+
+test('an orphaned report receipt is refused by delivery before the shared wait', async () => {
+  const after = afterInclusion((node, hash) => {
+    node.setReceipt(hash, {
+      transactionHash: hash,
+      blockNumber: HEAD - 20,
+      blockHash: blockAt(HEAD - 20).hash,
+      status: 'success',
+    });
+    node.reorgBlock(HEAD - 20);
+  });
+  const { guardian, screened, sent } = await submitOver(ONE_DUE, 'flag', after);
+  await assert.rejects(guardian.signalAndHeartbeat(screened), {
+    message: 'Transaction receipt is not canonical',
+  });
+  assert.deepEqual(sent.calls, ['flags']);
+});
+
+for (const maxReportAttempts of [undefined, 1] as const) {
+  const passes = maxReportAttempts ?? 3;
+  test(`a report lost on each of ${passes} passes leaves the attempt stale`, async () => {
+    const after = afterInclusion((node, hash) => {
+      node.setReceipt(hash, null);
+    });
+    const tuning = maxReportAttempts === undefined ? {} : { maxReportAttempts };
+    const { guardian, screened, sent } = await submitOver(ONE_DUE, 'flag', after, tuning);
+    assert.deepEqual(await guardian.signalAndHeartbeat(screened), {
+      kind: 'stale',
+      reason: 'report-no-longer-confirmed',
+    });
+    assert.deepEqual(
+      sent.calls,
+      Array.from({ length: passes }, () => 'flags'),
+    );
   });
 }
 
