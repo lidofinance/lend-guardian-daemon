@@ -4,11 +4,12 @@ import { encodeAbiParameters, getAbiItem, pad, toEventSelector } from 'viem';
 import { MARKET_CONTROLLER_ABI } from '../../abi/MarketController.abi.ts';
 import { SUPPLY_COLLATERAL_ABI } from '../../abi/Core.abi.ts';
 import { BaseRpcProvider } from '../../src/chain/base-rpc-provider.ts';
-import type { BlockLogFilter, ChainLog, LogFilter } from '../../src/chain/rpc.ts';
+import type { ChainLog, LogFilter } from '../../src/chain/rpc.ts';
 import { Markets } from '../../src/contracts/markets.ts';
 import { blockAt, BORROWER, CONTROLLER, CORE, MARKET } from './fake-node.ts';
 
 const BLOCK = blockAt(100_000);
+const WINDOW = { from: blockAt(99_000), to: blockAt(101_000) };
 const SUPPLY = {
   marketId: MARKET,
   borrower: BORROWER,
@@ -34,7 +35,7 @@ const CLASSIFICATION: ChainLog = {
 
 /** Deliberately return supplied evidence regardless of the query to exercise the contract boundary. */
 class EvidenceProvider extends BaseRpcProvider {
-  readonly filters: (LogFilter | BlockLogFilter)[] = [];
+  readonly filters: LogFilter[] = [];
 
   readonly #logs: ChainLog[];
 
@@ -46,7 +47,7 @@ class EvidenceProvider extends BaseRpcProvider {
     this.#logs = logs;
   }
 
-  override getLogs(filter: LogFilter | BlockLogFilter): Promise<ChainLog[]> {
+  override getLogs(filter: LogFilter): Promise<ChainLog[]> {
     this.filters.push(filter);
     return Promise.resolve(this.#logs);
   }
@@ -54,10 +55,42 @@ class EvidenceProvider extends BaseRpcProvider {
 
 test('supply classification accepts the adjacent controller event in the same transaction and block', async () => {
   const markets = new Markets(new EvidenceProvider([CLASSIFICATION]), { address: CORE, deploymentBlock: 1_000 });
-  assert.deepEqual(await markets.activationBefore(SUPPLY, CONTROLLER), {
+  assert.deepEqual(await markets.activationBefore(SUPPLY, CONTROLLER, WINDOW), {
     blockNumber: BLOCK.number,
     position: { dust: 0n, activating: 5n, activatingStart: BLOCK.timestamp, activatingDelay: 60 },
   });
+});
+
+test("supplies share one read of their controller's lifecycle events over the window", async () => {
+  const later = { ...SUPPLY, blockHash: blockAt(100_500).hash, transactionHash: blockAt(500_001).hash };
+  const provider = new EvidenceProvider([
+    CLASSIFICATION,
+    { ...CLASSIFICATION, blockHash: later.blockHash, blockNumber: 100_500n, transactionHash: later.transactionHash },
+  ]);
+  const markets = new Markets(provider, { address: CORE, deploymentBlock: 1_000 });
+  const activations = await Promise.all([
+    markets.activationBefore(SUPPLY, CONTROLLER, WINDOW),
+    markets.activationBefore(later, CONTROLLER, WINDOW),
+  ]);
+  assert.deepEqual(
+    activations.map((activation) => activation?.blockNumber),
+    [BLOCK.number, 100_500],
+  );
+  assert.deepEqual(provider.filters, [
+    {
+      address: CONTROLLER,
+      topics: [
+        [
+          toEventSelector(getAbiItem({ abi: MARKET_CONTROLLER_ABI, name: 'CollateralDusted' })),
+          toEventSelector(getAbiItem({ abi: MARKET_CONTROLLER_ABI, name: 'CollateralActivating' })),
+          toEventSelector(getAbiItem({ abi: MARKET_CONTROLLER_ABI, name: 'CollateralActivated' })),
+          toEventSelector(getAbiItem({ abi: MARKET_CONTROLLER_ABI, name: 'CollateralDrained' })),
+        ],
+      ],
+      fromBlock: WINDOW.from.number,
+      toBlock: WINDOW.to.number,
+    },
+  ]);
 });
 
 const INVALID_CLASSIFICATIONS: Readonly<Record<string, Partial<ChainLog>>> = {
@@ -74,7 +107,9 @@ for (const [reason, fields] of Object.entries(INVALID_CLASSIFICATIONS)) {
       address: CORE,
       deploymentBlock: 1_000,
     });
-    await assert.rejects(markets.activationBefore(SUPPLY, CONTROLLER), { reason: 'supply-without-controller-event' });
+    await assert.rejects(markets.activationBefore(SUPPLY, CONTROLLER, WINDOW), {
+      reason: 'supply-without-controller-event',
+    });
   });
 }
 
@@ -83,7 +118,9 @@ test('supply classification rejects duplicate adjacent events', async () => {
     address: CORE,
     deploymentBlock: 1_000,
   });
-  await assert.rejects(markets.activationBefore(SUPPLY, CONTROLLER), { reason: 'supply-without-controller-event' });
+  await assert.rejects(markets.activationBefore(SUPPLY, CONTROLLER, WINDOW), {
+    reason: 'supply-without-controller-event',
+  });
 });
 
 const ACTIVATION = {

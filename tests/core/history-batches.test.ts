@@ -1,6 +1,6 @@
 // Discovery and reconstruction read the history in bounded batches: the limit, the order of what they
-// return, one read of a market's controller and registry, and the stop after a failed read. What each
-// supply or walk decides is covered by reconstruct.test.ts.
+// return, one controller, registry and classification read per market, and the stop after a failed read.
+// What each supply or walk decides is covered by reconstruct.test.ts.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setImmediate } from 'node:timers/promises';
@@ -9,13 +9,13 @@ import type { Hex } from 'viem';
 import { SUPPLY_COLLATERAL_ABI } from '../../abi/Core.abi.ts';
 import { MARKET_CONTROLLER_ABI } from '../../abi/MarketController.abi.ts';
 import { BaseRpcProvider } from '../../src/chain/base-rpc-provider.ts';
-import type { BlockLogFilter, ChainLog, LogFilter } from '../../src/chain/rpc.ts';
-import type { Address, BlockRef } from '../../src/common/types.ts';
+import type { ChainLog, LogFilter } from '../../src/chain/rpc.ts';
+import type { Address, BlockRef, MarketId } from '../../src/common/types.ts';
 import type { Guardian } from '../../src/core/guardian.ts';
 import { Discovered } from '../../src/core/outcomes.ts';
 import type { ScanPlan } from '../../src/core/outcomes.ts';
 import type { PositionKey } from '../../src/core/types.ts';
-import { blockAt, CONTROLLER, CORE, MARKET, REGISTRY } from './fake-node.ts';
+import { blockAt, CONTROLLER, CORE, REGISTRY } from './fake-node.ts';
 import { guardianOver } from './setup.ts';
 
 const HEAD = 200_000;
@@ -31,10 +31,16 @@ function borrowerAt(index: number): Address {
   return padHex(numberToHex(index + 1), { size: 20 });
 }
 
+/** The market of position `index` among `markets` markets, all of one controller. */
+function marketAt(index: number, markets: number): MarketId {
+  return padHex(numberToHex((index % markets) + 1), { size: 32 });
+}
+
+/** One position in each of `count` markets. */
 function positionsFor(count: number): PositionKey[] {
   return Array.from({ length: count }, (_unused, index) => ({
     controller: CONTROLLER,
-    marketId: MARKET,
+    marketId: marketAt(index, count),
     borrower: borrowerAt(index),
   }));
 }
@@ -62,14 +68,14 @@ function activation(index: number): ChainLog {
 }
 
 /** The core supply paired with the activation: the same transaction, the next log. */
-function supply(index: number): ChainLog {
+function supply(index: number, markets: number): ChainLog {
   return {
     ...activation(index),
     address: CORE,
     logIndex: 5,
     topics: [
       toEventSelector(getAbiItem({ abi: SUPPLY_COLLATERAL_ABI, name: 'SupplyCollateral' })),
-      MARKET,
+      marketAt(index, markets),
       pad(borrowerAt(index)),
       pad(borrowerAt(index)),
     ],
@@ -83,46 +89,58 @@ interface HeldRead {
 }
 
 /**
- * A node for `count` positions of one market. The discovery window, the market's bindings and the
- * paired supplies answer at once; each supply's classification read and each position's lifecycle
- * walk waits until the test answers it.
+ * A node for `count` positions spread over `markets` markets of one controller. The discovery window,
+ * the controller's registry and classifications and the paired supplies answer at once; each market's
+ * controller read and each position's lifecycle walk waits until the test answers it.
  */
 class HistoryNode extends BaseRpcProvider {
   readonly held: HeldRead[] = [];
 
   readonly calledContracts: Address[] = [];
 
+  /** The contract each log read asked, in order. */
+  readonly logReads: Address[] = [];
+
   readonly #count: number;
 
-  constructor(count: number) {
+  readonly #markets: number;
+
+  constructor(count: number, markets = count) {
     super({
       maxLogBlockRange: 1_000_000,
       request: (): Promise<never> => Promise.reject(new Error('Unexpected RPC request')),
     });
     this.#count = count;
+    this.#markets = markets;
   }
 
   override getBlock(number?: number): Promise<BlockRef> {
     return Promise.resolve(blockAt(number ?? HEAD));
   }
 
-  /** The core names the controller; the controller names this Guardian's registry. */
+  /**
+   * The core names each market's controller once the test answers; the controller names this
+   * Guardian's registry.
+   */
   override call(to: Address): Promise<Hex> {
     this.calledContracts.push(to);
-    const answer = to.toLowerCase() === CORE.toLowerCase() ? CONTROLLER : REGISTRY;
-    return Promise.resolve(encodeAbiParameters([{ type: 'address' }], [answer]));
+    if (to.toLowerCase() === CORE.toLowerCase()) {
+      return this.#hold(encodeAbiParameters([{ type: 'address' }], [CONTROLLER]));
+    }
+    return Promise.resolve(encodeAbiParameters([{ type: 'address' }], [REGISTRY]));
   }
 
-  override getLogs(filter: LogFilter | BlockLogFilter): Promise<ChainLog[]> {
-    if ('blockHash' in filter) {
-      const index = this.#indexWhere((candidate) => blockAt(100_000 + candidate).hash === filter.blockHash);
-      return this.#hold([activation(index)]);
+  override getLogs(filter: LogFilter): Promise<ChainLog[]> {
+    this.logReads.push(filter.address);
+    if (filter.address.toLowerCase() === CONTROLLER.toLowerCase()) {
+      return Promise.resolve(Array.from({ length: this.#count }, (_unused, index) => activation(index)));
     }
     const borrower = filter.topics?.[3];
     if (borrower === undefined) {
-      return Promise.resolve(Array.from({ length: this.#count }, (_unused, index) => supply(index)));
+      return Promise.resolve(Array.from({ length: this.#count }, (_unused, index) => supply(index, this.#markets)));
     }
-    return Promise.resolve([supply(this.#indexWhere((candidate) => pad(borrowerAt(candidate)) === borrower))]);
+    const index = this.#indexWhere((candidate) => pad(borrowerAt(candidate)) === borrower);
+    return Promise.resolve([supply(index, this.#markets)]);
   }
 
   override async *logBatches(filter: LogFilter): AsyncGenerator<ChainLog[]> {
@@ -131,11 +149,11 @@ class HistoryNode extends BaseRpcProvider {
     yield await this.#hold([activation(index)]);
   }
 
-  #hold(logs: ChainLog[]): Promise<ChainLog[]> {
+  #hold<Result>(result: Result): Promise<Result> {
     return new Promise((resolve, reject) => {
       this.held.push({
         answer: () => {
-          resolve(logs);
+          resolve(result);
         },
         fail: reject,
       });
@@ -217,17 +235,21 @@ for (const [phase, run] of Object.entries(PHASES)) {
   });
 }
 
-test("supplies classified at once share one read of their market's controller and registry", async () => {
-  const node = new HistoryNode(3);
+test('supplies of one market classified at once share one controller, registry and classification read', async () => {
+  const node = new HistoryNode(3, 1);
   const discovery = guardianWith(node, 3).discoverCandidatePositions(PLAN);
   await setImmediate();
-  assert.equal(node.held.length, 3);
-  for (const read of node.held) {
-    read.answer();
-  }
-  await discovery;
+  const [controllerRead] = node.held;
+  assert.ok(controllerRead !== undefined);
+  assert.equal(node.held.length, 1);
+  controllerRead.answer();
+  assert.equal((await discovery).all().length, 3);
   assert.deepEqual(
     node.calledContracts.map((contract) => contract.toLowerCase()),
+    [CORE.toLowerCase(), CONTROLLER.toLowerCase()],
+  );
+  assert.deepEqual(
+    node.logReads.map((contract) => contract.toLowerCase()),
     [CORE.toLowerCase(), CONTROLLER.toLowerCase()],
   );
 });

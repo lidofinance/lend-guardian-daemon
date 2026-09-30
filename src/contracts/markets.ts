@@ -7,7 +7,6 @@ import {
   getAbiItem,
   isAddressEqual,
   pad,
-  parseEventLogs,
   toEventSelector,
   zeroAddress,
 } from 'viem';
@@ -16,9 +15,9 @@ import { MARKET_CONTROLLER_ABI } from '../../abi/MarketController.abi.ts';
 import { CORE_ABI, SUPPLY_COLLATERAL_ABI, SUPPLY_COLLATERAL_TOPICS } from '../../abi/Core.abi.ts';
 import { byLogPosition } from '../chain/log-order.ts';
 import type { LogPosition } from '../chain/log-order.ts';
-import type { RpcProvider, ChainLog } from '../chain/rpc.ts';
+import type { RpcProvider } from '../chain/rpc.ts';
 import { decodeLogs } from './decode-logs.ts';
-import type { ScanPlan } from '../core/outcomes.ts';
+import type { BlockRange, ScanPlan } from '../core/outcomes.ts';
 import type { PositionKey, SupplyAnchor } from '../core/types.ts';
 import { GuardianStop } from '../core/stop.ts';
 import { lower } from '../common/types.ts';
@@ -82,6 +81,14 @@ type SupplyCollateralLog = ParseEventLogsReturnType<typeof SUPPLY_COLLATERAL_ABI
 /** One controller lifecycle event as viem decodes it. */
 type LifecycleLog = ParseEventLogsReturnType<typeof MARKET_CONTROLLER_ABI, undefined, true>[number];
 
+/** A controller's lifecycle events in a discovery window. */
+interface WindowEvents {
+  /** Every event by its transaction, where the supply pairing looks for the log before the supply. */
+  readonly byTransaction: ReadonlyMap<TxHash, readonly LifecycleLog[]>;
+  /** Each borrower's newest event, whose position is the borrower's at the window's last block. */
+  readonly latest: ReadonlyMap<Address, LifecycleLog>;
+}
+
 const LIFECYCLE_TOPICS = [
   toEventSelector(getAbiItem({ abi: MARKET_CONTROLLER_ABI, name: 'CollateralDusted' })),
   toEventSelector(getAbiItem({ abi: MARKET_CONTROLLER_ABI, name: 'CollateralActivating' })),
@@ -100,7 +107,7 @@ const LIFECYCLE_KINDS: Record<LifecycleLog['eventName'], LifecycleEvent['kind']>
  * Reads for [discovery](../../docs/guardian-specification.md#b-discover-candidate-positions)
  * and [reconstruction](../../docs/guardian-specification.md#c-reconstruct-the-contributors).
  * Create one instance per phase call: binding caches belong to that call's report block,
- * and classification logs are cached by controller and historical block hash. No cache crosses calls.
+ * and lifecycle events are cached by controller and discovery window. No cache crosses calls.
  */
 export class Markets {
   readonly #rpc: RpcProvider;
@@ -109,7 +116,7 @@ export class Markets {
   // Pending reads are cached, so supplies classified at once share one read per market and controller.
   readonly #controllers = new Map<MarketId, Promise<Address>>();
   readonly #registries = new Map<Address, Promise<Address>>();
-  readonly #blockLogs = new Map<string, Promise<ChainLog[]>>();
+  readonly #windowEvents = new Map<string, Promise<WindowEvents>>();
 
   constructor(rpc: RpcProvider, deployment: ContractDeployment) {
     this.#rpc = rpc;
@@ -211,15 +218,14 @@ export class Markets {
 
   /**
    * Establish the [supply pairing](../../docs/guardian-specification.md#core-and-controllers-supply-and-activation-events)
-   * from controller logs at the supply's block hash, instead of Appendix B's transaction receipt.
-   * This shares one controller/block read across supplies and avoids loading unrelated receipt logs;
-   * transaction, adjacent log index and borrower still identify the same classification event.
+   * from the controller's lifecycle events in the discovery window, instead of Appendix B's transaction
+   * receipt. One read per controller serves every supply, so supplies do not multiply requests;
+   * transaction, adjacent log index, block hash and borrower still identify the same classification event.
    */
-  async activationBefore(supply: SupplyLog, controller: Address): Promise<Activation | null> {
-    const logs = await this.#logsOf(controller, supply.blockHash);
-    const before = logs.filter(
-      (log) => log.transactionHash === supply.transactionHash && log.logIndex === supply.logIndex - 1,
-    );
+  async activationBefore(supply: SupplyLog, controller: Address, window: BlockRange): Promise<Activation | null> {
+    const { byTransaction } = await this.#readWindowEvents(controller, window);
+    const inTransaction = byTransaction.get(supply.transactionHash) ?? [];
+    const before = inTransaction.filter((log) => log.logIndex === supply.logIndex - 1);
     const log = before.length === 1 ? before[0] : undefined;
     if (log === undefined) {
       throw new GuardianStop('supply-without-controller-event');
@@ -291,7 +297,7 @@ export class Markets {
       return null;
     }
 
-    const activation = await this.activationBefore(supply, controller);
+    const activation = await this.activationBefore(supply, controller, plan.discoveryRange);
     if (activation === null) {
       return null;
     }
@@ -300,6 +306,14 @@ export class Markets {
       return null;
     }
     if (!this.#requiresCurrentCoverage(plan.previousHeartbeatBlock, activation.blockNumber, deadline)) {
+      return null;
+    }
+    // [Scan phase 3](../../docs/guardian-specification.md#scan-cycle) discards a position that is not base-due at
+    // the report block. Its newest event lies in the window with its classification, so a lot withdrawn, activated
+    // or extended since is discarded here without a history walk; the work stays the same.
+    const { latest } = await this.#readWindowEvents(controller, plan.discoveryRange);
+    const current = latest.get(supply.borrower)?.args.position ?? activation.position;
+    if (!this.#isBaseActivationDeadlineReached(current, plan.discoveryRange.to.timestamp)) {
       return null;
     }
     return { controller: lower(controller), marketId: supply.marketId, borrower: supply.borrower };
@@ -449,35 +463,56 @@ export class Markets {
     };
   }
 
-  /** The controller's logs of one block, read once however many of the block's supplies it classified. */
-  #logsOf(controller: Address, blockHash: Bytes32): Promise<ChainLog[]> {
-    const cacheKey = `${controller}:${blockHash}`;
-    const cachedLogs = this.#blockLogs.get(cacheKey);
-    if (cachedLogs !== undefined) {
-      return cachedLogs;
+  /**
+   * The controller's lifecycle events in the window, read once however many supplies they classify. The
+   * window is read by block number like its supplies, so a reorg between the two reads leaves a supply
+   * without its classification and stops the attempt.
+   */
+  #readWindowEvents(controller: Address, window: BlockRange): Promise<WindowEvents> {
+    const cacheKey = `${controller}:${window.from.number}:${window.to.number}`;
+    const cachedEvents = this.#windowEvents.get(cacheKey);
+    if (cachedEvents !== undefined) {
+      return cachedEvents;
     }
 
-    const logs = this.#rpc.getLogs({ address: controller, blockHash });
+    const events = this.#rpc
+      .getLogs({
+        address: controller,
+        topics: [LIFECYCLE_TOPICS],
+        fromBlock: window.from.number,
+        toBlock: window.to.number,
+      })
+      .then((raw) => this.#indexWindowEvents(decodeLogs(MARKET_CONTROLLER_ABI, raw)));
 
-    this.#blockLogs.set(cacheKey, logs);
-    return logs;
+    this.#windowEvents.set(cacheKey, events);
+    return events;
+  }
+
+  /** Every event by its transaction, and each borrower's newest event. */
+  #indexWindowEvents(logs: readonly LifecycleLog[]): WindowEvents {
+    const byTransaction = new Map<TxHash, LifecycleLog[]>();
+    const latest = new Map<Address, LifecycleLog>();
+    for (const log of logs) {
+      byTransaction.set(log.transactionHash, [...(byTransaction.get(log.transactionHash) ?? []), log]);
+      const borrower = lower(log.args.borrower);
+      const newest = latest.get(borrower);
+      if (newest === undefined || byLogPosition(log, newest) > 0) {
+        latest.set(borrower, log);
+      }
+    }
+    return { byTransaction, latest };
   }
 
   /** The activation named by the classification immediately before a supply. */
-  #activationOf(log: ChainLog, borrower: Address): Activation | null {
-    const [classification] = parseEventLogs({
-      abi: MARKET_CONTROLLER_ABI,
-      eventName: ['CollateralDusted', 'CollateralActivating', 'CollateralActivated'],
-      args: { borrower },
-      logs: [log],
-    });
-    if (classification === undefined) {
+  #activationOf(log: LifecycleLog, borrower: Address): Activation | null {
+    const isClassification = log.eventName !== 'CollateralDrained' && isAddressEqual(log.args.borrower, borrower);
+    if (!isClassification) {
       throw new GuardianStop('supply-without-controller-event');
     }
-    if (classification.eventName !== 'CollateralActivating') {
+    if (log.eventName !== 'CollateralActivating') {
       return null;
     }
-    return { position: classification.args.position, blockNumber: Number(log.blockNumber) };
+    return { position: log.args.position, blockNumber: Number(log.blockNumber) };
   }
 
   #supplyOf(log: SupplyCollateralLog): SupplyLog {

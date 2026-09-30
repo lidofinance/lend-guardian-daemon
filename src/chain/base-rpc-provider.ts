@@ -3,15 +3,7 @@ import { hexToBigInt, hexToNumber, numberToHex } from 'viem';
 import type { RpcLog, PublicRpcSchema } from 'viem';
 import type { Address, BlockRef, Bytes32, Hex, TxHash } from '../common/types.ts';
 import { requireInteger } from '../common/validation.ts';
-import type {
-  BlockLogFilter,
-  ChainLog,
-  LogFilter,
-  ReceiptRef,
-  RpcProvider,
-  TransactionReceipt,
-  RpcRequest,
-} from './rpc.ts';
+import type { ChainLog, LogFilter, ReceiptRef, RpcProvider, TransactionReceipt, RpcRequest } from './rpc.ts';
 import { byLogPosition } from './log-order.ts';
 
 type RpcLogFilter = Extract<PublicRpcSchema[number], { Method: 'eth_getLogs' }>['Parameters'][0];
@@ -78,10 +70,7 @@ export class BaseRpcProvider implements RpcProvider {
     };
   }
 
-  async getLogs(filter: LogFilter | BlockLogFilter): Promise<ChainLog[]> {
-    if ('blockHash' in filter) {
-      return this.#logs(filter);
-    }
+  async getLogs(filter: LogFilter): Promise<ChainLog[]> {
     const found: ChainLog[] = [];
     for await (const logs of this.logBatches(filter, 'forward')) {
       found.push(...logs);
@@ -89,20 +78,32 @@ export class BaseRpcProvider implements RpcProvider {
     return found.sort(byLogPosition);
   }
 
-  /** Static inclusive ranges; the consumer can stop a backward walk as soon as it has evidence. */
+  /**
+   * Static inclusive ranges; the consumer can stop a backward walk as soon as it has evidence. A range
+   * whose read fails is read again in halves, down to one block, because a provider's log limit or the
+   * transport's response limit refuses a range that holds too many logs; a block that fails alone
+   * propagates its error.
+   */
   async *logBatches(filter: LogFilter, direction: 'forward' | 'backward'): AsyncGenerator<ChainLog[]> {
-    const ranges = this.#blockRanges(filter.fromBlock, filter.toBlock, direction);
-    for (const [from, to] of ranges) {
-      yield await this.#logs({
-        address: filter.address,
-        ...(filter.topics === undefined
-          ? {}
-          : {
-              topics: filter.topics.map((topic) => (typeof topic === 'string' || topic === null ? topic : [...topic])),
-            }),
-        fromBlock: numberToHex(from),
-        toBlock: numberToHex(to),
-      });
+    // Ranges still to read, the next one last, so the halves of a failed range keep the traversal order.
+    const pending = [...this.#blockRanges(filter.fromBlock, filter.toBlock, direction)].reverse();
+    while (true) {
+      const range = pending.pop();
+      if (range === undefined) {
+        return;
+      }
+      const [from, to] = range;
+      let logs: ChainLog[];
+      try {
+        logs = await this.#rangeLogs(filter, from, to);
+      } catch (error) {
+        if (from === to) {
+          throw error;
+        }
+        pending.push(...halves(from, to, direction));
+        continue;
+      }
+      yield logs;
     }
   }
 
@@ -131,6 +132,15 @@ export class BaseRpcProvider implements RpcProvider {
     }
     const canonical = await this.getBlock(receipt.blockNumber);
     return canonical.hash === receipt.blockHash && head.number - receipt.blockNumber + 1 >= depth;
+  }
+
+  #rangeLogs(filter: LogFilter, from: number, to: number): Promise<ChainLog[]> {
+    return this.#logs({
+      address: filter.address,
+      ...(filter.topics === undefined ? {} : { topics: [...filter.topics] }),
+      fromBlock: numberToHex(from),
+      toBlock: numberToHex(to),
+    });
   }
 
   async #logs(filter: RpcLogFilter): Promise<ChainLog[]> {
@@ -177,4 +187,12 @@ export class BaseRpcProvider implements RpcProvider {
       index += step;
     }
   }
+}
+
+/** The halves of a failed range in the order to push them, so the half read first is popped first. */
+function halves(from: number, to: number, direction: 'forward' | 'backward'): [number, number][] {
+  const middle = from + Math.floor((to - from) / 2);
+  const lower: [number, number] = [from, middle];
+  const upper: [number, number] = [middle + 1, to];
+  return direction === 'forward' ? [upper, lower] : [lower, upper];
 }

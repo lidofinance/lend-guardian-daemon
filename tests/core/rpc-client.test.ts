@@ -51,6 +51,38 @@ test('latest-log search sorts a batch, decodes every returned log and stops befo
   );
 });
 
+test('a refused log range is read again in halves, in the order of the traversal', async () => {
+  const asked: string[] = [];
+  // A node that serves at most two blocks per query.
+  const client = new BaseRpcProvider({
+    maxLogBlockRange: 8,
+    request: rpcRequest((method, params) => {
+      assert.equal(method, 'eth_getLogs');
+      const filter: unknown = params[0];
+      assert.ok(typeof filter === 'object' && filter !== null && 'fromBlock' in filter && 'toBlock' in filter);
+      const from = Number(BigInt(String(filter.fromBlock)));
+      const to = Number(BigInt(String(filter.toBlock)));
+      asked.push(`${String(from)}-${String(to)}`);
+      if (to - from + 1 > 2) {
+        return Promise.reject(new Error('query returned more than 10000 results'));
+      }
+      return Promise.resolve([rawLog(from)]);
+    }),
+  });
+  for (const [direction, expected] of [
+    ['forward', ['1-8', '1-4', '1-2', '3-4', '5-8', '5-6', '7-8']],
+    ['backward', ['1-8', '5-8', '7-8', '5-6', '1-4', '3-4', '1-2']],
+  ] as const) {
+    asked.length = 0;
+    const batches: ChainLog[][] = [];
+    for await (const logs of client.logBatches(FILTER, direction)) {
+      batches.push(logs);
+    }
+    assert.deepEqual(asked, expected);
+    assert.equal(batches.length, 4, direction);
+  }
+});
+
 test('receipt confirmation requires the inclusion block to remain canonical', async () => {
   const transactionHash = padHex('0x99', { size: 32 });
   const receipt = {
@@ -159,7 +191,7 @@ test('missing blocks and pending logs fail while an absent receipt remains null'
     request: rpcRequest(() => Promise.resolve([{ ...rawLog(0), blockHash: null, blockNumber: null }])),
     maxLogBlockRange: 1,
   });
-  await assert.rejects(pending.getLogs({ address: CORE, blockHash: padHex('0x01') }), /RPC log has no mined block/);
+  await assert.rejects(pending.getLogs({ address: CORE, fromBlock: 1, toBlock: 1 }), /RPC log has no mined block/);
 });
 
 test('invalid receipt status is rejected instead of becoming a confirmed result', async () => {

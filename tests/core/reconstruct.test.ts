@@ -234,7 +234,8 @@ test('a due lot yields one anchor, and the supply beside it ends the walk', asyn
   assert.equal(anchor.borrower, BORROWER);
   assert.equal(anchor.marketId, MARKET);
   assert.equal(anchor.logIndex, 5, 'the anchor is the supply, one log after the activation');
-  const lifecycleQueries = node.logQueries.filter((query) => query.address === CONTROLLER);
+  // Discovery's classification reads name no borrower.
+  const lifecycleQueries = node.logQueries.filter((query) => query.address === CONTROLLER && query.topics.length > 1);
   assert.equal(lifecycleQueries.length, 11, 'the walk reads down to the span that holds the lot and no older one');
   for (const query of lifecycleQueries) {
     assert.equal(query.topics[1], padHex(BORROWER, { size: 32 }));
@@ -258,7 +259,7 @@ test('a walk across spans reads back only as far as the dust it traces', async (
     { maxLogBlockRange: SPAN },
   );
   assert.equal(work.anchors, 2, 'the activation and the dust it absorbed are both funding');
-  const lifecycleQueries = node.logQueries.filter((query) => query.address === CONTROLLER);
+  const lifecycleQueries = node.logQueries.filter((query) => query.address === CONTROLLER && query.topics.length > 1);
   assert.equal(lifecycleQueries.length, 12, 'the walk reads down to the span that holds the dust and no older one');
 });
 
@@ -398,7 +399,7 @@ test('a plan whose report block the node no longer holds stops the attempt', asy
 });
 
 test('a controller log served under another block than its supply log stops the attempt', async () => {
-  const reorged: Lot = { ...activation(100_000, 5n, 5n), receiptBlockHash: blockAt(1).hash };
+  const reorged: Lot = { ...activation(100_000, 5n, 5n), controllerBlockHash: blockAt(1).hash };
   await assertStops({ head: HEAD, guardianAddedAt: CORE_DEPLOYED, lots: [reorged] }, 'supply-without-controller-event');
 });
 
@@ -439,7 +440,7 @@ test('a paired supply that does not decode at the activation block stops the att
   );
 });
 
-test('a log range the node refuses is not silently retried with different configuration', async () => {
+test('a log range the node refuses is read again in halves until the node serves every part', async () => {
   const caps: LogsCap[] = [
     { over: SPAN - 1, code: -32005, message: 'query returned more than 10000 results' },
     {
@@ -450,25 +451,19 @@ test('a log range the node refuses is not silently retried with different config
     { over: SPAN - 1, message: 'the range exceeds the limit' },
   ];
   for (const logsCapped of caps) {
-    await assert.rejects(
-      workOf(
-        {
-          head: HEAD,
-          guardianAddedAt: CORE_DEPLOYED,
-          lots: [activation(100_000, 5n, 5n)],
-          logsCapped,
-        },
-        { maxLogBlockRange: SPAN },
-      ),
-      (error: unknown) =>
-        hasCause(
-          error,
-          (candidate) =>
-            candidate instanceof Error &&
-            candidate.message === logsCapped.message &&
-            (logsCapped.code === undefined || ('code' in candidate && candidate.code === logsCapped.code)),
-        ),
+    const { work, node } = await workOf(
+      {
+        head: HEAD,
+        guardianAddedAt: CORE_DEPLOYED,
+        lots: [activation(100_000, 5n, 5n)],
+        logsCapped,
+      },
+      { maxLogBlockRange: SPAN },
     );
+    assertAnchors(work, [[100_000, 5]]);
+    const served = node.logQueries.filter((query) => query.address === CONTROLLER);
+    assert.ok(served.length > 0);
+    assert.ok(served.every((query) => query.toBlock - query.fromBlock + 1 < SPAN));
   }
 });
 
@@ -495,31 +490,28 @@ test('a node that refuses a single-block query stops the cycle', async () => {
   );
 });
 
-test("the controller's logs of a block are read once however many supplies the block holds", async () => {
+test("the controller's lifecycle events are read once for the window however many supplies it holds", async () => {
   const { work, node } = await workOf({
     head: HEAD,
     guardianAddedAt: CORE_DEPLOYED,
-    lots: [activation(100_000, 5n, 5n), { ...activation(100_000, 7n, 7n), logIndex: 8 }],
+    lots: [activation(100_000, 5n, 5n), { ...activation(100_000, 7n, 7n), logIndex: 8 }, activation(150_000, 9n, 9n)],
   });
-  assert.equal(work.positions, 1, 'both supplies are on behalf of one borrower');
-  const byBlock = node.blockLogQueries.filter((query) => query.address === CONTROLLER);
-  assert.equal(byBlock.length, 1, 'one query for the block, not one per supply');
+  assert.equal(work.positions, 1, 'every supply is on behalf of one borrower');
+  const windowQueries = node.logQueries.filter((query) => query.address === CONTROLLER && query.topics.length === 1);
+  assert.equal(windowQueries.length, 1, 'one query for the window, not one per supply or block');
 });
 
-test('a log response the client will not read stops the cycle', async () => {
-  await assert.rejects(
-    workOf(
-      {
-        head: HEAD,
-        guardianAddedAt: CORE_DEPLOYED,
-        lots: [activation(100_000, 5n, 5n)],
-        logsTooLargeOver: SPAN - 1,
-      },
-      { maxLogBlockRange: SPAN },
-    ),
-    (error: unknown) =>
-      hasCause(error, (candidate) => candidate instanceof Error && candidate.name === 'ResponseBodyTooLargeError'),
+test('a log response too large for the client is read again in halves', async () => {
+  const { work } = await workOf(
+    {
+      head: HEAD,
+      guardianAddedAt: CORE_DEPLOYED,
+      lots: [activation(100_000, 5n, 5n)],
+      logsTooLargeOver: SPAN - 1,
+    },
+    { maxLogBlockRange: SPAN },
   );
+  assertAnchors(work, [[100_000, 5]]);
 });
 
 for (const deadlineOffset of [-1, 0, 1]) {
@@ -705,6 +697,31 @@ for (const kind of ['activated', 'drained'] as const) {
       lots: [activation(100_000, 5n, 5n), cleared],
     });
     assertAnchors(work, []);
+  });
+}
+
+for (const kind of ['activated', 'drained'] as const) {
+  test(`a lot ${kind} since its supply is no candidate, so its history is not walked`, async () => {
+    const cleared: Lot = {
+      kind,
+      blockNumber: 110_000,
+      logIndex: 2,
+      amount: 5n,
+      position: { dust: 0n, activating: 0n, activatingStart: 0, activatingDelay: 0 },
+    };
+    const { guardian, node } = guardianOver({
+      head: HEAD,
+      guardianAddedAt: CORE_DEPLOYED,
+      lots: [activation(100_000, 5n, 5n), cleared],
+    });
+    const planned = await guardian.buildScanPlan();
+    assert.ok(planned.kind === 'plan', 'the script should produce a plan');
+    const discovered = await guardian.discoverCandidatePositions(planned);
+    assert.deepEqual(discovered.all(), []);
+    const work = await guardian.reconstructWork(discovered);
+    assert.equal(work.positions, 0);
+    const walks = node.logQueries.filter((query) => query.address === CONTROLLER && query.topics.length > 1);
+    assert.equal(walks.length, 0, 'no history walk for a position discovery discarded');
   });
 }
 
