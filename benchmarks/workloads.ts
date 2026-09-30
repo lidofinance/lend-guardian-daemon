@@ -591,7 +591,10 @@ function cycleChecks(
   }
   const isCleanAttestation = outcome === 'attested' && input.run.outcomes.length === 1;
   if (isCleanAttestation) {
-    checks.push(check('transactions', input.reportTransactions + 1, input.harness.client.deliveries().length));
+    // The report whose receipt the fault drops is sent once more before the heartbeat.
+    const resends = CYCLE_FAULTS[parameters.profile] === 'receipt-lost-after-last' ? 1 : 0;
+    const transactions = input.reportTransactions + resends + 1;
+    checks.push(check('transactions', transactions, input.harness.client.deliveries().length));
     checks.push(heartbeatCheck(input.harness));
   }
   return checks;
