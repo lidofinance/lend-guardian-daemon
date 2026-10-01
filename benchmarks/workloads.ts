@@ -36,7 +36,7 @@ import type { Delivery } from './synthetic-client.ts';
 import {
   BLOCKHASH_LOOKBACK,
   CHAIN_ID,
-  RoundTrips,
+  ProviderQueue,
   SLOT_SECONDS,
   measuredNode,
   providerNode,
@@ -58,6 +58,7 @@ import {
   cycleWorld,
   discoveryWorld,
   griefingWorld,
+  livenessWorld,
   positionAt,
   quietWorld,
   reconstructionWorld,
@@ -98,7 +99,7 @@ interface GuardianSettings {
   readonly interBatchConfirmationBlocks: number;
   readonly inclusionBlocks: number;
   readonly rpcLatency: RpcLatency;
-  /** A public provider's round trips and limits instead of `rpcLatency`, when set. */
+  /** A paid shared provider's delays and log limit instead of `rpcLatency`, when set. */
   readonly providerProfile: ProviderProfile | undefined;
   readonly provider: ProviderPlan;
   readonly onIncluded: ((delivery: Delivery) => void) | undefined;
@@ -635,9 +636,8 @@ interface Probe {
 async function runLiveness(parameters: LivenessScenario, context: RunContext): Promise<RunReport> {
   const window = new ResourceWindow();
   const capacity = await capacityOf(parameters, context);
-  const atCapacity = await submissionProbe(parameters, capacity, context);
-  const beyond =
-    capacity < parameters.maxTargets ? await submissionProbe(parameters, capacity + 1, context) : undefined;
+  const atCapacity = await cycleProbe(parameters, capacity, context);
+  const beyond = capacity < parameters.maxTargets ? await cycleProbe(parameters, capacity + 1, context) : undefined;
   return reportOf(atCapacity.harness, {
     usage: window.close(),
     stats: {},
@@ -660,14 +660,14 @@ async function runLiveness(parameters: LivenessScenario, context: RunContext): P
 
 /** The largest target count that still attests, by bisection: more targets never need fewer blocks. */
 async function capacityOf(parameters: LivenessScenario, context: RunContext): Promise<number> {
-  if ((await submissionProbe(parameters, parameters.maxTargets, context)).outcome === 'attested') {
+  if ((await cycleProbe(parameters, parameters.maxTargets, context)).outcome === 'attested') {
     return parameters.maxTargets;
   }
   let attests = 0;
   let fails = parameters.maxTargets;
   while (fails - attests > 1) {
     const middle = Math.floor((attests + fails) / 2);
-    const probe = await submissionProbe(parameters, middle, context);
+    const probe = await cycleProbe(parameters, middle, context);
     if (probe.outcome === 'attested') {
       attests = middle;
     } else {
@@ -677,22 +677,25 @@ async function capacityOf(parameters: LivenessScenario, context: RunContext): Pr
   return attests;
 }
 
-async function submissionProbe(parameters: LivenessScenario, targets: number, context: RunContext): Promise<Probe> {
-  const chain = quietWorld(context.clock);
+/**
+ * A Guardian's first cycle over `targets` due positions against the modelled provider: it reads every
+ * position's history, screens it at once with the scenario's decision, then reports and attests.
+ */
+async function cycleProbe(parameters: LivenessScenario, targets: number, context: RunContext): Promise<Probe> {
+  // The provider's delays are shorter than a slot, so every probe starts at a slot boundary; otherwise
+  // where in its first slot a probe began could move its outcome near the capacity.
+  context.clock.advanceSlots(1);
+  const chain = livenessWorld(targets, parameters.markets, context.clock);
   const harness = harnessOf(chain, context.clock, {
     ...DEFAULT_SETTINGS,
     maxSignalBatchSize: parameters.maxSignalBatchSize,
     txConfirmationBlocks: parameters.txConfirmationBlocks,
     interBatchConfirmationBlocks: parameters.interBatchConfirmationBlocks,
     inclusionBlocks: parameters.inclusionBlocks,
+    providerProfile: { queue: new ProviderQueue(context.clock), logLimit: undefined },
+    provider: { decide: () => DECISIONS[parameters.decision], latency: { kind: 'virtual', ms: 0 } },
   });
-  const plan = await planOf(harness);
-  const screened = submissionInput(
-    plan,
-    { targets, markets: parameters.markets, decision: parameters.decision },
-    chain,
-  );
-  const result = await settle(() => harness.guardian.signalAndHeartbeat(screened), outcomeOf);
+  const result = await settle(() => harness.guardian.cycle(null), outcomeOf);
   return { targets, harness, outcome: result.outcome };
 }
 
@@ -709,10 +712,13 @@ const MEMORY_LIMIT_MB = 2_800;
 
 const MEMORY_SAMPLE_INTERVAL_MS = 50;
 
-/** Base fees the attacker pays, in gwei: about today's, and a busier chain's. */
-const LOW_BASE_FEE_GWEI = 0.1;
+/**
+ * Mainnet base fees over 30 days of 2026, in gwei: the 10th percentile, which an attacker who waits for
+ * cheap blocks pays, and the median.
+ */
+const CHEAP_BASE_FEE_GWEI = 0.07;
 
-const HIGH_BASE_FEE_GWEI = 0.5;
+const MEDIAN_BASE_FEE_GWEI = 0.35;
 
 const GWEI_PER_ETH = 1e9;
 
@@ -840,12 +846,11 @@ async function griefingProbe(
   context: RunContext,
 ): Promise<GriefingProbe> {
   const world = griefingWorld(parameters, operations, context.clock);
-  const roundTrips = new RoundTrips(context.clock, parameters.roundTripMs);
   let candidates = 0;
   const harness = harnessOf(world.chain, context.clock, {
     ...DEFAULT_SETTINGS,
     providerProfile: {
-      roundTrips,
+      queue: new ProviderQueue(context.clock),
       logLimit: parameters.provider === 'capped' ? PROVIDER_LOG_LIMIT : undefined,
     },
     provider: {
@@ -872,7 +877,6 @@ async function griefingProbe(
     metrics: {
       ...livenessCounts(harness),
       ...harness.rpc.totals(),
-      roundTrips: roundTrips.completed(),
       memoryGrowthMb,
       cycleCpuMs: (cpu.user + cpu.system) / 1_000,
       reportTransactions: transactionCounts(harness.client.deliveries()).reportTransactions,
@@ -901,8 +905,8 @@ function attackCost(attack: GriefingAttack, operations: number): Record<string, 
   const gas = operations * OPERATION_GAS[attack];
   return {
     attackGasMillions: gas / 1e6,
-    costEthLowFee: (gas * LOW_BASE_FEE_GWEI) / GWEI_PER_ETH,
-    costEthHighFee: (gas * HIGH_BASE_FEE_GWEI) / GWEI_PER_ETH,
+    costEthCheapFee: (gas * CHEAP_BASE_FEE_GWEI) / GWEI_PER_ETH,
+    costEthMedianFee: (gas * MEDIAN_BASE_FEE_GWEI) / GWEI_PER_ETH,
     ...(attack === 'report-flood' ? { lotsLocked: operations } : {}),
   };
 }

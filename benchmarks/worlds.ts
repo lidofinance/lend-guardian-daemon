@@ -12,8 +12,8 @@ import type {
   ReconstructionScenario,
 } from './scenarios.ts';
 import { HistoryBuilder, SeededRandom, borrowerAt, controllerAt, marketIdAt } from './synthetic-history.ts';
-import type { Classification, Market } from './synthetic-history.ts';
-import { SyntheticChain, transactionHashOf } from './synthetic-rpc.ts';
+import type { ActivationDelays, Classification, Market } from './synthetic-history.ts';
+import { SyntheticChain, timestampOf, transactionHashOf } from './synthetic-rpc.ts';
 import type { VirtualClock } from './synthetic-rpc.ts';
 
 export const CORE: Address = '0x000000000000000000000000000000000000c0e0';
@@ -38,9 +38,18 @@ export const CYCLE_MARKETS = 10;
 
 const MINIMUM_ACTIVATION = 10n;
 
-/** Base delay of every synthetic lot; lots end at least this many blocks before the report block. */
-const DELAY_SECONDS = 60;
+/**
+ * The controller's delay rule with a cap of two minutes, below the due margin, so every lot a history
+ * writes is due at its report block. The conformance fixture's own cap of an hour would leave dense
+ * histories mostly not yet due.
+ */
+const ACTIVATION_DELAYS: ActivationDelays = {
+  minActivationDelay: 60,
+  maxActivationDelay: 120,
+  maxDelayInflow: 10_000n,
+};
 
+/** Lots end at least this many blocks, four minutes, before the report block, longer than any delay. */
 const DUE_MARGIN_BLOCKS = 20;
 
 /** The previous heartbeat of a steady-state cycle, which covers every supply before it. */
@@ -116,7 +125,7 @@ export function syntheticChain(historyBlocks: number, clock: VirtualClock): Synt
 /** A deployment with a Guardian and no supplies: for phases that take their work directly. */
 export function quietWorld(clock: VirtualClock): SyntheticChain {
   const chain = syntheticChain(HISTORY_BLOCKS, clock);
-  const history = new HistoryBuilder(chain, { minimumActivation: MINIMUM_ACTIVATION });
+  const history = new HistoryBuilder(chain, { minimumActivation: MINIMUM_ACTIVATION, delays: ACTIVATION_DELAYS });
   history.guardianAdded(REPORT_BLOCK);
   chain.seal();
   return chain;
@@ -125,13 +134,13 @@ export function quietWorld(clock: VirtualClock): SyntheticChain {
 /** `supplies` supplies spread over the whole history, for log-heavy transport answers. */
 export function logsWorld(supplies: number, clock: VirtualClock): SyntheticChain {
   const chain = syntheticChain(HISTORY_BLOCKS, clock);
-  const history = new HistoryBuilder(chain, { minimumActivation: MINIMUM_ACTIVATION });
+  const history = new HistoryBuilder(chain, { minimumActivation: MINIMUM_ACTIVATION, delays: ACTIVATION_DELAYS });
   history.guardianAdded(REPORT_BLOCK);
   const market = history.market(0, REGISTRY);
   const firstBlock = chain.layout.coreDeploymentBlock;
   for (let index = 0; index < supplies; index += 1) {
     const blockNumber = firstBlock + Math.floor((index * HISTORY_BLOCKS) / Math.max(1, supplies));
-    history.supply(blockNumber, { market, borrower: borrowerAt(index), assets: MINIMUM_ACTIVATION, delaySeconds: 0 });
+    history.supply(blockNumber, { market, borrower: borrowerAt(index), assets: MINIMUM_ACTIVATION });
   }
   chain.seal();
   return chain;
@@ -149,7 +158,8 @@ class DiscoveryTally {
 
   readonly #targetControllers = new Set<string>();
 
-  add(market: Market, isTargetRegistry: boolean, classification: Classification): void {
+  /** A supply in `market`; it is a candidate when its lot reports to the target registry and is due. */
+  add(market: Market, isTargetRegistry: boolean, isDueLot: boolean): void {
     this.#markets.add(market.id);
     const { controller } = market;
     if (controller === null) {
@@ -160,7 +170,7 @@ class DiscoveryTally {
       return;
     }
     this.#targetControllers.add(controller);
-    this.#candidates += classification === 'activating' ? 1 : 0;
+    this.#candidates += isDueLot ? 1 : 0;
   }
 
   world(chain: SyntheticChain): DiscoveryWorld {
@@ -176,7 +186,7 @@ class DiscoveryTally {
 
 export function discoveryWorld(parameters: DiscoveryScenario, clock: VirtualClock, seed: number): DiscoveryWorld {
   const chain = syntheticChain(parameters.rangeBlocks, clock);
-  const history = new HistoryBuilder(chain, { minimumActivation: MINIMUM_ACTIVATION });
+  const history = new HistoryBuilder(chain, { minimumActivation: MINIMUM_ACTIVATION, delays: ACTIVATION_DELAYS });
   history.guardianAdded(REPORT_BLOCK);
   const markets = marketsOf(history, parameters.markets);
   const foreign = history.market(FOREIGN_MARKET_INDEX, FOREIGN_REGISTRY);
@@ -187,13 +197,12 @@ export function discoveryWorld(parameters: DiscoveryScenario, clock: VirtualCloc
     const market = kind === 'foreign' ? foreign : marketAt(markets, index);
     const blockNumber = supplyBlockAt(index, parameters, chain.layout.coreDeploymentBlock);
     const assets = kind === 'dust' ? dustAssets(random) : MINIMUM_ACTIVATION + BigInt(random.below(1_000));
-    const classification = history.supply(blockNumber, {
-      market,
-      borrower: borrowerAt(index),
-      assets,
-      delaySeconds: 0,
-    });
-    tally.add(market, kind !== 'foreign', classification);
+    const borrower = borrowerAt(index);
+    const classification = history.supply(blockNumber, { market, borrower, assets });
+    // A lot whose delay ends after the report block is not due yet, so discovery leaves it out.
+    const dueAt = history.dueAt({ market, borrower });
+    const isDue = dueAt !== null && dueAt <= timestampOf(REPORT_BLOCK);
+    tally.add(market, kind !== 'foreign', classification === 'activating' && isDue);
   }
   chain.seal();
   return tally.world(chain);
@@ -307,6 +316,21 @@ export function cycleWorld(parameters: CycleScenario, clock: VirtualClock): Cycl
   };
 }
 
+/** `positions` due lots, one per borrower, spread over `markets` markets and the whole discovery window. */
+export function livenessWorld(positions: number, markets: number, clock: VirtualClock): SyntheticChain {
+  const chain = syntheticChain(HISTORY_BLOCKS, clock);
+  writePositions(chain, {
+    pattern: 'single',
+    positions,
+    events: 1,
+    markets,
+    joinedAt: REPORT_BLOCK,
+    lastBlock: REPORT_BLOCK - DUE_MARGIN_BLOCKS,
+  });
+  chain.seal();
+  return chain;
+}
+
 /** Positions written by one builder, which later supplies can extend. */
 interface WrittenPositions {
   readonly written: Written[];
@@ -329,7 +353,7 @@ function writePositions(
 ): WrittenPositions {
   // Dust in `dust-drains` must survive its drains and still sit below the activation minimum.
   const minimumActivation = BigInt(Math.max(Number(MINIMUM_ACTIVATION), shape.events + 10));
-  const history = new HistoryBuilder(chain, { minimumActivation });
+  const history = new HistoryBuilder(chain, { minimumActivation, delays: ACTIVATION_DELAYS });
   history.guardianAdded(shape.joinedAt);
   const markets = marketsOf(history, shape.markets);
   const write = PATTERNS[shape.pattern];
@@ -361,7 +385,6 @@ function writeSteadyState(chain: SyntheticChain, positions: WrittenPositions, pa
       market: marketAt(positions.markets, position),
       borrower: borrowerAt(position),
       assets: positions.minimumActivation,
-      delaySeconds: DELAY_SECONDS,
     });
   }
   return parameters.freshSupplies;
@@ -379,7 +402,6 @@ function supplyAt(input: PatternInput, blockNumber: number, assets: bigint): Cla
     market: input.market,
     borrower: input.borrower,
     assets,
-    delaySeconds: DELAY_SECONDS,
   });
 }
 
@@ -444,7 +466,7 @@ const ATTACKER_INDEX = 10_000_000;
  */
 export function griefingWorld(parameters: GriefingScenario, operations: number, clock: VirtualClock): GriefingWorld {
   const chain = syntheticChain(HISTORY_BLOCKS, clock);
-  const history = new HistoryBuilder(chain, { minimumActivation: MINIMUM_ACTIVATION });
+  const history = new HistoryBuilder(chain, { minimumActivation: MINIMUM_ACTIVATION, delays: ACTIVATION_DELAYS });
   history.guardianAdded(REPORT_BLOCK);
   const [market] = marketsOf(history, 1);
   if (market === undefined) {
@@ -473,7 +495,7 @@ function writeAttack(
   const isDust = operation.attack === 'discovery-flood';
   const borrower = borrowerAt(isDust ? ATTACKER_INDEX : operation.index);
   const assets = isDust ? 1n : MINIMUM_ACTIVATION;
-  history.supply(blockNumber, { market, borrower, assets, delaySeconds: DELAY_SECONDS });
+  history.supply(blockNumber, { market, borrower, assets });
   if (operation.attack !== 'report-flood') {
     history.drain(blockNumber, { market, borrower, amount: assets });
   }

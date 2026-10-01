@@ -184,8 +184,6 @@ export interface GriefingScenario {
   readonly attack: GriefingAttack;
   /** Blocks at the start of the discovery window the operations are spread over. */
   readonly spreadBlocks: number;
-  /** Round trip of every RPC exchange, charged to chain time. */
-  readonly roundTripMs: number;
   /** Whether the provider refuses a log list above 10,000 entries. */
   readonly provider: 'capped' | 'uncapped';
   /** Time the screening service takes to answer, charged to chain time. */
@@ -330,7 +328,6 @@ const GRIEFING: GriefingScenario = {
   family: 'griefing',
   attack: 'discovery-flood',
   spreadBlocks: 10_000,
-  roundTripMs: 50,
   provider: 'capped',
   screeningLatencyMs: 0,
   maxOperations: 1_000_000,
@@ -435,6 +432,8 @@ function fullLiveness(): LivenessScenario[] {
     { ...LIVENESS, interBatchConfirmationBlocks: 1 },
     { ...LIVENESS, inclusionBlocks: 2 },
     ...[50, 100].map((maxSignalBatchSize) => ({ ...LIVENESS, maxSignalBatchSize })),
+    // The daemon's own batch size and wait between batches.
+    { ...LIVENESS, maxSignalBatchSize: 50, interBatchConfirmationBlocks: 1 },
   ];
 }
 
@@ -462,13 +461,11 @@ function fullDaemon(): DaemonScenario[] {
 }
 
 /**
- * Every attack at both round trips and against both providers; the discovery flood also spread over
+ * Every attack against a provider with and without a log limit; the discovery flood also spread over
  * the window. The report flood's screening answers in 290 seconds, the longest the daemon waits.
  */
 function fullGriefing(): GriefingScenario[] {
-  const conditions = [50, 100].flatMap((roundTripMs) =>
-    (['capped', 'uncapped'] as const).map((provider) => ({ ...GRIEFING, roundTripMs, provider })),
-  );
+  const conditions = (['capped', 'uncapped'] as const).map((provider) => ({ ...GRIEFING, provider }));
   return conditions.flatMap((condition) => [
     condition,
     { ...condition, spreadBlocks: 50_400 },

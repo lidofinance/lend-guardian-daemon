@@ -100,6 +100,11 @@ export class VirtualClock {
     this.#realTimeScale = options.realTimeScale;
   }
 
+  /** Milliseconds of chain time since the clock started. */
+  now(): number {
+    return this.#elapsedMs();
+  }
+
   /** Whole slots elapsed since the clock started. */
   slots(): number {
     return Math.floor(this.#elapsedMs() / this.#slotMs);
@@ -128,47 +133,61 @@ export class VirtualClock {
 }
 
 /**
- * Round trips to a remote node, charged to the chain clock. Requests sent together share one round
- * trip, which ends once the process has sent all it can: a batch of concurrent reads costs one round
- * trip and a sequence of dependent reads costs one per read.
+ * Delays of a paid shared provider, modelled on one we measured: a log read that finds nothing is the
+ * slowest, one that returns logs takes a fraction of that, and any other request one network exchange.
  */
-export class RoundTrips {
+const SHARED_PROVIDER_DELAYS = { emptyLogReadMs: 2_000, logReadMs: 400, otherMs: 50 } as const;
+
+/**
+ * Requests to a remote provider, each answered after its own delay of chain time. Once the process
+ * has sent all it can, the clock moves to the next answer, so requests in flight overlap and a slow
+ * answer holds up only the work that waits for it.
+ */
+export class ProviderQueue {
   readonly #clock: VirtualClock;
 
-  readonly #roundTripMs: number;
+  #pending: { readonly answerAt: number; readonly resolve: () => void }[] = [];
 
-  #waiting: (() => void)[] = [];
+  #isScheduled = false;
 
-  #completed = 0;
-
-  constructor(clock: VirtualClock, roundTripMs: number) {
+  constructor(clock: VirtualClock) {
     this.#clock = clock;
-    this.#roundTripMs = roundTripMs;
   }
 
-  /** Settles when the round trip that carries this request ends. */
-  wait(): Promise<void> {
+  /** Settles when the answer to a request sent now arrives, `delayMs` of chain time later. */
+  wait(delayMs: number): Promise<void> {
     return new Promise((resolve) => {
-      this.#waiting.push(resolve);
-      if (this.#waiting.length === 1) {
-        setImmediate(() => {
-          this.#complete();
-        });
-      }
+      this.#pending.push({ answerAt: this.#clock.now() + delayMs, resolve });
+      this.#schedule();
     });
   }
 
-  completed(): number {
-    return this.#completed;
+  #schedule(): void {
+    if (this.#isScheduled) {
+      return;
+    }
+    this.#isScheduled = true;
+    setImmediate(() => {
+      this.#isScheduled = false;
+      this.#answerNext();
+    });
   }
 
-  #complete(): void {
-    const answered = this.#waiting;
-    this.#waiting = [];
-    this.#completed += 1;
-    this.#clock.pass(this.#roundTripMs);
-    for (const resolve of answered) {
-      resolve();
+  /** Move the clock to the earliest answer and deliver every answer due by then. */
+  #answerNext(): void {
+    if (this.#pending.length === 0) {
+      return;
+    }
+    const next = Math.min(...this.#pending.map((request) => request.answerAt));
+    this.#clock.pass(Math.max(0, next - this.#clock.now()));
+    const now = this.#clock.now();
+    const due = this.#pending.filter((request) => request.answerAt <= now);
+    this.#pending = this.#pending.filter((request) => request.answerAt > now);
+    for (const request of due) {
+      request.resolve();
+    }
+    if (this.#pending.length > 0) {
+      this.#schedule();
     }
   }
 }
@@ -691,21 +710,21 @@ export function measuredNode(chain: SyntheticChain, observer: RpcObserver, laten
 /** The daemon's transport refuses a response body above ten megabytes (`maxResponseBodySize`). */
 const TRANSPORT_RESPONSE_LIMIT_BYTES = 10 * 1_048_576;
 
-/** A public provider as a cycle meets it: a round trip per exchange, and the largest log list it serves. */
+/** A paid shared provider as a cycle meets it: answers after their delays, and the largest log list it serves. */
 export interface ProviderProfile {
-  readonly roundTrips: RoundTrips;
+  readonly queue: ProviderQueue;
   /** Undefined when the provider serves a log list of any length. */
   readonly logLimit: number | undefined;
 }
 
 /**
- * The node behind a public provider: every answer arrives after its round trip, and a log list above
- * the provider's limit or a response above the transport's limit fails as those do.
+ * The node behind a paid shared provider: every answer arrives after the delay of its kind, and a log
+ * list above the provider's limit or a response above the transport's limit fails as those do.
  */
 export function providerNode(chain: SyntheticChain, observer: RpcObserver, profile: ProviderProfile): NodeRequest {
   return async (method, params) => {
     const { answer, handlerMs } = answerOrRecordFailure(chain, observer, method, params);
-    await profile.roundTrips.wait();
+    await profile.queue.wait(answerDelayMs(method, answer));
     const isOverLogLimit = profile.logLimit !== undefined && answer.logs > profile.logLimit;
     if (isOverLogLimit) {
       observer.failed(method, handlerMs);
@@ -721,6 +740,14 @@ export function providerNode(chain: SyntheticChain, observer: RpcObserver, profi
     const parsed: unknown = JSON.parse(JSON.stringify(answer.value));
     return parsed;
   };
+}
+
+/** The modelled provider's delay before `answer` arrives. */
+function answerDelayMs(method: string, answer: Answer): number {
+  if (method !== 'eth_getLogs') {
+    return SHARED_PROVIDER_DELAYS.otherMs;
+  }
+  return answer.logs === 0 ? SHARED_PROVIDER_DELAYS.emptyLogReadMs : SHARED_PROVIDER_DELAYS.logReadMs;
 }
 
 /**

@@ -455,14 +455,13 @@ const FAMILY_COLUMNS: Readonly<Record<string, readonly Column[]>> = {
   griefing: [
     { header: 'capacity', metric: 'capacity', digits: 0 },
     { header: 'blocks used', metric: 'blocksConsumed', digits: 0 },
-    { header: 'round trips', metric: 'roundTrips', digits: 0 },
     { header: 'RPC', metric: 'rpcCalls', digits: 0 },
     { header: 'largest log list', metric: 'largestLogList', digits: 0 },
     { header: 'largest response MB', metric: 'largestResponseMb', digits: 1 },
     { header: 'memory growth MB', metric: 'memoryGrowthMb', digits: 0 },
     { header: 'attack gas M', metric: 'attackGasMillions', digits: 0 },
-    { header: 'ETH at 0.1 gwei', metric: 'costEthLowFee', digits: 2 },
-    { header: 'ETH at 0.5 gwei', metric: 'costEthHighFee', digits: 2 },
+    { header: 'ETH at 0.07 gwei', metric: 'costEthCheapFee', digits: 2 },
+    { header: 'ETH at 0.35 gwei', metric: 'costEthMedianFee', digits: 2 },
   ],
   daemon: [
     { header: 'wall ms', metric: 'wallMs', digits: 0 },
