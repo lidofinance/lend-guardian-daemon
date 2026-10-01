@@ -9,8 +9,8 @@ A Guardian screens collateral supplies before the collateral activates. In each 
 ## Ways to run a Guardian
 
 - **Your own implementation.** You write the whole Guardian from the [specification](docs/guardian-specification.md), in any language.
-- **The SDK in your application.** The SDK is a TypeScript library that runs the Guardian cycle. Your application calls it on a schedule and provides RPC endpoints, the signing key and screening. The [example](example/README.md) is a runnable application to start from.
-- **The daemon image.** The [daemon](daemon/README.md) is a ready-to-run application built on the SDK and packaged as a Docker image. You configure and run it, and provide RPC endpoints, the signing key and a screening service that the daemon calls over HTTP.
+- **The SDK in your application.** The SDK is a TypeScript library that runs the Guardian cycle. Your application calls it on a schedule and provides RPC endpoints, the signing key and screening. The [example](example/) is a runnable application to start from.
+- **The daemon image.** The [daemon](daemon/) is a ready-to-run application built on the SDK and packaged as a Docker image. You configure and run it, and provide RPC endpoints, the signing key and a screening service that the daemon calls over HTTP.
 
 The table shows who does what in each case.
 
@@ -31,7 +31,7 @@ The table shows who does what in each case.
 ### The SDK in your application
 
 - Install the [SDK package](#sdk-package) and follow [SDK integration](#sdk-integration).
-- Start from the [example](example/README.md). In [`example/daemon.ts`](example/daemon.ts), `createGuardian` sets up the viem clients and transport, and `main` runs the cycles and recovers from failed ones.
+- Start from the [example](example/). In [`example/daemon.ts`](example/daemon.ts), `createGuardian` sets up the viem clients and transport, and `main` runs the cycles and recovers from failed ones.
 - Replace the placeholder screening provider in [`example/screening-adapter.ts`](example/screening-adapter.ts) with yours. The placeholder answers `incomplete` for every anchor, so a cycle with work stops at screening.
 - The example starts in observe mode: it creates no signer and sends no transactions.
 
@@ -140,10 +140,10 @@ Tests use scripted nodes and isolated local Anvil processes; they make no extern
 - [`src/contracts/`](src/contracts/): core, market-controller and `GuardianSignals` access.
 - [`src/chain/`](src/chain/): generic RPC reads, viem transport and transaction delivery.
 - [`abi/`](abi/): minimal ABI fragments used by the SDK.
-- [`example/`](example/README.md): example Guardian application built on the SDK.
-- [`daemon/`](daemon/README.md): deployable daemon with HTTP screening, event forwarding and a Docker image.
+- [`example/`](example/): example Guardian application built on the SDK.
+- [`daemon/`](daemon/): deployable daemon with HTTP screening, event forwarding and a Docker image.
 - [`tests/`](tests/): core, example, daemon and contract-conformance tests.
-- [`benchmarks/`](benchmarks/README.md): SDK cost, amplification, liveness and daemon overhead benchmarks, with [their latest results](benchmarks/RESULTS.md).
+- [`benchmarks/`](benchmarks/): SDK cost, amplification, liveness and daemon overhead benchmarks, with [their latest results](benchmarks/RESULTS.md).
 - [`docs/guardian-specification.md`](docs/guardian-specification.md): Guardian specification 0.2.0.
 
 ## License
