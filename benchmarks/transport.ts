@@ -44,7 +44,7 @@ const BYTES_PER_MEGABYTE = 1_048_576;
 
 const POLICY: TransactionPolicy = {
   maxFeePerGas: 100_000_000_000n,
-  sendTimeoutMs: 264_000,
+  sendTimeoutMs: 336_000,
   replacementFeeBumpBps: 1_000,
   replacementTimeoutMs: 36_000,
   sendAttempts: 5,

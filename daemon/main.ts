@@ -58,16 +58,19 @@ const SETTINGS = {
   MAX_SIGNAL_BATCH_SIZE: { default: 50, min: 1 },
   IDLE_HEARTBEAT_INTERVAL_SECONDS: { default: 12 * 60 * 60, min: 1 },
   HEARTBEAT_RESERVE_BLOCKS: { default: 8, min: 1 },
+  // Deeper than any reorg Ethereum's proof of stake has produced, seven slots in May 2022.
   TRANSACTION_CONFIRMATION_BLOCKS: { default: 12, min: 1 },
-  // The SDK's viem transport applies these to every physical HTTP attempt.
-  RPC_REQUEST_TIMEOUT_MS: { default: 10_000, min: 1, max: MAX_TIMER_MS },
+  // The SDK's viem transport applies these to every physical HTTP attempt. A shared provider can take
+  // many seconds for a log read, and viem retries an attempt that timed out.
+  RPC_REQUEST_TIMEOUT_MS: { default: 30_000, min: 1, max: MAX_TIMER_MS },
   RPC_RETRY_COUNT: { default: 2, min: 0 },
   RPC_RETRY_DELAY_MS: { default: 150, min: 0 },
   MAX_RPC_RESPONSE_BODY_SIZE: { default: 10 * 1024 * 1024, min: 1 },
   // A provider's own limit; a range it refuses is read again in halves, costing a request each time.
   MAX_LOG_BLOCK_RANGE: { default: 10_000, min: 1 },
-  // Transaction delivery; the defaults are the reference example's.
-  SEND_TIMEOUT_MS: { default: 264_000, min: 1, max: MAX_TIMER_MS },
+  // Transaction delivery; the defaults are the reference example's. A send fits every attempt's
+  // inclusion wait, then the confirmations and one slot: 5 * 36 s + (12 + 1) * 12 s.
+  SEND_TIMEOUT_MS: { default: 336_000, min: 1, max: MAX_TIMER_MS },
   REPLACEMENT_FEE_BUMP_BPS: { default: 1_000, min: 1 },
   MAX_FEE_PER_GAS_WEI: { default: 100_000_000_000, min: 1 },
   REPLACEMENT_TIMEOUT_MS: { default: 36_000, min: 1, max: MAX_TIMER_MS },

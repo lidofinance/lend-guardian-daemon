@@ -45,7 +45,7 @@ const HISTORY_READ_CONCURRENCY = 8;
 
 const POLICY: TransactionPolicy = {
   maxFeePerGas: 100_000_000_000n,
-  sendTimeoutMs: 264_000,
+  sendTimeoutMs: 336_000,
   replacementFeeBumpBps: 1_000,
   replacementTimeoutMs: 36_000,
   sendAttempts: 5,
@@ -290,7 +290,7 @@ function sdkClients(
 ): { readonly client: ViemRpcClient; readonly publicClient: PublicClient } {
   const transport = createViemRpcTransport({
     urls: [fixture.anvil.rpcUrl],
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
     maxResponseBodySize: 10 * 1_048_576,
     retryCount: 2,
     retryDelayMs: 150,
