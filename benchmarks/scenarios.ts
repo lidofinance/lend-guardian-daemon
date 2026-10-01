@@ -188,6 +188,8 @@ export interface GriefingScenario {
   readonly roundTripMs: number;
   /** Whether the provider refuses a log list above 10,000 entries. */
   readonly provider: 'capped' | 'uncapped';
+  /** Time the screening service takes to answer, charged to chain time. */
+  readonly screeningLatencyMs: number;
   /** Upper bound of the search. */
   readonly maxOperations: number;
 }
@@ -330,7 +332,8 @@ const GRIEFING: GriefingScenario = {
   spreadBlocks: 10_000,
   roundTripMs: 50,
   provider: 'capped',
-  maxOperations: 200_000,
+  screeningLatencyMs: 0,
+  maxOperations: 1_000_000,
 };
 
 const ANVIL: AnvilScenario = {
@@ -458,7 +461,10 @@ function fullDaemon(): DaemonScenario[] {
   return [{ ...DAEMON, runner: 'sdk' }, DAEMON, { ...DAEMON, receiverLatencyMs: 1_000 }];
 }
 
-/** Every attack at both round trips and against both providers; the discovery flood also spread over the window. */
+/**
+ * Every attack at both round trips and against both providers; the discovery flood also spread over
+ * the window. The report flood's screening answers in 290 seconds, the longest the daemon waits.
+ */
 function fullGriefing(): GriefingScenario[] {
   const conditions = [50, 100].flatMap((roundTripMs) =>
     (['capped', 'uncapped'] as const).map((provider) => ({ ...GRIEFING, roundTripMs, provider })),
@@ -467,7 +473,7 @@ function fullGriefing(): GriefingScenario[] {
     condition,
     { ...condition, spreadBlocks: 50_400 },
     { ...condition, attack: 'candidate-flood', spreadBlocks: 50_400 },
-    { ...condition, attack: 'report-flood', spreadBlocks: 50_400, maxOperations: 20_000 },
+    { ...condition, attack: 'report-flood', spreadBlocks: 50_400, screeningLatencyMs: 290_000, maxOperations: 20_000 },
   ]);
 }
 

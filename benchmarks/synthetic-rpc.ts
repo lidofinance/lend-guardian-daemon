@@ -716,7 +716,10 @@ export function providerNode(chain: SyntheticChain, observer: RpcObserver, profi
       throw new Error(`response body of ${String(answer.bytes)} bytes exceeds the transport limit`);
     }
     observer.answered(answer, handlerMs, 0);
-    return answer.value;
+    // A transport parses each response into new objects. Handing over the node's own records would
+    // let the SDK keep strings the history already holds and hide what a flood costs in memory.
+    const parsed: unknown = JSON.parse(JSON.stringify(answer.value));
+    return parsed;
   };
 }
 

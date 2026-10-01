@@ -701,8 +701,11 @@ async function submissionProbe(parameters: LivenessScenario, targets: number, co
 /** The log list limit of a capped provider, as major public providers set it. */
 const PROVIDER_LOG_LIMIT = 10_000;
 
-/** Memory a cycle may add to the process before the attack counts as exceeding the Guardian. */
-const MEMORY_LIMIT_MB = 4_096;
+/**
+ * Memory a cycle may add to the process before the attack counts as exceeding the Guardian: the
+ * daemon's default heap of 3,072 MB less the about 270 MB an idle daemon holds in its container.
+ */
+const MEMORY_LIMIT_MB = 2_800;
 
 const MEMORY_SAMPLE_INTERVAL_MS = 50;
 
@@ -847,7 +850,7 @@ async function griefingProbe(
     },
     provider: {
       decide: () => DECISIONS[parameters.attack === 'report-flood' ? 'suspect' : 'clean'],
-      latency: { kind: 'real', ms: 0 },
+      latency: { kind: 'virtual', ms: parameters.screeningLatencyMs },
     },
     onEvent: (event) => {
       if (event.event === 'cycle.discovered') {
@@ -904,7 +907,11 @@ function attackCost(attack: GriefingAttack, operations: number): Record<string, 
   };
 }
 
-/** Resident memory above what the process held when sampling began, sampled until stopped. */
+/**
+ * Heap in use above what the process held when sampling began, sampled until stopped. Earlier probes
+ * leave the process holding free heap pages, so resident memory would hide what a later cycle adds;
+ * heap in use also counts garbage between collections, which errs towards a smaller capacity.
+ */
 class MemoryPeak {
   readonly #baseline: number;
 
@@ -914,17 +921,17 @@ class MemoryPeak {
 
   constructor() {
     globalThis.gc?.();
-    this.#baseline = process.memoryUsage().rss;
+    this.#baseline = process.memoryUsage().heapUsed;
     this.#peak = this.#baseline;
     this.#timer = setInterval(() => {
-      this.#peak = Math.max(this.#peak, process.memoryUsage().rss);
+      this.#peak = Math.max(this.#peak, process.memoryUsage().heapUsed);
     }, MEMORY_SAMPLE_INTERVAL_MS);
   }
 
   /** Megabytes of the peak above the baseline. */
   stop(): number {
     clearInterval(this.#timer);
-    this.#peak = Math.max(this.#peak, process.memoryUsage().rss);
+    this.#peak = Math.max(this.#peak, process.memoryUsage().heapUsed);
     return (this.#peak - this.#baseline) / 1_048_576;
   }
 }
