@@ -20,11 +20,14 @@ import type { Address, Hex, TxHash } from '../common/types.ts';
 import { requireDefined, requireInteger } from '../common/validation.ts';
 
 /**
- * The gas limit adds a fifth to the node's estimate. A registry report costs more gas for every
- * report another guardian makes on the same account between the estimate and inclusion, and for
- * every report that expires meanwhile; with the exact estimate the report would run out of gas.
+ * The gas limit adds a fifth to the node's estimate unless the policy sets another headroom. A
+ * registry report costs more gas for every report another guardian makes on the same account
+ * between the estimate and inclusion, and for every report that expires meanwhile; with the exact
+ * estimate the report would run out of gas.
  */
-const GAS_HEADROOM_DIVISOR = 5n;
+const DEFAULT_GAS_HEADROOM_BPS = 2_000;
+
+const BASIS_POINTS_SCALE = 10_000n;
 
 export interface ViemRpcClientOptions {
   readonly publicClient: PublicClient;
@@ -51,6 +54,7 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
   readonly #walletClient: WalletClient<Transport, Chain, Account> | undefined;
   readonly transactionPolicy: TransactionPolicy;
   readonly #onEvent: EventHandler | undefined;
+  readonly #gasHeadroomBps: bigint;
   #isSending = false;
   readonly signer: Address | undefined;
 
@@ -67,6 +71,9 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
     requireInteger('sendTimeoutMs', policy.sendTimeoutMs, { min: 1, max: 2_147_483_647 });
     requireInteger('replacementFeeBumpBps', policy.replacementFeeBumpBps, { min: 1 });
     requireInteger('sendAttempts', policy.sendAttempts, { min: 1 });
+    const gasHeadroomBps = policy.gasHeadroomBps ?? DEFAULT_GAS_HEADROOM_BPS;
+    requireInteger('gasHeadroomBps', gasHeadroomBps, { min: 0 });
+    this.#gasHeadroomBps = BigInt(gasHeadroomBps);
     this.#publicClient = options.publicClient;
     this.#walletClient = options.walletClient;
     this.transactionPolicy = Object.freeze({ ...policy });
@@ -186,7 +193,7 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
       value: transaction.value,
       data: transaction.data,
       nonce: prepared.nonce,
-      gas: prepared.gas + prepared.gas / GAS_HEADROOM_DIVISOR,
+      gas: prepared.gas + (prepared.gas * this.#gasHeadroomBps) / BASIS_POINTS_SCALE,
       maxFeePerGas: prepared.maxFeePerGas,
       maxPriorityFeePerGas: prepared.maxPriorityFeePerGas,
     });

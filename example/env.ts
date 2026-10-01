@@ -86,6 +86,29 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
+/**
+ * An unset variable leaves the setting at the caller's default; a set one must be a decimal integer
+ * within the range. Only digits pass, so an empty value, a sign, a fraction or an exponent fails.
+ */
+export function optionalInteger(
+  name: string,
+  range: { readonly min: number; readonly max?: number },
+): number | undefined {
+  const text = process.env[name];
+  if (text === undefined) {
+    return undefined;
+  }
+  const value = Number(text);
+  const max = range.max ?? Number.MAX_SAFE_INTEGER;
+  const isInteger = /^\d+$/.test(text) && Number.isSafeInteger(value);
+  const isInRange = value >= range.min && value <= max;
+  if (!isInteger || !isInRange) {
+    const bounds = range.max === undefined ? `of at least ${range.min}` : `from ${range.min} to ${range.max}`;
+    throw new Error(`${name} must be an integer ${bounds}`);
+  }
+  return value;
+}
+
 /** An unset variable leaves the setting off; a set one must be a positive integer. */
 export function optionalPositiveInteger(name: string): number | undefined {
   return process.env[name] === undefined ? undefined : positiveInteger(name);

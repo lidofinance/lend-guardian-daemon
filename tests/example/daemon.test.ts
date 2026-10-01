@@ -214,6 +214,20 @@ test('without a log quorum an endpoint that lacks logs is not noticed', () => {
   assert.match(child.stdout, /observed: 1 screened/);
 });
 
+test('observe screens with log requests narrower than the scanned history', () => {
+  const child = runExample('observe', undefined, { MAX_LOG_BLOCK_RANGE: '1000' });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /observed: 1 screened/);
+});
+
+test('the example refuses a log block range that is not a positive integer before reaching RPC', () => {
+  const child = runExample('observe', undefined, { MAX_LOG_BLOCK_RANGE: '0' });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 1);
+  assert.match(child.stderr, /MAX_LOG_BLOCK_RANGE is not a positive integer/);
+});
+
 for (const [name, rpc, message] of [
   ['that is not a number', { RPC_LOG_QUORUM: 'two' }, /RPC_LOG_QUORUM is not a positive integer/],
   ['that is empty', { RPC_LOG_QUORUM: '' }, /RPC_LOG_QUORUM is not a positive integer/],

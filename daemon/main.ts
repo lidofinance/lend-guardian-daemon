@@ -13,7 +13,7 @@ import type { Mode } from '../example/env.ts';
 import { createViemRpcTransport, ViemRpcClient } from '../src/chain/viem-client.ts';
 import { Guardian } from '../src/core/index.ts';
 import type { Address, BlockRef, CycleOutcome, EventHandler, SdkEvent, StaleReason } from '../src/core/index.ts';
-import { HttpScreening } from './screening.ts';
+import { HttpScreening, MAX_SCREENING_TIMEOUT_MS } from './screening.ts';
 
 /** What the daemon reports of its own, beside the SDK's events and by the same path. */
 type RunnerEvent =
@@ -25,78 +25,114 @@ type DaemonEvent = SdkEvent | RunnerEvent;
 /** Mainnet and Hoodi both use 12-second slots; Guardian derives a seven-day lookback from this. */
 const SLOT_SECONDS = 12;
 
-/** A cycle every thirty slots from the start of the previous one, a failed one included. */
-const CYCLE_INTERVAL_MS = 30 * SLOT_SECONDS * 1_000;
+/** The longest delay Node's timers accept, in milliseconds. */
+const MAX_TIMER_MS = 2_147_483_647;
 
-/** How many times one cycle rebuilds a stale plan at once before it waits for the next cycle. */
-const MAX_RESTARTS_PER_CYCLE = 5;
+/** A setting's value while its environment variable is unset, and the range a set value must fall in. */
+interface Setting {
+  readonly default: number;
+  readonly min: number;
+  readonly max?: number;
+}
 
-// Guardian policy of this daemon, the same as the reference example's.
-const REPORT_BLOCK_LAG = 2;
-const FLAGGER_READ_CONCURRENCY = 8;
-const HISTORY_READ_CONCURRENCY = 8;
-// A report that a reorg drops is sent again after the shared wait, so a batch waits only for its inclusion.
-const INTER_BATCH_CONFIRMATION_BLOCKS = 1;
-const MAX_REPORT_ATTEMPTS = 3;
-const CONFIRMATION_POLL_INTERVAL_MS = 12_000;
-// A report costs up to about 156,000 gas per borrower, so 50 borrowers stay under half of the
-// 16,777,216 gas one transaction may use.
-const MAX_SIGNAL_BATCH_SIZE = 50;
-const IDLE_HEARTBEAT_INTERVAL_SECONDS = 12 * 60 * 60;
-const HEARTBEAT_RESERVE_BLOCKS = 8;
-const TRANSACTION_CONFIRMATION_BLOCKS = 12;
+/**
+ * Every numeric setting of the daemon, each read from the environment variable of its name; README.md
+ * describes them. Guardian and its clients check their options again when they are built, the
+ * combinations included, before any RPC request.
+ */
+const SETTINGS = {
+  // A cycle every thirty slots from the start of the previous one, a failed one included.
+  CYCLE_INTERVAL_MS: { default: 30 * SLOT_SECONDS * 1_000, min: 1, max: MAX_TIMER_MS },
+  // How many times one cycle rebuilds a stale plan at once before it waits for the next cycle.
+  MAX_RESTARTS_PER_CYCLE: { default: 5, min: 0 },
+  // Guardian policy; the defaults are the reference example's.
+  REPORT_BLOCK_LAG: { default: 2, min: 1 },
+  FLAGGER_READ_CONCURRENCY: { default: 8, min: 1 },
+  HISTORY_READ_CONCURRENCY: { default: 8, min: 1 },
+  // A report that a reorg drops is sent again after the shared wait, so a batch waits only for its inclusion.
+  INTER_BATCH_CONFIRMATION_BLOCKS: { default: 1, min: 1 },
+  MAX_REPORT_ATTEMPTS: { default: 3, min: 1 },
+  CONFIRMATION_POLL_INTERVAL_MS: { default: 12_000, min: 1, max: MAX_TIMER_MS },
+  // A report costs up to about 156,000 gas per borrower, so 50 borrowers stay under half of the
+  // 16,777,216 gas one transaction may use.
+  MAX_SIGNAL_BATCH_SIZE: { default: 50, min: 1 },
+  IDLE_HEARTBEAT_INTERVAL_SECONDS: { default: 12 * 60 * 60, min: 1 },
+  HEARTBEAT_RESERVE_BLOCKS: { default: 8, min: 1 },
+  TRANSACTION_CONFIRMATION_BLOCKS: { default: 12, min: 1 },
+  // The SDK's viem transport applies these to every physical HTTP attempt.
+  RPC_REQUEST_TIMEOUT_MS: { default: 10_000, min: 1, max: MAX_TIMER_MS },
+  RPC_RETRY_COUNT: { default: 2, min: 0 },
+  RPC_RETRY_DELAY_MS: { default: 150, min: 0 },
+  MAX_RPC_RESPONSE_BODY_SIZE: { default: 10 * 1024 * 1024, min: 1 },
+  // A provider's own limit; a range it refuses is read again in halves, costing a request each time.
+  MAX_LOG_BLOCK_RANGE: { default: 10_000, min: 1 },
+  // Transaction delivery; the defaults are the reference example's.
+  SEND_TIMEOUT_MS: { default: 264_000, min: 1, max: MAX_TIMER_MS },
+  REPLACEMENT_FEE_BUMP_BPS: { default: 1_000, min: 1 },
+  MAX_FEE_PER_GAS_WEI: { default: 100_000_000_000, min: 1 },
+  REPLACEMENT_TIMEOUT_MS: { default: 36_000, min: 1, max: MAX_TIMER_MS },
+  SEND_ATTEMPTS: { default: 5, min: 1 },
+  GAS_HEADROOM_BPS: { default: 2_000, min: 0 },
+  // The screening service, the event receiver and the liveness endpoint.
+  SCREENING_TIMEOUT_MS: { default: MAX_SCREENING_TIMEOUT_MS, min: 1, max: MAX_SCREENING_TIMEOUT_MS },
+  // A receiver that has not answered by then loses the event; see README.md, Limitations.
+  FORWARD_TIMEOUT_MS: { default: 5_000, min: 1, max: MAX_TIMER_MS },
+  HEALTH_PORT: { default: 8_080, min: 1, max: 65_535 },
+  HEALTH_WINDOW_MS: { default: 10 * 60_000, min: 1 },
+} satisfies Record<string, Setting>;
 
-// The SDK's viem transport applies these settings to every physical HTTP attempt.
-const RPC_REQUEST_TIMEOUT_MS = 10_000;
-const RPC_RETRY_COUNT = 2;
-const RPC_RETRY_DELAY_MS = 150;
-const MAX_RPC_RESPONSE_BODY_SIZE = 10 * 1024 * 1024;
-const RPC_USER_AGENT = 'guardian-daemon';
-const MAX_LOG_BLOCK_RANGE = 10_000;
-
-// Transaction delivery policy of this daemon.
-const SEND_TIMEOUT_MS = 264_000;
-const REPLACEMENT_FEE_BUMP_BPS = 1_000;
-const MAX_FEE_PER_GAS_WEI = 100_000_000_000n;
-const REPLACEMENT_TIMEOUT_MS = 36_000;
-const SEND_ATTEMPTS = 5;
-
-const HEALTH_PORT = 8080;
-
-/** Longer than the pause between cycles, the longest time the daemon reports no event while it works. */
-const HEALTH_WINDOW_MS = 10 * 60_000;
-
-/** A receiver that has not answered by then loses the event; see README.md, Limitations. */
-const FORWARD_TIMEOUT_MS = 5_000;
+const DEFAULT_RPC_USER_AGENT = 'guardian-daemon';
 
 /** Any URL, which may carry an endpoint's credentials in its path or query. */
 const URL_PATTERN = /https?:\/\/[^\s"'<>]+/g;
 
-/** Run a cycle every thirty slots, from the start of the previous one, for as long as the process lives. */
+/** Run a cycle every `CYCLE_INTERVAL_MS` from the start of the previous one, for as long as the process lives. */
 async function main(): Promise<void> {
   const mode = env.mode('MODE');
   const eventsUrl = process.env.EVENTS_URL === undefined ? undefined : readUrl('EVENTS_URL');
+  const forwardTimeoutMs = setting('FORWARD_TIMEOUT_MS');
+  const cycleIntervalMs = setting('CYCLE_INTERVAL_MS');
+  const maxRestarts = setting('MAX_RESTARTS_PER_CYCLE');
+  const healthWindowMs = healthWindow(cycleIntervalMs);
   let lastEventAt = Date.now();
   const onEvent = (event: DaemonEvent): void => {
     lastEventAt = Date.now();
-    report(event, eventsUrl);
+    report(event, eventsUrl, forwardTimeoutMs);
   };
   const guardian = createGuardian(mode, onEvent);
   // Liveness for Docker or Kubernetes. The server does not keep the process alive, so an error that
   // ends the cycles also ends the process.
   createServer((_request, response) => {
-    const isActive = Date.now() - lastEventAt < HEALTH_WINDOW_MS;
+    const isActive = Date.now() - lastEventAt < healthWindowMs;
     response.writeHead(isActive ? 200 : 503).end();
   })
-    .listen(HEALTH_PORT)
+    .listen(setting('HEALTH_PORT'))
     .unref();
 
   let previousHeartbeatBlock: BlockRef | null = null;
   while (true) {
     const startedAt = Date.now();
-    previousHeartbeatBlock = await runCycle({ guardian, mode, onEvent }, previousHeartbeatBlock);
-    await sleep(Math.max(0, startedAt + CYCLE_INTERVAL_MS - Date.now()));
+    previousHeartbeatBlock = await runCycle({ guardian, mode, maxRestarts, onEvent }, previousHeartbeatBlock);
+    await sleep(Math.max(0, startedAt + cycleIntervalMs - Date.now()));
   }
+}
+
+/** The setting from its environment variable, or its default while the variable is unset. */
+function setting(name: keyof typeof SETTINGS): number {
+  const range: Setting = SETTINGS[name];
+  return env.optionalInteger(name, range) ?? range.default;
+}
+
+/**
+ * The liveness window. A working daemon reports no event for at most the pause between cycles or
+ * the wait for screening, so a shorter window would report a working daemon as stuck.
+ */
+function healthWindow(cycleIntervalMs: number): number {
+  const healthWindowMs = setting('HEALTH_WINDOW_MS');
+  if (healthWindowMs <= Math.max(cycleIntervalMs, setting('SCREENING_TIMEOUT_MS'))) {
+    throw new Error('HEALTH_WINDOW_MS must be longer than CYCLE_INTERVAL_MS and SCREENING_TIMEOUT_MS');
+  }
+  return healthWindowMs;
 }
 
 /**
@@ -111,6 +147,7 @@ export async function runCycle(
   deps: {
     readonly guardian: Pick<Guardian, 'cycle' | 'clearPendingNonces'>;
     readonly mode: Mode;
+    readonly maxRestarts: number;
     readonly onEvent: (event: RunnerEvent) => void;
   },
   previousHeartbeatBlock: BlockRef | null,
@@ -135,7 +172,7 @@ export async function runCycle(
     if (outcome.kind !== 'stale') {
       return outcome.previousHeartbeatBlock;
     }
-    if (restarts === MAX_RESTARTS_PER_CYCLE) {
+    if (restarts === deps.maxRestarts) {
       deps.onEvent({ event: 'restart-budget-exhausted', restarts, reason: outcome.reason });
       return previousHeartbeatBlock;
     }
@@ -144,13 +181,13 @@ export async function runCycle(
 }
 
 /** Print the event as a JSON line and send it on; a successful RPC request is only sent. */
-function report(event: DaemonEvent, eventsUrl: string | undefined): void {
+function report(event: DaemonEvent, eventsUrl: string | undefined, forwardTimeoutMs: number): void {
   const record = toRecord(event);
   if (!isRoutineRpc(event)) {
     console.log(record);
   }
   if (eventsUrl !== undefined) {
-    forward(eventsUrl, record);
+    forward(eventsUrl, record, forwardTimeoutMs);
   }
 }
 
@@ -182,13 +219,13 @@ function isRoutineRpc(event: DaemonEvent): boolean {
 }
 
 /** Post one event and move on; README.md, Limitations, states what the receiver must do. */
-export function forward(url: string, record: string): void {
+export function forward(url: string, record: string, timeoutMs = SETTINGS.FORWARD_TIMEOUT_MS.default): void {
   void fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: record,
     // A receiver that does not answer cannot pile up requests in this process.
-    signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   })
     // Only a read or cancelled body returns the connection to undici's pool.
     .then((response) => response.body?.cancel())
@@ -207,7 +244,7 @@ function readUrl(name: string): string {
   return value;
 }
 
-/** The Guardian with this daemon's policy over the configured deployment, nodes and screening service. */
+/** The Guardian with the configured policy over the configured deployment, nodes and screening service. */
 function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
   const chain = env.chain('CHAIN_ID');
   const guardian = env.address('GUARDIAN');
@@ -230,17 +267,17 @@ function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
       },
     },
     guardian,
-    screening: new HttpScreening(readUrl('SCREENING_URL')),
-    reportBlockLag: REPORT_BLOCK_LAG,
-    flaggerReadConcurrency: FLAGGER_READ_CONCURRENCY,
-    historyReadConcurrency: HISTORY_READ_CONCURRENCY,
-    interBatchConfirmationBlocks: INTER_BATCH_CONFIRMATION_BLOCKS,
-    maxReportAttempts: MAX_REPORT_ATTEMPTS,
-    confirmationPollIntervalMs: CONFIRMATION_POLL_INTERVAL_MS,
-    maxSignalBatchSize: MAX_SIGNAL_BATCH_SIZE,
-    idleHeartbeatInterval: IDLE_HEARTBEAT_INTERVAL_SECONDS,
-    heartbeatReserveBlocks: HEARTBEAT_RESERVE_BLOCKS,
-    txConfirmationBlocks: TRANSACTION_CONFIRMATION_BLOCKS,
+    screening: new HttpScreening(readUrl('SCREENING_URL'), setting('SCREENING_TIMEOUT_MS')),
+    reportBlockLag: setting('REPORT_BLOCK_LAG'),
+    flaggerReadConcurrency: setting('FLAGGER_READ_CONCURRENCY'),
+    historyReadConcurrency: setting('HISTORY_READ_CONCURRENCY'),
+    interBatchConfirmationBlocks: setting('INTER_BATCH_CONFIRMATION_BLOCKS'),
+    maxReportAttempts: setting('MAX_REPORT_ATTEMPTS'),
+    confirmationPollIntervalMs: setting('CONFIRMATION_POLL_INTERVAL_MS'),
+    maxSignalBatchSize: setting('MAX_SIGNAL_BATCH_SIZE'),
+    idleHeartbeatInterval: setting('IDLE_HEARTBEAT_INTERVAL_SECONDS'),
+    heartbeatReserveBlocks: setting('HEARTBEAT_RESERVE_BLOCKS'),
+    txConfirmationBlocks: setting('TRANSACTION_CONFIRMATION_BLOCKS'),
   });
 }
 
@@ -250,11 +287,11 @@ function createClient(mode: Mode, chain: Chain, guardian: Address, onEvent: Even
     urls: env.rpcUrls('RPC_URLS'),
     // Unset, one endpoint answers a log read like any other request.
     logQuorum: env.optionalPositiveInteger('RPC_LOG_QUORUM'),
-    timeoutMs: RPC_REQUEST_TIMEOUT_MS,
-    maxResponseBodySize: MAX_RPC_RESPONSE_BODY_SIZE,
-    retryCount: RPC_RETRY_COUNT,
-    retryDelayMs: RPC_RETRY_DELAY_MS,
-    userAgent: RPC_USER_AGENT,
+    timeoutMs: setting('RPC_REQUEST_TIMEOUT_MS'),
+    maxResponseBodySize: setting('MAX_RPC_RESPONSE_BODY_SIZE'),
+    retryCount: setting('RPC_RETRY_COUNT'),
+    retryDelayMs: setting('RPC_RETRY_DELAY_MS'),
+    userAgent: process.env.RPC_USER_AGENT ?? DEFAULT_RPC_USER_AGENT,
     onEvent,
   });
   const publicClient = createPublicClient({ chain, transport });
@@ -268,13 +305,14 @@ function createClient(mode: Mode, chain: Chain, guardian: Address, onEvent: Even
     publicClient,
     walletClient,
     onEvent,
-    maxLogBlockRange: MAX_LOG_BLOCK_RANGE,
+    maxLogBlockRange: setting('MAX_LOG_BLOCK_RANGE'),
     transactionPolicy: {
-      sendTimeoutMs: SEND_TIMEOUT_MS,
-      replacementFeeBumpBps: REPLACEMENT_FEE_BUMP_BPS,
-      maxFeePerGas: MAX_FEE_PER_GAS_WEI,
-      replacementTimeoutMs: REPLACEMENT_TIMEOUT_MS,
-      sendAttempts: SEND_ATTEMPTS,
+      sendTimeoutMs: setting('SEND_TIMEOUT_MS'),
+      replacementFeeBumpBps: setting('REPLACEMENT_FEE_BUMP_BPS'),
+      maxFeePerGas: BigInt(setting('MAX_FEE_PER_GAS_WEI')),
+      replacementTimeoutMs: setting('REPLACEMENT_TIMEOUT_MS'),
+      sendAttempts: setting('SEND_ATTEMPTS'),
+      gasHeadroomBps: setting('GAS_HEADROOM_BPS'),
     },
   });
 }

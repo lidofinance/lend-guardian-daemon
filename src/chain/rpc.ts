@@ -79,6 +79,8 @@ export interface TransactionPolicy {
   readonly replacementTimeoutMs: number;
   /** Preparation attempts, including the initial transaction and estimates above the fee cap. */
   readonly sendAttempts: number;
+  /** Gas added to the node's estimate, in basis points; 2,000, a fifth, when omitted. */
+  readonly gasHeadroomBps?: number | undefined;
 }
 
 /** Fully specified EIP-1559 transaction, ready for a configured signer. */

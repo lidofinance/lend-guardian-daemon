@@ -46,7 +46,7 @@ const RPC_RETRY_COUNT = 2;
 const RPC_RETRY_DELAY_MS = 150;
 const MAX_RPC_RESPONSE_BODY_SIZE = 10 * 1024 * 1024;
 const RPC_USER_AGENT = 'guardian-daemon-sdk-example';
-const MAX_LOG_BLOCK_RANGE = 10_000;
+const DEFAULT_MAX_LOG_BLOCK_RANGE = 10_000;
 
 // Transaction delivery policy for this example.
 const SEND_TIMEOUT_MS = 264_000;
@@ -54,6 +54,9 @@ const REPLACEMENT_FEE_BUMP_BPS = 1_000;
 const MAX_FEE_PER_GAS_WEI = 100_000_000_000n;
 const REPLACEMENT_TIMEOUT_MS = 36_000;
 const SEND_ATTEMPTS = 5;
+// A report costs more gas when other guardians report the same accounts first, so the gas limit adds
+// a fifth to the node's estimate.
+const GAS_HEADROOM_BPS = 2_000;
 
 /**
  * Schedule [scan attempts](../docs/guardian-specification.md#scan-cycle). The intervals below are
@@ -163,13 +166,15 @@ function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
     publicClient,
     walletClient,
     onEvent,
-    maxLogBlockRange: MAX_LOG_BLOCK_RANGE,
+    // A provider's own limit; a range it refuses is read again in halves, costing a request each time.
+    maxLogBlockRange: env.optionalPositiveInteger('MAX_LOG_BLOCK_RANGE') ?? DEFAULT_MAX_LOG_BLOCK_RANGE,
     transactionPolicy: {
       sendTimeoutMs: SEND_TIMEOUT_MS,
       replacementFeeBumpBps: REPLACEMENT_FEE_BUMP_BPS,
       maxFeePerGas: MAX_FEE_PER_GAS_WEI,
       replacementTimeoutMs: REPLACEMENT_TIMEOUT_MS,
       sendAttempts: SEND_ATTEMPTS,
+      gasHeadroomBps: GAS_HEADROOM_BPS,
     },
   });
 

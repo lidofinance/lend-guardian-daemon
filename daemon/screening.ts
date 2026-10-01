@@ -4,16 +4,20 @@
 import type { ScreeningProvider, ScreeningRequest, ScreeningResult, SupplyAnchor } from '../src/core/index.ts';
 
 /**
- * A service that has not answered by then fails the attempt, which the next cycle repeats. Node's
- * fetch waits at most 300 seconds for response headers, so a longer timeout would never be reached.
+ * The longest wait for the service. Node's fetch waits at most 300 seconds for response headers, so a
+ * longer timeout would never be reached.
  */
-const SCREENING_TIMEOUT_MS = 290_000;
+export const MAX_SCREENING_TIMEOUT_MS = 290_000;
 
 export class HttpScreening implements ScreeningProvider {
   readonly #url: string;
 
-  constructor(url: string) {
+  readonly #timeoutMs: number;
+
+  /** A service that has not answered within `timeoutMs` fails the attempt, which the next cycle repeats. */
+  constructor(url: string, timeoutMs = MAX_SCREENING_TIMEOUT_MS) {
     this.#url = url;
+    this.#timeoutMs = timeoutMs;
   }
 
   /**
@@ -26,7 +30,7 @@ export class HttpScreening implements ScreeningProvider {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ chainId: request.chainId, reportBlock: request.reportBlock, anchors }),
-      signal: AbortSignal.timeout(SCREENING_TIMEOUT_MS),
+      signal: AbortSignal.timeout(this.#timeoutMs),
     });
     if (!response.ok) {
       throw new Error(`Screening service answered with HTTP ${response.status}`);

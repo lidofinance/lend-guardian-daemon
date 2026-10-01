@@ -62,7 +62,7 @@ type SignalScenario = 'failed-send';
 /** The delegate's key; the scripted registry names its address as the Guardian's delegate. */
 const SIGNAL = { MODE: 'signal', SIGNER_KEY: padHex('0x02', { size: 32 }) };
 
-function runDaemon(scenario: 'observe' | 'rpc-error' | SignalScenario) {
+function runDaemon(scenario: 'observe' | 'rpc-error' | SignalScenario, settings: Record<string, string> = {}) {
   const isSignal = scenario === 'failed-send';
   return spawnSync(
     process.execPath,
@@ -70,7 +70,7 @@ function runDaemon(scenario: 'observe' | 'rpc-error' | SignalScenario) {
     {
       cwd: new URL('../../', import.meta.url),
       // Deliberately do not inherit the host environment or any real credentials.
-      env: { ...CONFIGURATION, ...(isSignal ? SIGNAL : {}) },
+      env: { ...CONFIGURATION, ...(isSignal ? SIGNAL : {}), ...settings },
       encoding: 'utf8',
       timeout: 10_000,
     },
@@ -132,6 +132,36 @@ test('the daemon refuses to start without a screening service URL', () => {
   );
 });
 
+test('a setting from the environment replaces its default', () => {
+  const child = runDaemon('observe', { REPORT_BLOCK_LAG: '3' });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  // The scripted head is block 200,000; the default lag of two would report block 199,998.
+  assert.match(child.stdout, /^\{"event":"cycle\.screened","cycleId":"[^"]+","reportBlock":\{"number":199997,/m);
+});
+
+for (const [settings, message] of [
+  [{ MAX_LOG_BLOCK_RANGE: 'wide' }, 'MAX_LOG_BLOCK_RANGE must be an integer of at least 1'],
+  [{ REPORT_BLOCK_LAG: '0' }, 'REPORT_BLOCK_LAG must be an integer of at least 1'],
+  [{ RPC_RETRY_COUNT: '' }, 'RPC_RETRY_COUNT must be an integer of at least 0'],
+  [{ MAX_FEE_PER_GAS_WEI: '1e11' }, 'MAX_FEE_PER_GAS_WEI must be an integer of at least 1'],
+  [{ SCREENING_TIMEOUT_MS: '300000' }, 'SCREENING_TIMEOUT_MS must be an integer from 1 to 290000'],
+  [{ HEALTH_PORT: '65536' }, 'HEALTH_PORT must be an integer from 1 to 65535'],
+  [{ CYCLE_INTERVAL_MS: '600000' }, 'HEALTH_WINDOW_MS must be longer than CYCLE_INTERVAL_MS and SCREENING_TIMEOUT_MS'],
+] as const) {
+  test(`the daemon refuses ${Object.keys(settings).join(', ')} out of its range before any RPC request`, () => {
+    const child = spawnSync(process.execPath, ['daemon/main.ts'], {
+      cwd: new URL('../../', import.meta.url),
+      env: { ...CONFIGURATION, ...settings },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    assert.equal(child.error, undefined);
+    assert.equal(child.status, 1);
+    assert.equal(child.stderr, `{"event":"daemon.failed","error":{"name":"Error","message":"${message}"}}\n`);
+  });
+}
+
 const REPORT_BLOCK: BlockRef = blockAt(199_998);
 
 const PREVIOUS_HEARTBEAT_BLOCK: BlockRef = blockAt(150_000);
@@ -171,7 +201,7 @@ function scripted(outcomes: readonly (CycleOutcome | Error)[], clearing?: Error)
 test('a signal cycle clears the pending nonces first, and an attested call hands its report block on', async () => {
   const { guardian, calls, reported, onEvent } = scripted([ATTESTED]);
 
-  const next = await runCycle({ guardian, mode: 'signal', onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
+  const next = await runCycle({ guardian, mode: 'signal', maxRestarts: 5, onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
 
   assert.deepEqual(calls, ['clear', 'cycle']);
   assert.deepEqual(next, REPORT_BLOCK);
@@ -181,7 +211,7 @@ test('a signal cycle clears the pending nonces first, and an attested call hands
 test('an observe cycle clears no nonces', async () => {
   const { guardian, calls, onEvent } = scripted([ATTESTED]);
 
-  await runCycle({ guardian, mode: 'observe', onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
+  await runCycle({ guardian, mode: 'observe', maxRestarts: 5, onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
 
   assert.deepEqual(calls, ['cycle']);
 });
@@ -189,7 +219,7 @@ test('an observe cycle clears no nonces', async () => {
 test('a stale call is replanned at once from the same hint', async () => {
   const { guardian, hints, reported, onEvent } = scripted([STALE, ATTESTED]);
 
-  const next = await runCycle({ guardian, mode: 'observe', onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
+  const next = await runCycle({ guardian, mode: 'observe', maxRestarts: 5, onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
 
   assert.deepEqual(hints, [PREVIOUS_HEARTBEAT_BLOCK, PREVIOUS_HEARTBEAT_BLOCK]);
   assert.deepEqual(next, REPORT_BLOCK);
@@ -199,17 +229,27 @@ test('a stale call is replanned at once from the same hint', async () => {
 test('a plan that stays stale ends the cycle after five replans, reported once, and keeps the hint', async () => {
   const { guardian, calls, reported, onEvent } = scripted([STALE]);
 
-  const next = await runCycle({ guardian, mode: 'observe', onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
+  const next = await runCycle({ guardian, mode: 'observe', maxRestarts: 5, onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
 
   assert.equal(calls.length, 6);
   assert.deepEqual(reported, [{ event: 'restart-budget-exhausted', restarts: 5, reason: 'report-block-reorged' }]);
   assert.deepEqual(next, PREVIOUS_HEARTBEAT_BLOCK);
 });
 
+test('a restart budget of zero ends the cycle at the first stale plan', async () => {
+  const { guardian, calls, reported, onEvent } = scripted([STALE]);
+
+  const next = await runCycle({ guardian, mode: 'observe', maxRestarts: 0, onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(reported, [{ event: 'restart-budget-exhausted', restarts: 0, reason: 'report-block-reorged' }]);
+  assert.deepEqual(next, PREVIOUS_HEARTBEAT_BLOCK);
+});
+
 test('a failed call ends the cycle with its hint, and the daemon reports nothing of its own', async () => {
   const { guardian, calls, reported, onEvent } = scripted([new GuardianStop('delegate-mismatch')]);
 
-  const next = await runCycle({ guardian, mode: 'signal', onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
+  const next = await runCycle({ guardian, mode: 'signal', maxRestarts: 5, onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
 
   assert.deepEqual(calls, ['clear', 'cycle']);
   assert.deepEqual(reported, [], 'the SDK reports the failed call as cycle.failed');
@@ -220,7 +260,7 @@ test('a failed nonce clearing reports a cycle that could not start, without call
   const failure = new Error('cancel: RPC is on another chain');
   const { guardian, calls, reported, onEvent } = scripted([ATTESTED], failure);
 
-  const next = await runCycle({ guardian, mode: 'signal', onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
+  const next = await runCycle({ guardian, mode: 'signal', maxRestarts: 5, onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
 
   assert.deepEqual(calls, ['clear']);
   assert.deepEqual(reported, [{ event: 'cycle-not-started', error: failure }]);
