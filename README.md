@@ -1,5 +1,7 @@
 # guardian-daemon-sdk
 
+> **Pre-release, pending audit.** Interfaces, settings and figures can change before the release.
+
 TypeScript reference implementation of the Guardian offchain logic for `GuardianSignals`.
 
 A Guardian screens collateral supplies before the collateral activates. In each cycle it selects a recent block, finds the collateral that must be screened by that block, screens its supply transactions, submits the required `suspect` and `flag` reports and sends a heartbeat for that block. The [Guardian specification](docs/guardian-specification.md) defines this behavior.
