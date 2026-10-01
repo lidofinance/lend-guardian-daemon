@@ -2,7 +2,7 @@
 
 > **Pre-release figures.** They were measured on a pre-release version of the SDK and the daemon. Later versions, contract upgrades, chain activity and provider limits can change them; they are not guarantees.
 
-The latest measurements of the SDK and the daemon. The benchmark suite ran on a developer laptop over synthetic nodes, with no network between the SDK and the node, so its figures are indicative. The daemon image ran in a container with the 2 CPUs and 4 GB that [the daemon guide](../daemon/README.md#requirements) requires, against a local node. A live network adds round trips, provider limits and load. [README.md](README.md) describes the method.
+The latest measurements of the SDK and the daemon. The benchmark suite ran on a developer laptop over synthetic nodes, with no network between the SDK and the node, so its figures are indicative. The daemon image ran in a container with the 2 CPUs and 4 GB that [the daemon guide](../daemon/README.md#requirements) requires, against local nodes. A live network adds round trips, provider limits and load. [README.md](README.md) describes the method.
 
 ## Benchmark suite
 
@@ -25,10 +25,23 @@ The median of five runs of the `full` preset.
 
 ## Daemon image
 
-A container with 2 CPUs, 4 GB of memory and a 3 GB heap, one run per row, against Anvil on the same laptop. The stand that ran these cycles is not part of this repository.
+A container with 2 CPUs, 4 GB of memory and a 3 GB heap on the same laptop, posting every event to a receiver. The stands that ran these cycles are not part of this repository.
+
+Against Anvil with the pinned contracts and a history of a few hundred blocks, one run per row:
 
 | Run                                                  | Result                                                                           |
 | ---------------------------------------------------- | -------------------------------------------------------------------------------- |
 | Observe cycle over 1,000 lots                        | observed in about 2 s; 3,013 RPC requests and one screening request; peak 412 MB |
 | Signal cycle over the same lots, every tenth flagged | two flag transactions of 50 and the heartbeat confirmed; peak 334 MB             |
 | Node's heap limit in the 4 GB container              | 3,264 MB with `--max-old-space-size=3072`; 2,240 MB without it                   |
+
+Against a synthetic node that serves the benchmark's history, observe cycles only. Each position holds one lot that is due, and the lots are spread over the whole seven-day window, so a cycle sends about six requests per position, against three on Anvil's short history. The screening service answers at once and judges every position clean. The node answers each request at once, or after 50 ms as a remote provider would. CPU time is the container's, including a probe that reads its counters every second.
+
+| Positions | Node's delay per request | Cycle time | CPU time   | RPC requests | Peak memory |
+| --------- | ------------------------ | ---------- | ---------- | ------------ | ----------- |
+| 1,000     | none                     | 3–4 s      | 4–6 s      | 6,074        | 354 MB      |
+| 5,000     | none                     | about 15 s | about 18 s | 29,984       | 418 MB      |
+| 1,000     | 50 ms                    | 47 s       | 12 s       | 6,074        | 324 MB      |
+| 5,000     | 50 ms                    | 3.7 min    | 51 s       | 29,984       | 384 MB      |
+
+Three cycles in a row over 5,000 positions kept the same peak, and no second of these cycles kept more than about 1.5 CPUs busy.
