@@ -143,8 +143,13 @@ class HistoryNode extends BaseRpcProvider {
     return Promise.resolve([supply(index, this.#markets)]);
   }
 
+  /** Discovery's window reads arrive as one piece; a lifecycle walk waits until the test answers it. */
   override async *logBatches(filter: LogFilter): AsyncGenerator<ChainLog[]> {
     const borrower = filter.topics?.[1];
+    if (borrower === undefined) {
+      yield await this.getLogs(filter);
+      return;
+    }
     const index = this.#indexWhere((candidate) => pad(borrowerAt(candidate)) === borrower);
     yield await this.#hold([activation(index)]);
   }
@@ -235,7 +240,7 @@ for (const [phase, run] of Object.entries(PHASES)) {
   });
 }
 
-test('supplies of one market classified at once share one controller, registry and classification read', async () => {
+test('supplies of one market share one controller and registry read, and their piece one read of controller events', async () => {
   const node = new HistoryNode(3, 1);
   const discovery = guardianWith(node, 3).discoverCandidatePositions(PLAN);
   await setImmediate();
@@ -248,8 +253,9 @@ test('supplies of one market classified at once share one controller, registry a
     node.calledContracts.map((contract) => contract.toLowerCase()),
     [CORE.toLowerCase(), CONTROLLER.toLowerCase()],
   );
+  // The supplies, their controller's events through their last block, then through the report block.
   assert.deepEqual(
     node.logReads.map((contract) => contract.toLowerCase()),
-    [CORE.toLowerCase(), CONTROLLER.toLowerCase()],
+    [CORE.toLowerCase(), CONTROLLER.toLowerCase(), CONTROLLER.toLowerCase()],
   );
 });

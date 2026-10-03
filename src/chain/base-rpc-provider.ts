@@ -81,18 +81,23 @@ export class BaseRpcProvider implements RpcProvider {
   /**
    * Static inclusive ranges; the consumer can stop a backward walk as soon as it has evidence. A range
    * whose read fails is read again in halves, down to one block, because a provider's log limit or the
-   * transport's response limit refuses a range that holds too many logs; a block that fails alone
-   * propagates its error.
+   * transport's response limit refuses a range that holds too many logs. The rest of that static range is
+   * then read at the size that worked, since the blocks next to a dense one are usually as dense, and the
+   * next static range is tried whole again. A block that fails alone propagates its error.
    */
   async *logBatches(filter: LogFilter, direction: 'forward' | 'backward'): AsyncGenerator<ChainLog[]> {
-    // Ranges still to read, the next one last, so the halves of a failed range keep the traversal order.
-    const pending = [...this.#blockRanges(filter.fromBlock, filter.toBlock, direction)].reverse();
+    // Ranges still to read, the next one last, each with the size of its next read: the whole range until a
+    // read fails, then half the failed size for the rest of the range.
+    const pending = [...this.#blockRanges(filter.fromBlock, filter.toBlock, direction)]
+      .reverse()
+      .map(([from, to]) => ({ from, to, size: to - from + 1 }));
     while (true) {
       const range = pending.pop();
       if (range === undefined) {
         return;
       }
-      const [from, to] = range;
+      const from = direction === 'forward' ? range.from : Math.max(range.from, range.to - range.size + 1);
+      const to = direction === 'forward' ? Math.min(range.to, range.from + range.size - 1) : range.to;
       let logs: ChainLog[];
       try {
         logs = await this.#rangeLogs(filter, from, to);
@@ -100,10 +105,14 @@ export class BaseRpcProvider implements RpcProvider {
         if (from === to) {
           throw error;
         }
-        pending.push(...halves(from, to, direction));
+        pending.push({ ...range, size: Math.ceil((to - from + 1) / 2) });
         continue;
       }
       yield logs;
+      const unread = direction === 'forward' ? { ...range, from: to + 1 } : { ...range, to: from - 1 };
+      if (unread.from <= unread.to) {
+        pending.push(unread);
+      }
     }
   }
 
@@ -187,12 +196,4 @@ export class BaseRpcProvider implements RpcProvider {
       index += step;
     }
   }
-}
-
-/** The halves of a failed range in the order to push them, so the half read first is popped first. */
-function halves(from: number, to: number, direction: 'forward' | 'backward'): [number, number][] {
-  const middle = from + Math.floor((to - from) / 2);
-  const lower: [number, number] = [from, middle];
-  const upper: [number, number] = [middle + 1, to];
-  return direction === 'forward' ? [upper, lower] : [lower, upper];
 }

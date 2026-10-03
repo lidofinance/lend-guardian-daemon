@@ -56,7 +56,7 @@ interface GuardianConfig {
   readonly reportBlockLag?: number;
   /** Maximum concurrent flagger reads. Defaults to 8. */
   readonly flaggerReadConcurrency?: number;
-  /** Maximum supplies classified, or candidate positions reconstructed, at once. Defaults to 1. */
+  /** Maximum markets or controllers read at once in discovery, or candidate positions reconstructed. Defaults to 1. */
   readonly historyReadConcurrency?: number;
   /** Confirmations between report batches, capped at txConfirmationBlocks. Defaults to 2. */
   readonly interBatchConfirmationBlocks?: number;

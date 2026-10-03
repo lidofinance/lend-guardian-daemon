@@ -490,7 +490,7 @@ test('a node that refuses a single-block query stops the cycle', async () => {
   );
 });
 
-test("the controller's lifecycle events are read once for the window however many supplies it holds", async () => {
+test("the controller's lifecycle events are read once for a piece of supplies, not once per supply or block", async () => {
   const { work, node } = await workOf({
     head: HEAD,
     guardianAddedAt: CORE_DEPLOYED,
@@ -498,7 +498,15 @@ test("the controller's lifecycle events are read once for the window however man
   });
   assert.equal(work.positions, 1, 'every supply is on behalf of one borrower');
   const windowQueries = node.logQueries.filter((query) => query.address === CONTROLLER && query.topics.length === 1);
-  assert.equal(windowQueries.length, 1, 'one query for the window, not one per supply or block');
+  // The window, which starts at the core's deployment, holds one piece of supplies: the controller's events
+  // from the window start through the last supply, then through the report block for the candidate found.
+  assert.deepEqual(
+    windowQueries.map((query) => [query.fromBlock, query.toBlock]),
+    [
+      [CORE_DEPLOYED, 150_000],
+      [150_001, REPORT],
+    ],
+  );
 });
 
 test('a log response too large for the client is read again in halves', async () => {
