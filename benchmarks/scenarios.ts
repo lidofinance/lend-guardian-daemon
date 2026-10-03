@@ -234,7 +234,7 @@ export interface Scenario {
   readonly parameters: ScenarioParameters;
 }
 
-export type PresetName = 'smoke' | 'full';
+export type PresetName = 'smoke' | 'full' | 'stress';
 
 export interface Preset {
   readonly name: PresetName;
@@ -482,6 +482,22 @@ function fullGriefing(): GriefingScenario[] {
   ]);
 }
 
+/**
+ * The floods without an attacker's budget, up to the most operations whose history the chain server holds
+ * in the griefing run's 16 GB heap, about 2.7 GB per million dust deposits and 3.0 GB per million
+ * withdrawn lots: how large an attack a first cycle survives, not what it costs. The report flood stays
+ * out: the block budget stops it far below its bound.
+ */
+function stressGriefing(): GriefingScenario[] {
+  return fullGriefing()
+    .filter((scenario) => scenario.attack !== 'report-flood')
+    .map((scenario) => ({
+      ...scenario,
+      maxOperations: scenario.attack === 'candidate-flood' ? 4_500_000 : 5_000_000,
+      maxAttackCostEth: Number.POSITIVE_INFINITY,
+    }));
+}
+
 function fullAnvil(): AnvilScenario[] {
   return [
     ANVIL,
@@ -585,7 +601,10 @@ export function presetNamed(name: string): Preset {
     ];
     return { name, warmup: 2, repeat: 5, scenarios: scenariosOf(parameters, 1) };
   }
-  throw new RangeError(`Unknown preset ${name}; use smoke or full`);
+  if (name === 'stress') {
+    return { name, warmup: 0, repeat: 1, scenarios: scenariosOf(stressGriefing(), 1) };
+  }
+  throw new RangeError(`Unknown preset ${name}; use smoke, full or stress`);
 }
 
 export function scenarioById(preset: Preset, id: string): Scenario {

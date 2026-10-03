@@ -26,11 +26,17 @@ The `anvil` family and the conformance fixtures it reuses need Anvil 1.7.1 on `P
 npm run benchmark -- --filter griefing --repeat 1 --warmup 0 --max-old-space-mb 16384 --timeout-ms 3600000
 ```
 
+The `stress` preset runs the same floods without the attacker's budget, up to the most operations whose history the chain server holds in that heap: five million dust deposits or four and a half million withdrawn lots. It shows how large an attack a first cycle survives, not what one costs; give it two hours per scenario:
+
+```bash
+node benchmarks/run.ts --preset stress --commit <revision> --max-old-space-mb 16384 --timeout-ms 7200000
+```
+
 Runner options:
 
 | Option                         | Meaning                                                                                                |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------ |
-| `--preset smoke\|full`         | Scenario set; `smoke` by default.                                                                      |
+| `--preset smoke\|full\|stress` | Scenario set; `smoke` by default.                                                                      |
 | `--filter <text>`              | Only scenarios whose identifier contains the text.                                                     |
 | `--repeat <n>`, `--warmup <n>` | Override the preset's measured and warm-up runs.                                                       |
 | `--commit <revision>`          | Revision recorded with the results; also read from `BENCHMARK_COMMIT`. The runner runs no Git command. |
