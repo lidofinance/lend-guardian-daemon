@@ -560,14 +560,17 @@ interface CycleRun {
 async function cycleAttempts(harness: Harness, attempts: number): Promise<CycleRun> {
   const outcomes: string[] = [];
   const anchorsByAttempt: number[] = [];
+  // A stale attempt hands its work to the next one, as the daemon's replan does.
+  let earlierWork: Work | undefined;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const anchorsBefore = harness.providers.totals().providerAnchors;
-    const result = await settle(() => harness.guardian.cycle(null), outcomeOf);
+    const result = await settle(() => harness.guardian.cycle(null, earlierWork), outcomeOf);
     outcomes.push(result.outcome);
     anchorsByAttempt.push(harness.providers.totals().providerAnchors - anchorsBefore);
     if (result.outcome === 'attested') {
       break;
     }
+    earlierWork = result.value?.kind === 'stale' ? result.value.work : undefined;
   }
   return { outcomes, anchorsByAttempt };
 }
@@ -648,6 +651,8 @@ interface Probe {
   readonly targets: number;
   readonly harness: Harness;
   readonly outcome: string;
+  /** Stale plans replanned before the outcome. */
+  readonly restarts: number;
 }
 
 async function runLiveness(parameters: LivenessScenario, context: RunContext): Promise<RunReport> {
@@ -666,6 +671,7 @@ async function runLiveness(parameters: LivenessScenario, context: RunContext): P
         counts: {
           capacityTargets: capacity,
           capacityBatches: expectedReportTransactions({ ...parameters, targets: capacity }),
+          restarts: atCapacity.restarts,
           targets: capacity,
           anchors: capacity,
           ...atCapacityCounts,
@@ -724,8 +730,17 @@ async function cycleProbe(
       latency: { kind: 'virtual', ms: parameters.screeningLatencyMs },
     },
   });
-  const result = await settle(() => harness.guardian.cycle(null), outcomeOf);
-  return { targets, harness, outcome: result.outcome };
+  // A stale plan is replanned at once, up to the budget, from the work of the stale attempt.
+  let earlierWork: Work | undefined;
+  let restarts = 0;
+  while (true) {
+    const result = await settle(() => harness.guardian.cycle(null, earlierWork), outcomeOf);
+    if (result.value?.kind !== 'stale' || restarts === parameters.restarts) {
+      return { targets, harness, outcome: result.outcome, restarts };
+    }
+    restarts += 1;
+    earlierWork = result.value.work;
+  }
 }
 
 // ─── Griefing: the largest attack a first cycle still attests through, and what exceeding it costs.

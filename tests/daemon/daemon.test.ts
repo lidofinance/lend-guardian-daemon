@@ -5,6 +5,7 @@ import { padHex } from 'viem';
 import { forward, runCycle, toRecord } from '../../daemon/main.ts';
 import { GuardianStop } from '../../src/core/index.ts';
 import type { BlockRef, CycleOutcome } from '../../src/core/index.ts';
+import { Work } from '../../src/core/outcomes.ts';
 import { blockAt, CORE, GUARDIAN, REGISTRY } from '../core/fake-node.ts';
 
 test('a record carries amounts as decimal strings and errors as their name and message without URLs', () => {
@@ -179,11 +180,13 @@ const STALE: CycleOutcome = { kind: 'stale', reason: 'report-block-reorged' };
 function scripted(outcomes: readonly (CycleOutcome | Error)[], clearing?: Error) {
   const calls: string[] = [];
   const hints: (BlockRef | null | undefined)[] = [];
+  const earlierWorks: (Work | undefined)[] = [];
   const queue = [...outcomes];
   const guardian = {
-    cycle: (previousHeartbeatBlock?: BlockRef | null): Promise<CycleOutcome> => {
+    cycle: (previousHeartbeatBlock?: BlockRef | null, earlierWork?: Work): Promise<CycleOutcome> => {
       calls.push('cycle');
       hints.push(previousHeartbeatBlock);
+      earlierWorks.push(earlierWork);
       const next = queue.length > 1 ? queue.shift() : queue[0];
       assert.ok(next !== undefined);
       return next instanceof Error ? Promise.reject(next) : Promise.resolve(next);
@@ -195,7 +198,7 @@ function scripted(outcomes: readonly (CycleOutcome | Error)[], clearing?: Error)
   };
   const reported: unknown[] = [];
 
-  return { guardian, calls, hints, reported, onEvent: (event: unknown) => reported.push(event) };
+  return { guardian, calls, hints, earlierWorks, reported, onEvent: (event: unknown) => reported.push(event) };
 }
 
 test('a signal cycle clears the pending nonces first, and an attested call hands its report block on', async () => {
@@ -224,6 +227,25 @@ test('a stale call is replanned at once from the same hint', async () => {
   assert.deepEqual(hints, [PREVIOUS_HEARTBEAT_BLOCK, PREVIOUS_HEARTBEAT_BLOCK]);
   assert.deepEqual(next, REPORT_BLOCK);
   assert.deepEqual(reported, []);
+});
+
+test('a replan reuses the work of the stale attempt', async () => {
+  const work = new Work(
+    {
+      kind: 'plan',
+      previousHeartbeatBlock: PREVIOUS_HEARTBEAT_BLOCK,
+      heartbeatTimestampAtStart: PREVIOUS_HEARTBEAT_BLOCK.timestamp,
+      discoveryRange: { from: PREVIOUS_HEARTBEAT_BLOCK, to: REPORT_BLOCK },
+    },
+    new Map(),
+  );
+  const { guardian, earlierWorks, onEvent } = scripted([{ ...STALE, work }, ATTESTED]);
+
+  await runCycle({ guardian, mode: 'observe', maxRestarts: 5, onEvent }, PREVIOUS_HEARTBEAT_BLOCK);
+
+  assert.equal(earlierWorks.length, 2);
+  assert.equal(earlierWorks[0], undefined);
+  assert.equal(earlierWorks[1], work);
 });
 
 test('a plan that stays stale ends the cycle after five replans, reported once, and keeps the hint', async () => {

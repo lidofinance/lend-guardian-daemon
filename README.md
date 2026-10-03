@@ -77,6 +77,8 @@ if ('previousHeartbeatBlock' in outcome) {
 }
 ```
 
+A stale outcome carries the attempt's `work`. Pass it to the next attempt as the second argument of `cycle`: a position whose controller logged nothing for it since keeps the anchors that attempt reconstructed, so a retry walks only what changed.
+
 `cycle` reports each phase and its result as events to the `onEvent` handler, which also receives RPC, transaction and report events. Missing, malformed or incomplete screening results stop the cycle before any transaction. In signal mode the SDK sends the required suspect reports, then the flag reports, waits until they are confirmed on the canonical chain, and then sends the heartbeat and waits for its confirmation. RPC and screening provider errors are passed on to the application.
 
 For viem, create one transport, use it for the public and wallet clients, and pass both clients to `ViemRpcClient`. With another library, implement the `RpcProvider` reads and the `RpcClient` preparation, broadcast and delivery methods yourself. [`example/daemon.ts`](example/daemon.ts) sets up observe and signal mode with viem.

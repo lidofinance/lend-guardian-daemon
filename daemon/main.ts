@@ -12,7 +12,7 @@ import * as env from '../example/env.ts';
 import type { Mode } from '../example/env.ts';
 import { createViemRpcTransport, ViemRpcClient } from '../src/chain/viem-client.ts';
 import { Guardian } from '../src/core/index.ts';
-import type { Address, BlockRef, CycleOutcome, EventHandler, SdkEvent, StaleReason } from '../src/core/index.ts';
+import type { Address, BlockRef, CycleOutcome, EventHandler, SdkEvent, StaleReason, Work } from '../src/core/index.ts';
 import { HttpScreening, MAX_SCREENING_TIMEOUT_MS } from './screening.ts';
 
 /** What the daemon reports of its own, beside the SDK's events and by the same path. */
@@ -142,7 +142,8 @@ function healthWindow(cycleIntervalMs: number): number {
  * One scheduled [scan cycle](../docs/guardian-specification.md#scan-cycle) and the hint for the next:
  * the coverage its completed call confirmed, or the hint it started from. In signal mode it first
  * clears the signer's pending nonces, so no transaction of an earlier cycle or process blocks this one;
- * the signer must have no other writer. A stale plan is rebuilt at once, up to the budget. A
+ * the signer must have no other writer. A stale plan is rebuilt at once, up to the budget, and the
+ * new attempt reuses the work the stale one reconstructed where it still holds. A
  * [failed call](../docs/guardian-specification.md#failure-handling) ends the cycle, which the SDK has
  * already reported as `cycle.failed`.
  */
@@ -164,10 +165,11 @@ export async function runCycle(
     }
   }
   let restarts = 0;
+  let earlierWork: Work | undefined;
   while (true) {
     let outcome: CycleOutcome;
     try {
-      outcome = await deps.guardian.cycle(previousHeartbeatBlock);
+      outcome = await deps.guardian.cycle(previousHeartbeatBlock, earlierWork);
     } catch {
       // The SDK reported the failure as `cycle.failed`; the next cycle starts from the same hint.
       return previousHeartbeatBlock;
@@ -180,6 +182,7 @@ export async function runCycle(
       return previousHeartbeatBlock;
     }
     restarts += 1;
+    earlierWork = outcome.work;
   }
 }
 

@@ -64,7 +64,7 @@ Invalid or missing configuration ends the process with exit code 1 before any RP
 
 - A cycle starts every `CYCLE_INTERVAL_MS` from the start of the previous one, whatever its outcome; a longer cycle is followed at once.
 - In signal mode every cycle first clears the signer's pending nonces: each pending transaction is awaited or cancelled, so no transaction of an earlier cycle or process blocks this one. The signer must have no other writer. When the clearing fails, the cycle does not start and the next one tries again.
-- A stale plan is rebuilt at once, up to `MAX_RESTARTS_PER_CYCLE` times; then the cycle waits for the next one.
+- A stale plan is rebuilt at once, up to `MAX_RESTARTS_PER_CYCLE` times; then the cycle waits for the next one. Each new attempt keeps the anchors the stale one reconstructed for the positions nothing changed since.
 - A failed cycle keeps the heartbeat hint it started from, and the next cycle repeats it.
 
 ### Settings
@@ -198,4 +198,4 @@ The fields of the SDK events are defined by `SdkEvent` in [`src/events.ts`](../s
 npm run test:daemon
 ```
 
-The tests cover the screening contract and each response it refuses, records without URLs, event forwarding, an observe cycle over a scripted node with a scripted screening service and receiver, an RPC failure that reaches the log and the receiver without its endpoint, nonce clearing before every signal cycle, the replan of a stale plan within its budget, and the refusal to start without a screening service.
+The tests cover the screening contract and each response it refuses, records without URLs, event forwarding, an observe cycle over a scripted node with a scripted screening service and receiver, an RPC failure that reaches the log and the receiver without its endpoint, nonce clearing before every signal cycle, the replan of a stale plan within its budget from the stale attempt's work, and the refusal to start without a screening service.

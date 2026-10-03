@@ -116,6 +116,8 @@ export interface LivenessScenario {
   readonly inclusionBlocks: number;
   /** Time the screening service takes to answer, charged to chain time. */
   readonly screeningLatencyMs: number;
+  /** Stale plans replanned at once, each attempt reusing the work of the stale one, as the daemon does. */
+  readonly restarts: number;
   /** Upper bound of the target-count search. */
   readonly maxTargets: number;
 }
@@ -308,6 +310,7 @@ const LIVENESS: LivenessScenario = {
   interBatchConfirmationBlocks: 2,
   inclusionBlocks: 1,
   screeningLatencyMs: 0,
+  restarts: 0,
   maxTargets: 20_000,
 };
 
@@ -442,6 +445,9 @@ function fullLiveness(): LivenessScenario[] {
     // The daemon's own batch size and wait between batches, then with the longest wait for screening.
     { ...LIVENESS, maxSignalBatchSize: 50, interBatchConfirmationBlocks: 1 },
     { ...LIVENESS, maxSignalBatchSize: 50, interBatchConfirmationBlocks: 1, screeningLatencyMs: 290_000 },
+    // The same with the daemon's five replans of a stale plan.
+    { ...LIVENESS, maxSignalBatchSize: 50, interBatchConfirmationBlocks: 1, restarts: 5 },
+    { ...LIVENESS, maxSignalBatchSize: 50, interBatchConfirmationBlocks: 1, screeningLatencyMs: 290_000, restarts: 5 },
   ];
 }
 
@@ -530,6 +536,7 @@ function smokeParameters(): ScenarioParameters[] {
     { ...CYCLE, profile: 'steady-state', positions: 100 },
     { ...CYCLE, profile: 'steady-state', positions: 100, freshSupplies: 5 },
     { ...LIVENESS, maxTargets: 5_000 },
+    { ...LIVENESS, maxTargets: 5_000, restarts: 5 },
     { ...TRANSPORT, requests: 20 },
     { ...TRANSPORT, condition: 'timeout', requests: 3, timeoutMs: 200 },
     { ...TRANSPORT, condition: 'first-down', requests: 5 },
