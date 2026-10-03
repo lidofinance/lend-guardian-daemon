@@ -1,4 +1,4 @@
-// A signing client for benchmarks. The synthetic chain mines each registry call, and waiting for
+// A signing client for benchmarks. The chain server mines each registry call, and waiting for
 // inclusion or confirmations moves its virtual head instead of wall-clock time. Reads, receipts and
 // confirmation checks run through the SDK's own BaseRpcProvider over the measured node, so they are
 // counted like any other request. Fees, signing and replacement are not modelled.
@@ -13,8 +13,9 @@ import type {
   TransactionRequest,
 } from '../src/chain/rpc.ts';
 import type { Address, TxHash } from '../src/common/types.ts';
+import type { RemoteChain } from './chain-client.ts';
 import { typedRequest } from './synthetic-rpc.ts';
-import type { MinedTransaction, NodeRequest, SyntheticChain } from './synthetic-rpc.ts';
+import type { MinedTransaction, NodeRequest, ProviderQueue } from './synthetic-rpc.ts';
 
 /**
  * Delivery policy the SDK reads from its client. Only `sendTimeoutMs` matters here: Guardian uses it
@@ -38,13 +39,18 @@ export interface Delivery extends MinedTransaction {
 
 export interface SyntheticClientOptions {
   readonly node: NodeRequest;
-  readonly chain: SyntheticChain;
+  readonly chain: RemoteChain;
   readonly signer: Address;
   readonly maxLogBlockRange: number;
   /** Blocks from broadcast to inclusion. */
   readonly inclusionBlocks: number;
   /** Called after each inclusion and before confirmations accumulate; faults are injected here. */
-  readonly onIncluded?: ((delivery: Delivery) => void) | undefined;
+  readonly onIncluded?: ((delivery: Delivery) => Promise<void>) | undefined;
+  /**
+   * The modelled provider's queue, when the scenario has one: a send counts as a request in flight, so
+   * the provider's answers do not move the clock while the chain server mines and confirms it.
+   */
+  readonly providerQueue?: ProviderQueue | undefined;
 }
 
 export class SyntheticClient extends BaseRpcProvider implements RpcClient {
@@ -52,11 +58,13 @@ export class SyntheticClient extends BaseRpcProvider implements RpcClient {
 
   readonly transactionPolicy = POLICY;
 
-  readonly #chain: SyntheticChain;
+  readonly #chain: RemoteChain;
 
   readonly #inclusionBlocks: number;
 
-  readonly #onIncluded: ((delivery: Delivery) => void) | undefined;
+  readonly #onIncluded: ((delivery: Delivery) => Promise<void>) | undefined;
+
+  readonly #providerQueue: ProviderQueue | undefined;
 
   readonly #deliveries: Delivery[] = [];
 
@@ -66,6 +74,7 @@ export class SyntheticClient extends BaseRpcProvider implements RpcClient {
     this.#chain = options.chain;
     this.#inclusionBlocks = options.inclusionBlocks;
     this.#onIncluded = options.onIncluded;
+    this.#providerQueue = options.providerQueue;
   }
 
   /** Every delivery so far, in order. */
@@ -82,16 +91,25 @@ export class SyntheticClient extends BaseRpcProvider implements RpcClient {
   }
 
   /** Mine the call, let the fault hook act, then advance the head to the requested depth. */
-  send(transaction: TransactionRequest, options: SendOptions): Promise<ReceiptRef> {
-    const headAtBroadcast = this.#chain.head();
-    const mined = this.#chain.include(transaction.data, this.#inclusionBlocks);
+  async send(transaction: TransactionRequest, options: SendOptions): Promise<ReceiptRef> {
+    this.#providerQueue?.startRequest();
+    try {
+      return await this.#mine(transaction, options);
+    } finally {
+      this.#providerQueue?.finishRequest();
+    }
+  }
+
+  async #mine(transaction: TransactionRequest, options: SendOptions): Promise<ReceiptRef> {
+    const headAtBroadcast = await this.#chain.head();
+    const mined = await this.#chain.include(transaction.data, this.#inclusionBlocks);
     const delivery: Delivery = { ...mined, sequence: this.#deliveries.length, headAtBroadcast };
     this.#deliveries.push(delivery);
-    this.#onIncluded?.(delivery);
-    this.#chain.advanceTo(mined.blockNumber + options.confirmations - 1);
+    await this.#onIncluded?.(delivery);
+    await this.#chain.advanceTo(mined.blockNumber + options.confirmations - 1);
     if (mined.status === 'reverted') {
-      return Promise.reject(new Error(`Synthetic ${mined.method} transaction reverted`));
+      throw new Error(`Synthetic ${mined.method} transaction reverted`);
     }
-    return Promise.resolve({ transactionHash: mined.hash, blockNumber: mined.blockNumber, blockHash: mined.blockHash });
+    return { transactionHash: mined.hash, blockNumber: mined.blockNumber, blockHash: mined.blockHash };
   }
 }

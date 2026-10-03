@@ -31,18 +31,12 @@ import type {
   ScreeningScenario,
   SubmissionFault,
 } from './scenarios.ts';
+import { startChainServer } from './chain-client.ts';
+import type { RemoteChain, WorldFacts } from './chain-client.ts';
 import { SyntheticClient } from './synthetic-client.ts';
 import type { Delivery } from './synthetic-client.ts';
-import {
-  BLOCKHASH_LOOKBACK,
-  CHAIN_ID,
-  ProviderQueue,
-  SLOT_SECONDS,
-  measuredNode,
-  providerNode,
-  timestampOf,
-} from './synthetic-rpc.ts';
-import type { ProviderProfile, RpcLatency, SyntheticChain, VirtualClock } from './synthetic-rpc.ts';
+import { BLOCKHASH_LOOKBACK, CHAIN_ID, ProviderQueue, SLOT_SECONDS, timestampOf } from './synthetic-rpc.ts';
+import type { ProviderProfile, RpcLatency, VirtualClock } from './synthetic-rpc.ts';
 import { runAnvil } from './anvil.ts';
 import { runDaemon } from './daemon.ts';
 import { runTransport } from './transport.ts';
@@ -54,23 +48,15 @@ import {
   REGISTRY,
   REPORT_BLOCK,
   REPORT_BLOCK_LAG,
-  buildWorld,
-  cycleWorld,
-  discoveryWorld,
-  griefingWorld,
-  livenessWorld,
+  SCREENING_MARKETS,
   positionAt,
-  quietWorld,
-  reconstructionWorld,
+  countScreeningTargets,
   syntheticAnchor,
 } from './worlds.ts';
-import type { CycleWorld } from './worlds.ts';
 
 const HEARTBEAT_RESERVE_BLOCKS = 8;
 
 const IDLE_HEARTBEAT_INTERVAL_SECONDS = 12 * 60 * 60;
-
-const SCREENING_MARKETS = 10;
 
 const CLEAN: ScreeningResult = { status: 'judged', requiresSuspect: false, requiresFlag: false };
 
@@ -87,7 +73,8 @@ const NO_LATENCY: RpcLatency = { everyRequestMs: 0, byLabelMs: new Map() };
 
 interface RunContext {
   readonly clock: VirtualClock;
-  readonly seed: number;
+  readonly presetName: string;
+  readonly scenarioId: string;
 }
 
 interface GuardianSettings {
@@ -102,7 +89,7 @@ interface GuardianSettings {
   /** A paid shared provider's delays and log limit instead of `rpcLatency`, when set. */
   readonly providerProfile: ProviderProfile | undefined;
   readonly provider: ProviderPlan;
-  readonly onIncluded: ((delivery: Delivery) => void) | undefined;
+  readonly onIncluded: ((delivery: Delivery) => Promise<void>) | undefined;
   /** Sees every SDK event after the harness's own observers. */
   readonly onEvent: ((event: SdkEvent) => void) | undefined;
 }
@@ -150,7 +137,7 @@ class PlanRecorder {
 }
 
 interface Harness {
-  readonly chain: SyntheticChain;
+  readonly chain: RemoteChain;
   readonly rpc: RpcMeter;
   readonly providers: ProviderMeter;
   readonly phases: PhaseTimer;
@@ -173,7 +160,7 @@ interface Settled<Result> {
 
 /** Run one scenario in this process and report what it measured. */
 export function runScenario(scenario: Scenario, clock: VirtualClock, presetName: string): Promise<RunReport> {
-  const context: RunContext = { clock, seed: scenario.seed };
+  const context: RunContext = { clock, presetName, scenarioId: scenario.id };
   const { parameters } = scenario;
   switch (parameters.family) {
     case 'discovery':
@@ -202,111 +189,137 @@ export function runScenario(scenario: Scenario, clock: VirtualClock, presetName:
 // ─── Discovery: supply logs in chunks, controller bindings and lifecycle logs in chunks.
 
 async function runDiscovery(parameters: DiscoveryScenario, context: RunContext): Promise<RunReport> {
-  const built = buildWorld(() => discoveryWorld(parameters, context.clock, context.seed));
-  const harness = harnessOf(built.world.chain, context.clock, {
-    ...DEFAULT_SETTINGS,
-    maxLogBlockRange: parameters.maxLogBlockRange,
+  return runOnChainServer(context, async (chain) => {
+    const world = await chain.build(context.presetName, context.scenarioId);
+    const harness = harnessOf(chain, world, context.clock, {
+      ...DEFAULT_SETTINGS,
+      maxLogBlockRange: parameters.maxLogBlockRange,
+    });
+    return measured(harness, world.stats, () => discoveryMeasurement(parameters, harness, world));
   });
-  return measured(harness, built.stats, async () => {
-    const plan = await planOf(harness);
-    const discovered = await harness.phases.time('discovery', () => harness.guardian.discoverCandidatePositions(plan));
-    const candidates = discovered.all().length;
-    const { world } = built;
-    const chunks = Math.ceil(parameters.rangeBlocks / parameters.maxLogBlockRange);
-    return {
-      outcome: 'discovered',
-      counts: { supplies: parameters.supplies, candidates },
-      checks: [
-        check('candidate positions', world.candidates, candidates),
-        check('core log chunks', chunks, harness.rpc.count('discovery', 'eth_getLogs:core-range')),
-        check(
-          'controller log chunks',
-          world.targetControllers * chunks,
-          harness.rpc.count('discovery', 'eth_getLogs:controller-range'),
-        ),
-        check('market controller reads', world.markets, harness.rpc.count('discovery', 'eth_call:marketController')),
-        check(
-          'controller registry reads',
-          world.controllers,
-          harness.rpc.count('discovery', 'eth_call:guardianSignals'),
-        ),
-      ],
-    };
-  });
+}
+
+async function discoveryMeasurement(
+  parameters: DiscoveryScenario,
+  harness: Harness,
+  world: WorldFacts,
+): Promise<Measured> {
+  const plan = await planOf(harness);
+  const discovered = await harness.phases.time('discovery', () => harness.guardian.discoverCandidatePositions(plan));
+  const candidates = discovered.all().length;
+  const targetControllers = readFact(world, 'targetControllers');
+  const chunks = Math.ceil(parameters.rangeBlocks / parameters.maxLogBlockRange);
+  // Each piece of supplies reads its controllers from the first unread block through its last supply, and
+  // the candidates' controllers are read once more through the report block. Those reads span at most the
+  // window and each adds at most one partial chunk, so they never grow with the number of supplies.
+  const controllerReads = harness.rpc.count('discovery', 'eth_getLogs:controller-range');
+  const readBounds = `${String(targetControllers)} to ${String(targetControllers * (2 * chunks + 1))}`;
+  const isWithinBounds =
+    controllerReads >= targetControllers && controllerReads <= targetControllers * (2 * chunks + 1);
+  return {
+    outcome: 'discovered',
+    counts: { supplies: parameters.supplies, candidates },
+    checks: [
+      check('candidate positions', readFact(world, 'candidates'), candidates),
+      check('core log chunks', chunks, harness.rpc.count('discovery', 'eth_getLogs:core-range')),
+      check('controller log reads', readBounds, isWithinBounds ? readBounds : controllerReads),
+      check(
+        'market controller reads',
+        readFact(world, 'markets'),
+        harness.rpc.count('discovery', 'eth_call:marketController'),
+      ),
+      check(
+        'controller registry reads',
+        readFact(world, 'controllers'),
+        harness.rpc.count('discovery', 'eth_call:guardianSignals'),
+      ),
+    ],
+  };
 }
 
 // ─── Reconstruction: backward lifecycle walks, wide or deep.
 
 async function runReconstruction(parameters: ReconstructionScenario, context: RunContext): Promise<RunReport> {
-  const built = buildWorld(() => reconstructionWorld(parameters, context.clock));
-  const harness = harnessOf(built.world.chain, context.clock, {
-    ...DEFAULT_SETTINGS,
-    maxLogBlockRange: parameters.maxLogBlockRange,
-  });
-  return measured(harness, built.stats, async () => {
-    const plan = await planOf(harness);
-    const discovered = await harness.phases.time('discovery', () => harness.guardian.discoverCandidatePositions(plan));
-    const work = await harness.phases.time('reconstruction', () => harness.guardian.reconstructWork(discovered));
-    const { world } = built;
-    return {
-      outcome: 'reconstructed',
-      counts: {
-        supplies: world.supplies,
-        candidates: discovered.all().length,
-        positions: work.positions,
-        anchors: work.anchors,
-        historyEvents: world.events,
-        controllerRangeCalls: harness.rpc.count('reconstruction', 'eth_getLogs:controller-range'),
-      },
-      checks: [
-        check('work anchors', world.anchors, work.anchors),
-        check('work positions', parameters.positions, work.positions),
-      ],
-    };
+  return runOnChainServer(context, async (chain) => {
+    const world = await chain.build(context.presetName, context.scenarioId);
+    const harness = harnessOf(chain, world, context.clock, {
+      ...DEFAULT_SETTINGS,
+      maxLogBlockRange: parameters.maxLogBlockRange,
+    });
+    return measured(harness, world.stats, async () => {
+      const plan = await planOf(harness);
+      const discovered = await harness.phases.time('discovery', () =>
+        harness.guardian.discoverCandidatePositions(plan),
+      );
+      const work = await harness.phases.time('reconstruction', () => harness.guardian.reconstructWork(discovered));
+      return {
+        outcome: 'reconstructed',
+        counts: {
+          supplies: readFact(world, 'supplies'),
+          candidates: discovered.all().length,
+          positions: work.positions,
+          anchors: work.anchors,
+          historyEvents: readFact(world, 'events'),
+          controllerRangeCalls: harness.rpc.count('reconstruction', 'eth_getLogs:controller-range'),
+        },
+        checks: [
+          check('work anchors', readFact(world, 'anchors'), work.anchors),
+          check('work positions', parameters.positions, work.positions),
+        ],
+      };
+    });
   });
 }
 
 // ─── Screening: own-flag reads, the provider request and positional validation.
 
 async function runScreening(parameters: ScreeningScenario, context: RunContext): Promise<RunReport> {
-  const built = buildWorld(() => quietWorld(context.clock));
-  const harness = harnessOf(built.world, context.clock, {
-    ...DEFAULT_SETTINGS,
-    flaggerReadConcurrency: parameters.flaggerReadConcurrency,
-    rpcLatency: { everyRequestMs: 0, byLabelMs: new Map([['eth_call:getFlaggedBy', parameters.flaggerLatencyMs]]) },
-    provider: {
-      decide: (index, count) =>
-        isIncompleteAt(parameters.incomplete, index, count) ? { status: 'incomplete' } : CLEAN,
-      latency: { kind: 'real', ms: parameters.providerLatencyMs },
-    },
-  });
-  const plan = await planOf(harness);
-  const input = screeningInput(parameters, plan, built.world);
-  return measured(harness, built.stats, async () => {
-    const result = await settle(
-      () => harness.phases.time('screening', () => harness.guardian.screenWork(input.work)),
-      () => 'screened',
-    );
-    const expectedOutcome = parameters.incomplete === 'none' ? 'screened' : 'stop:screening-result-incomplete';
-    return {
-      outcome: result.outcome,
-      counts: {
-        anchors: input.work.anchors,
-        targets: input.targets,
-        ownFlaggedTargets: input.ownFlagged,
-        skippedTargets: result.value?.skipped.length ?? 0,
+  return runOnChainServer(context, async (chain) => {
+    const world = await chain.build(context.presetName, context.scenarioId);
+    const harness = harnessOf(chain, world, context.clock, {
+      ...DEFAULT_SETTINGS,
+      flaggerReadConcurrency: parameters.flaggerReadConcurrency,
+      rpcLatency: { everyRequestMs: 0, byLabelMs: new Map([['eth_call:getFlaggedBy', parameters.flaggerLatencyMs]]) },
+      provider: {
+        decide: (index, count) =>
+          isIncompleteAt(parameters.incomplete, index, count) ? { status: 'incomplete' } : CLEAN,
+        latency: { kind: 'real', ms: parameters.providerLatencyMs },
       },
-      checks: [
-        check('outcome', expectedOutcome, result.outcome),
-        check('flagger reads', input.targets, harness.rpc.count('screening', 'eth_call:getFlaggedBy')),
-        check(
-          'anchors sent to the provider',
-          (input.targets - input.ownFlagged) * parameters.anchorsPerTarget,
-          harness.providers.totals().providerAnchors,
-        ),
-      ],
-    };
+    });
+    const plan = await planOf(harness);
+    return measured(harness, world.stats, () => screeningMeasurement(parameters, harness, plan));
   });
+}
+
+async function screeningMeasurement(
+  parameters: ScreeningScenario,
+  harness: Harness,
+  plan: ScanPlan,
+): Promise<Measured> {
+  const input = screeningInput(parameters, plan);
+  const result = await settle(
+    () => harness.phases.time('screening', () => harness.guardian.screenWork(input.work)),
+    () => 'screened',
+  );
+  const expectedOutcome = parameters.incomplete === 'none' ? 'screened' : 'stop:screening-result-incomplete';
+  return {
+    outcome: result.outcome,
+    counts: {
+      anchors: input.work.anchors,
+      targets: input.targets,
+      ownFlaggedTargets: input.ownFlagged,
+      skippedTargets: result.value?.skipped.length ?? 0,
+    },
+    checks: [
+      check('outcome', expectedOutcome, result.outcome),
+      check('flagger reads', input.targets, harness.rpc.count('screening', 'eth_call:getFlaggedBy')),
+      check(
+        'anchors sent to the provider',
+        (input.targets - input.ownFlagged) * parameters.anchorsPerTarget,
+        harness.providers.totals().providerAnchors,
+      ),
+    ],
+  };
 }
 
 function isIncompleteAt(incomplete: ScreeningScenario['incomplete'], index: number, count: number): boolean {
@@ -316,23 +329,19 @@ function isIncompleteAt(incomplete: ScreeningScenario['incomplete'], index: numb
   return incomplete === 'last' ? index === count - 1 : false;
 }
 
+/** The screening scenario's work; the chain server's world holds this Guardian's flags on the first targets. */
 function screeningInput(
   parameters: ScreeningScenario,
   plan: ScanPlan,
-  chain: SyntheticChain,
 ): { readonly work: Work; readonly targets: number; readonly ownFlagged: number } {
-  const targets = Math.max(1, Math.floor(parameters.anchors / parameters.anchorsPerTarget));
-  const ownFlagged = Math.round(targets * parameters.ownFlagShare);
+  const { targets, ownFlagged } = countScreeningTargets(parameters);
   const byPosition = new Map<PositionKey, readonly SupplyAnchor[]>();
   for (let target = 0; target < targets; target += 1) {
     const position = positionAt(target, SCREENING_MARKETS);
     const anchors = Array.from({ length: parameters.anchorsPerTarget }, (_anchor, index) =>
-      syntheticAnchor(position, target * parameters.anchorsPerTarget + index, chain),
+      syntheticAnchor(position, target * parameters.anchorsPerTarget + index),
     );
     byPosition.set(position, anchors);
-    if (target < ownFlagged) {
-      chain.flag(position.marketId, position.borrower, GUARDIAN);
-    }
   }
   return { work: new Work(plan, byPosition), targets, ownFlagged };
 }
@@ -349,33 +358,35 @@ const FAULT_OUTCOMES: Readonly<Record<SubmissionFault, string>> = {
 };
 
 async function runReports(parameters: ReportsScenario, context: RunContext): Promise<RunReport> {
-  const built = buildWorld(() => quietWorld(context.clock));
-  const reportTransactions = expectedReportTransactions(parameters);
-  const harness = harnessOf(built.world, context.clock, {
-    ...DEFAULT_SETTINGS,
-    maxSignalBatchSize: parameters.maxSignalBatchSize,
-    txConfirmationBlocks: parameters.txConfirmationBlocks,
-    interBatchConfirmationBlocks: parameters.interBatchConfirmationBlocks,
-    onIncluded: faultHook(parameters.fault, reportTransactions, built.world, context.clock),
-  });
-  const plan = await planOf(harness);
-  const screened = submissionInput(plan, parameters, built.world);
-  return measured(harness, built.stats, async () => {
-    const result = await settle(
-      () => harness.phases.time('signal', () => harness.guardian.signalAndHeartbeat(screened)),
-      outcomeOf,
-    );
-    return {
-      outcome: result.outcome,
-      counts: {
-        targets: parameters.targets,
-        anchors: parameters.targets,
-        suspects: screened.suspects.length,
-        flags: screened.flags.length,
-        ...livenessCounts(harness),
-      },
-      checks: reportChecks(parameters, { outcome: result.outcome, harness, reportTransactions }),
-    };
+  return runOnChainServer(context, async (chain) => {
+    const world = await chain.build(context.presetName, context.scenarioId);
+    const reportTransactions = expectedReportTransactions(parameters);
+    const harness = harnessOf(chain, world, context.clock, {
+      ...DEFAULT_SETTINGS,
+      maxSignalBatchSize: parameters.maxSignalBatchSize,
+      txConfirmationBlocks: parameters.txConfirmationBlocks,
+      interBatchConfirmationBlocks: parameters.interBatchConfirmationBlocks,
+      onIncluded: faultHook(parameters.fault, reportTransactions, chain, context.clock),
+    });
+    const plan = await planOf(harness);
+    const screened = submissionInput(plan, parameters);
+    return measured(harness, world.stats, async () => {
+      const result = await settle(
+        () => harness.phases.time('signal', () => harness.guardian.signalAndHeartbeat(screened)),
+        outcomeOf,
+      );
+      return {
+        outcome: result.outcome,
+        counts: {
+          targets: parameters.targets,
+          anchors: parameters.targets,
+          suspects: screened.suspects.length,
+          flags: screened.flags.length,
+          ...(await livenessCounts(harness)),
+        },
+        checks: reportChecks(parameters, { outcome: result.outcome, harness, reportTransactions }),
+      };
+    });
   });
 }
 
@@ -425,13 +436,12 @@ function targetsPerMarket(targets: number, markets: number): number[] {
 function submissionInput(
   plan: ScanPlan,
   parameters: { readonly targets: number; readonly markets: number; readonly decision: Decision },
-  chain: SyntheticChain,
 ): Screened {
   const byPosition = new Map<PositionKey, readonly SupplyAnchor[]>();
   const pending: PendingTarget[] = [];
   for (let target = 0; target < parameters.targets; target += 1) {
     const position = positionAt(target, parameters.markets);
-    const anchors = [syntheticAnchor(position, target, chain)];
+    const anchors = [syntheticAnchor(position, target)];
     byPosition.set(position, anchors);
     pending.push({ target: { marketId: position.marketId, borrower: position.borrower }, anchors });
   }
@@ -444,21 +454,21 @@ function submissionInput(
 function faultHook(
   fault: SubmissionFault,
   reportTransactions: number,
-  chain: SyntheticChain,
+  chain: RemoteChain,
   clock: VirtualClock,
-): ((delivery: Delivery) => void) | undefined {
+): ((delivery: Delivery) => Promise<void>) | undefined {
   if (fault === 'none') {
     return undefined;
   }
   const trigger = triggerOf(fault, reportTransactions);
   let hasFired = false;
-  return (delivery) => {
+  return async (delivery) => {
     const isTrigger = delivery.method !== 'heartbeat' && delivery.sequence === trigger;
     if (!isTrigger || hasFired) {
       return;
     }
     hasFired = true;
-    applyFault(fault, delivery, chain, clock);
+    await applyFault(fault, delivery, chain, clock);
   };
 }
 
@@ -469,16 +479,21 @@ function triggerOf(fault: SubmissionFault, reportTransactions: number): number {
   return fault.endsWith('-middle') ? Math.floor((reportTransactions - 1) / 2) : reportTransactions - 1;
 }
 
-function applyFault(fault: SubmissionFault, delivery: Delivery, chain: SyntheticChain, clock: VirtualClock): void {
+async function applyFault(
+  fault: SubmissionFault,
+  delivery: Delivery,
+  chain: RemoteChain,
+  clock: VirtualClock,
+): Promise<void> {
   if (fault.startsWith('reorg-')) {
-    chain.reorgFrom(REPORT_BLOCK);
+    await chain.reorgFrom(REPORT_BLOCK);
     return;
   }
   if (fault.startsWith('age-out-')) {
     clock.advanceSlots(BLOCKHASH_LOOKBACK);
     return;
   }
-  chain.dropTransaction(delivery.hash);
+  await chain.dropTransaction(delivery.hash);
 }
 
 // ─── Whole cycles.
@@ -514,24 +529,26 @@ const CYCLE_FAULTS: Readonly<Record<CycleProfile, SubmissionFault>> = {
 };
 
 async function runCycle(parameters: CycleScenario, context: RunContext): Promise<RunReport> {
-  const built = buildWorld(() => cycleWorld(parameters, context.clock));
-  const reportTransactions = expectedReportTransactions({
-    targets: built.world.targets,
-    markets: CYCLE_MARKETS,
-    decision: parameters.decision,
-    maxSignalBatchSize: DEFAULT_SETTINGS.maxSignalBatchSize,
-  });
-  const decision = DECISIONS[parameters.decision];
-  const harness = harnessOf(built.world.chain, context.clock, {
-    ...DEFAULT_SETTINGS,
-    rpcLatency: { everyRequestMs: parameters.rpcLatencyMs, byLabelMs: new Map() },
-    provider: { decide: () => decision, latency: { kind: 'virtual', ms: parameters.providerLatencyMs } },
-    onIncluded: faultHook(CYCLE_FAULTS[parameters.profile], reportTransactions, built.world.chain, context.clock),
-  });
-  const attempts = parameters.profile === 'restart-after-stale' ? 2 : 1;
-  return measured(harness, built.stats, async () => {
-    const run = await cycleAttempts(harness, attempts);
-    return cycleMeasurement(parameters, { harness, run, world: built.world, reportTransactions });
+  return runOnChainServer(context, async (chain) => {
+    const world = await chain.build(context.presetName, context.scenarioId);
+    const reportTransactions = expectedReportTransactions({
+      targets: readFact(world, 'targets'),
+      markets: CYCLE_MARKETS,
+      decision: parameters.decision,
+      maxSignalBatchSize: DEFAULT_SETTINGS.maxSignalBatchSize,
+    });
+    const decision = DECISIONS[parameters.decision];
+    const harness = harnessOf(chain, world, context.clock, {
+      ...DEFAULT_SETTINGS,
+      rpcLatency: { everyRequestMs: parameters.rpcLatencyMs, byLabelMs: new Map() },
+      provider: { decide: () => decision, latency: { kind: 'virtual', ms: parameters.providerLatencyMs } },
+      onIncluded: faultHook(CYCLE_FAULTS[parameters.profile], reportTransactions, chain, context.clock),
+    });
+    const attempts = parameters.profile === 'restart-after-stale' ? 2 : 1;
+    return measured(harness, world.stats, async () => {
+      const run = await cycleAttempts(harness, attempts);
+      return cycleMeasurement(parameters, { harness, run, world, reportTransactions });
+    });
   });
 }
 
@@ -555,37 +572,37 @@ async function cycleAttempts(harness: Harness, attempts: number): Promise<CycleR
   return { outcomes, anchorsByAttempt };
 }
 
-function cycleMeasurement(
+async function cycleMeasurement(
   parameters: CycleScenario,
   input: {
     readonly harness: Harness;
     readonly run: CycleRun;
-    readonly world: CycleWorld;
+    readonly world: WorldFacts;
     readonly reportTransactions: number;
   },
-): Measured {
+): Promise<Measured> {
   const outcome = input.run.outcomes.at(-1) ?? 'error:no attempt';
   const [original = 0, reprocessed = 0] = input.run.anchorsByAttempt;
   return {
     outcome,
     counts: {
-      supplies: input.world.supplies,
-      anchors: input.world.anchors,
-      targets: input.world.targets,
+      supplies: readFact(input.world, 'supplies'),
+      anchors: readFact(input.world, 'anchors'),
+      targets: readFact(input.world, 'targets'),
       restarts: input.run.outcomes.length - 1,
       originalAnchors: original,
       reprocessedAnchors: reprocessed,
-      ...livenessCounts(input.harness),
+      ...(await livenessCounts(input.harness)),
     },
-    checks: cycleChecks(parameters, outcome, input),
+    checks: await cycleChecks(parameters, outcome, input),
   };
 }
 
-function cycleChecks(
+async function cycleChecks(
   parameters: CycleScenario,
   outcome: string,
   input: { readonly harness: Harness; readonly run: CycleRun; readonly reportTransactions: number },
-): Check[] {
+): Promise<Check[]> {
   const checks = [outcomeCheck(expectedCycleOutcome(parameters), outcome)];
   if (parameters.profile === 'restart-after-stale') {
     checks.push(check('first attempt', 'stale:report-block-aged-out', input.run.outcomes[0] ?? 'none'));
@@ -596,7 +613,7 @@ function cycleChecks(
     const resends = CYCLE_FAULTS[parameters.profile] === 'receipt-lost-after-last' ? 1 : 0;
     const transactions = input.reportTransactions + resends + 1;
     checks.push(check('transactions', transactions, input.harness.client.deliveries().length));
-    checks.push(heartbeatCheck(input.harness));
+    checks.push(await heartbeatCheck(input.harness));
   }
   return checks;
 }
@@ -619,10 +636,10 @@ function outcomeCheck(expected: string | null, outcome: string): Check {
   return check('outcome', expected, actual);
 }
 
-function heartbeatCheck(harness: Harness): Check {
+async function heartbeatCheck(harness: Harness): Promise<Check> {
   const reportBlocks = harness.plans.reportBlocks();
   const expected = reportBlocks === undefined ? 0 : timestampOf(reportBlocks.last);
-  return check('stored heartbeat', expected, harness.chain.heartbeatTimestamp());
+  return check('stored heartbeat', expected, await harness.chain.heartbeatTimestamp());
 }
 
 // ─── Liveness: how many targets one submission can confirm before the report block ages out.
@@ -634,40 +651,44 @@ interface Probe {
 }
 
 async function runLiveness(parameters: LivenessScenario, context: RunContext): Promise<RunReport> {
-  const window = new ResourceWindow();
-  const capacity = await capacityOf(parameters, context);
-  const atCapacity = await cycleProbe(parameters, capacity, context);
-  const beyond = capacity < parameters.maxTargets ? await cycleProbe(parameters, capacity + 1, context) : undefined;
-  return reportOf(atCapacity.harness, {
-    usage: window.close(),
-    stats: {},
-    result: {
-      outcome: `capacity ${String(capacity)}`,
-      counts: {
-        capacityTargets: capacity,
-        capacityBatches: expectedReportTransactions({ ...parameters, targets: capacity }),
-        targets: capacity,
-        anchors: capacity,
-        ...livenessCounts(atCapacity.harness),
+  return runOnChainServer(context, async (chain) => {
+    const window = new ResourceWindow();
+    const capacity = await capacityOf(parameters, context, chain);
+    const atCapacity = await cycleProbe(parameters, capacity, context, chain);
+    const atCapacityCounts = await livenessCounts(atCapacity.harness);
+    const isBelowBound = capacity < parameters.maxTargets;
+    const beyond = isBelowBound ? await cycleProbe(parameters, capacity + 1, context, chain) : undefined;
+    return reportOf(atCapacity.harness, {
+      usage: window.close(),
+      stats: {},
+      result: {
+        outcome: `capacity ${String(capacity)}`,
+        counts: {
+          capacityTargets: capacity,
+          capacityBatches: expectedReportTransactions({ ...parameters, targets: capacity }),
+          targets: capacity,
+          anchors: capacity,
+          ...atCapacityCounts,
+        },
+        checks: [
+          check('capacity attests', 'attested', atCapacity.outcome),
+          ...(beyond === undefined ? [] : [check('one more target', 'stale:report-block-aged-out', beyond.outcome)]),
+        ],
       },
-      checks: [
-        check('capacity attests', 'attested', atCapacity.outcome),
-        ...(beyond === undefined ? [] : [check('one more target', 'stale:report-block-aged-out', beyond.outcome)]),
-      ],
-    },
+    });
   });
 }
 
 /** The largest target count that still attests, by bisection: more targets never need fewer blocks. */
-async function capacityOf(parameters: LivenessScenario, context: RunContext): Promise<number> {
-  if ((await cycleProbe(parameters, parameters.maxTargets, context)).outcome === 'attested') {
+async function capacityOf(parameters: LivenessScenario, context: RunContext, chain: RemoteChain): Promise<number> {
+  if ((await cycleProbe(parameters, parameters.maxTargets, context, chain)).outcome === 'attested') {
     return parameters.maxTargets;
   }
   let attests = 0;
   let fails = parameters.maxTargets;
   while (fails - attests > 1) {
     const middle = Math.floor((attests + fails) / 2);
-    const probe = await cycleProbe(parameters, middle, context);
+    const probe = await cycleProbe(parameters, middle, context, chain);
     if (probe.outcome === 'attested') {
       attests = middle;
     } else {
@@ -679,21 +700,29 @@ async function capacityOf(parameters: LivenessScenario, context: RunContext): Pr
 
 /**
  * A Guardian's first cycle over `targets` due positions against the modelled provider: it reads every
- * position's history, screens it at once with the scenario's decision, then reports and attests.
+ * position's history, screens it with the scenario's decision and delay, then reports and attests.
  */
-async function cycleProbe(parameters: LivenessScenario, targets: number, context: RunContext): Promise<Probe> {
+async function cycleProbe(
+  parameters: LivenessScenario,
+  targets: number,
+  context: RunContext,
+  chain: RemoteChain,
+): Promise<Probe> {
   // The provider's delays are shorter than a slot, so every probe starts at a slot boundary; otherwise
   // where in its first slot a probe began could move its outcome near the capacity.
   context.clock.advanceSlots(1);
-  const chain = livenessWorld(targets, parameters.markets, context.clock);
-  const harness = harnessOf(chain, context.clock, {
+  const world = await chain.build(context.presetName, context.scenarioId, targets);
+  const harness = harnessOf(chain, world, context.clock, {
     ...DEFAULT_SETTINGS,
     maxSignalBatchSize: parameters.maxSignalBatchSize,
     txConfirmationBlocks: parameters.txConfirmationBlocks,
     interBatchConfirmationBlocks: parameters.interBatchConfirmationBlocks,
     inclusionBlocks: parameters.inclusionBlocks,
     providerProfile: { queue: new ProviderQueue(context.clock), logLimit: undefined },
-    provider: { decide: () => DECISIONS[parameters.decision], latency: { kind: 'virtual', ms: 0 } },
+    provider: {
+      decide: () => DECISIONS[parameters.decision],
+      latency: { kind: 'virtual', ms: parameters.screeningLatencyMs },
+    },
   });
   const result = await settle(() => harness.guardian.cycle(null), outcomeOf);
   return { targets, harness, outcome: result.outcome };
@@ -751,7 +780,7 @@ interface GriefingProbe {
 
 async function runGriefing(parameters: GriefingScenario, context: RunContext): Promise<RunReport> {
   const window = new ResourceWindow();
-  const search = await searchCapacity(parameters, context);
+  const search = await runOnChainServer(context, (chain) => searchCapacity(parameters, context, chain));
   const usage = window.close();
   const { fits, breaks } = search;
   const capacity = fits?.operations ?? 0;
@@ -794,33 +823,49 @@ interface CapacitySearch {
  * The largest attack that still attests: double from a hundred operations until one breaks the cycle
  * or the bound is reached, then bisect to within two percent.
  */
-async function searchCapacity(parameters: GriefingScenario, context: RunContext): Promise<CapacitySearch> {
-  const doubled = await doubleUntilBreak(parameters, context);
+async function searchCapacity(
+  parameters: GriefingScenario,
+  context: RunContext,
+  chain: RemoteChain,
+): Promise<CapacitySearch> {
+  const doubled = await doubleUntilBreak(parameters, context, chain);
   const { breaks } = doubled;
-  return breaks === undefined ? doubled : bisect(parameters, context, { ...doubled, breaks });
+  return breaks === undefined ? doubled : bisect(parameters, { context, chain }, { ...doubled, breaks });
 }
 
-async function doubleUntilBreak(parameters: GriefingScenario, context: RunContext): Promise<CapacitySearch> {
+async function doubleUntilBreak(
+  parameters: GriefingScenario,
+  context: RunContext,
+  chain: RemoteChain,
+): Promise<CapacitySearch> {
   let fits: GriefingProbe | undefined;
   let probes = 0;
-  let operations = Math.min(FIRST_PROBE_OPERATIONS, parameters.maxOperations);
+  const bound = searchBound(parameters);
+  let operations = Math.min(FIRST_PROBE_OPERATIONS, bound);
   while (true) {
-    const probe = await griefingProbe(parameters, operations, context);
+    const probe = await griefingProbe(parameters, operations, context, chain);
     probes += 1;
     if (probe.failure !== null) {
       return { fits, breaks: probe, probes };
     }
     fits = probe;
-    if (operations === parameters.maxOperations) {
+    if (operations === bound) {
       return { fits, breaks: undefined, probes };
     }
-    operations = Math.min(operations * 2, parameters.maxOperations);
+    operations = Math.min(operations * 2, bound);
   }
+}
+
+/** The largest attack the search tries: the scenario's operations, or fewer when its gas budget buys fewer. */
+function searchBound(parameters: GriefingScenario): number {
+  const gweiPerOperation = OPERATION_GAS[parameters.attack] * CHEAP_BASE_FEE_GWEI;
+  const affordable = Math.floor((parameters.maxAttackCostEth * GWEI_PER_ETH) / gweiPerOperation);
+  return Math.min(parameters.maxOperations, affordable);
 }
 
 async function bisect(
   parameters: GriefingScenario,
-  context: RunContext,
+  run: { readonly context: RunContext; readonly chain: RemoteChain },
   bracket: CapacitySearch & { readonly breaks: GriefingProbe },
 ): Promise<CapacitySearch> {
   let { fits, breaks, probes } = bracket;
@@ -829,7 +874,7 @@ async function bisect(
     if (breaks.operations - low <= Math.max(1, Math.floor(low * SEARCH_PRECISION))) {
       return { fits, breaks, probes };
     }
-    const probe = await griefingProbe(parameters, Math.floor((low + breaks.operations) / 2), context);
+    const probe = await griefingProbe(parameters, Math.floor((low + breaks.operations) / 2), run.context, run.chain);
     probes += 1;
     if (probe.failure === null) {
       fits = probe;
@@ -844,10 +889,11 @@ async function griefingProbe(
   parameters: GriefingScenario,
   operations: number,
   context: RunContext,
+  chain: RemoteChain,
 ): Promise<GriefingProbe> {
-  const world = griefingWorld(parameters, operations, context.clock);
+  const world = await chain.build(context.presetName, context.scenarioId, operations);
   let candidates = 0;
-  const harness = harnessOf(world.chain, context.clock, {
+  const harness = harnessOf(chain, world, context.clock, {
     ...DEFAULT_SETTINGS,
     providerProfile: {
       queue: new ProviderQueue(context.clock),
@@ -875,7 +921,7 @@ async function griefingProbe(
     failure,
     candidates,
     metrics: {
-      ...livenessCounts(harness),
+      ...(await livenessCounts(harness)),
       ...harness.rpc.totals(),
       memoryGrowthMb,
       cycleCpuMs: (cpu.user + cpu.system) / 1_000,
@@ -942,15 +988,12 @@ class MemoryPeak {
 
 // ─── Shared construction and measurement.
 
-function harnessOf(chain: SyntheticChain, clock: VirtualClock, settings: GuardianSettings): Harness {
+function harnessOf(chain: RemoteChain, world: WorldFacts, clock: VirtualClock, settings: GuardianSettings): Harness {
   const rpc = new RpcMeter();
   const providers = new ProviderMeter();
   const phases = new PhaseTimer(rpc);
   const plans = new PlanRecorder();
-  const node =
-    settings.providerProfile === undefined
-      ? measuredNode(chain, rpc, settings.rpcLatency)
-      : providerNode(chain, rpc, settings.providerProfile);
+  const node = chain.createNodeRequest(rpc, { latency: settings.rpcLatency, provider: settings.providerProfile });
   const client = new SyntheticClient({
     node,
     chain,
@@ -958,6 +1001,7 @@ function harnessOf(chain: SyntheticChain, clock: VirtualClock, settings: Guardia
     maxLogBlockRange: settings.maxLogBlockRange,
     inclusionBlocks: settings.inclusionBlocks,
     onIncluded: settings.onIncluded,
+    providerQueue: settings.providerProfile?.queue,
   });
   const guardian = new Guardian({
     client,
@@ -966,8 +1010,8 @@ function harnessOf(chain: SyntheticChain, clock: VirtualClock, settings: Guardia
     deployment: {
       chainId: CHAIN_ID,
       slotSeconds: SLOT_SECONDS,
-      lidoLend: { address: CORE, deploymentBlock: chain.layout.coreDeploymentBlock },
-      guardianSignals: { address: REGISTRY, deploymentBlock: chain.layout.registryDeploymentBlock },
+      lidoLend: { address: CORE, deploymentBlock: readFact(world, 'coreDeploymentBlock') },
+      guardianSignals: { address: REGISTRY, deploymentBlock: readFact(world, 'registryDeploymentBlock') },
     },
     screening: providers.provider(settings.provider, clock),
     onEvent: (event) => {
@@ -985,6 +1029,28 @@ function harnessOf(chain: SyntheticChain, clock: VirtualClock, settings: Guardia
     txConfirmationBlocks: settings.txConfirmationBlocks,
   });
   return { chain, rpc, providers, phases, plans, client, guardian };
+}
+
+/** Run `operation` against a chain server of its own, and stop the server afterwards. */
+async function runOnChainServer<Result>(
+  context: RunContext,
+  operation: (chain: RemoteChain) => Promise<Result>,
+): Promise<Result> {
+  const server = await startChainServer(context.clock);
+  try {
+    return await operation(server.chain);
+  } finally {
+    server.stop();
+  }
+}
+
+/** A number the chain server reported about the world it built. */
+function readFact(world: WorldFacts, name: string): number {
+  const value = world.facts[name];
+  if (value === undefined) {
+    throw new Error(`The chain server reported no ${name}`);
+  }
+  return value;
 }
 
 async function planOf(harness: Harness): Promise<ScanPlan> {
@@ -1062,7 +1128,7 @@ function transactionCounts(deliveries: readonly Delivery[]): {
 }
 
 /** Where the blockhash budget went: from planning to the heartbeat broadcast, or to the stop. */
-function livenessCounts(harness: Harness): Record<string, number> {
+async function livenessCounts(harness: Harness): Promise<Record<string, number>> {
   const reportBlocks = harness.plans.reportBlocks();
   if (reportBlocks === undefined) {
     return {};
@@ -1070,7 +1136,7 @@ function livenessCounts(harness: Harness): Record<string, number> {
   const deliveries = harness.client.deliveries();
   const heartbeat = deliveries.find((delivery) => delivery.method === 'heartbeat');
   const headAtPlanning = reportBlocks.first + REPORT_BLOCK_LAG;
-  const headAtHeartbeat = heartbeat?.headAtBroadcast ?? harness.chain.head();
+  const headAtHeartbeat = heartbeat?.headAtBroadcast ?? (await harness.chain.head());
   return {
     reportBlock: reportBlocks.last,
     headAtPlanning,

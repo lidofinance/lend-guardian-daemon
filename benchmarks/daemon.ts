@@ -15,8 +15,8 @@ import type { DaemonScenario } from './scenarios.ts';
 import { realDelay } from './synthetic-rpc.ts';
 import { CLEAN_SCREENING, observeGuardian, observeOnce } from './transport.ts';
 
-/** The transport of the `observe-cycle` condition, with the daemon's ten-second request timeout. */
-const OBSERVE_CYCLE = { condition: 'observe-cycle', timeoutMs: 10_000 } as const;
+/** The transport of the `observe-cycle` condition, with the daemon's 30-second request timeout. */
+const OBSERVE_CYCLE = { condition: 'observe-cycle', timeoutMs: 30_000 } as const;
 
 /** Longer than the five seconds after which the daemon gives up on a post. */
 const DELIVERY_DEADLINE_MS = 15_000;

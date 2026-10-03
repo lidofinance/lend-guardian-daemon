@@ -73,6 +73,11 @@ export function timestampOf(blockNumber: number): number {
   return GENESIS_TIMESTAMP + blockNumber * SLOT_SECONDS;
 }
 
+/** The hash of a synthetic block in the fork `epoch`: zero before any reorg. */
+export function computeBlockHash(blockNumber: number, epoch: number): Bytes32 {
+  return numberToHex(BLOCK_TAG | (BigInt(epoch) << WORD_BITS) | BigInt(blockNumber), { size: 32 });
+}
+
 export function transactionHashOf(blockNumber: number, transactionIndex: number): TxHash {
   return numberToHex(TRANSACTION_TAG | (BigInt(blockNumber) << WORD_BITS) | BigInt(transactionIndex), { size: 32 });
 }
@@ -121,6 +126,21 @@ export class VirtualClock {
     this.#simulatedMs += milliseconds;
   }
 
+  /** Set the time: the chain server takes each request's chain time from the measured process. */
+  setNow(milliseconds: number): void {
+    this.#simulatedMs += milliseconds - this.#elapsedMs();
+  }
+
+  /** Move forward to `milliseconds` when behind it, as the measured process does with the server's time. */
+  catchUp(milliseconds: number): void {
+    this.#simulatedMs += Math.max(0, milliseconds - this.#elapsedMs());
+  }
+
+  /** Take back real time that is not chain time, such as building a world in the chain server. */
+  discountRealTime(milliseconds: number): void {
+    this.#simulatedMs -= this.#realTimeScale * milliseconds;
+  }
+
   /** Move to the start of the slot `count` slots after the current one. */
   advanceSlots(count: number): void {
     const targetMs = (this.slots() + count) * this.#slotMs;
@@ -133,20 +153,17 @@ export class VirtualClock {
 }
 
 /**
- * Delays of a paid shared provider, modelled on one we measured: a log read that finds nothing is the
- * slowest, one that returns logs takes a fraction of that, and any other request one network exchange.
- */
-const SHARED_PROVIDER_DELAYS = { emptyLogReadMs: 2_000, logReadMs: 400, otherMs: 50 } as const;
-
-/**
- * Requests to a remote provider, each answered after its own delay of chain time. Once the process
- * has sent all it can, the clock moves to the next answer, so requests in flight overlap and a slow
- * answer holds up only the work that waits for it.
+ * Requests to a remote provider, each answered after its own delay of chain time from when it was sent.
+ * The clock moves to the next answer only once every request in flight has its answer queued and the
+ * process has sent all it can, so requests in flight overlap and a slow answer holds up only the work
+ * that waits for it, however the loopback server's real answers interleave.
  */
 export class ProviderQueue {
   readonly #clock: VirtualClock;
 
   #pending: { readonly answerAt: number; readonly resolve: () => void }[] = [];
+
+  #inFlight = 0;
 
   #isScheduled = false;
 
@@ -154,10 +171,23 @@ export class ProviderQueue {
     this.#clock = clock;
   }
 
-  /** Settles when the answer to a request sent now arrives, `delayMs` of chain time later. */
-  wait(delayMs: number): Promise<void> {
+  /** Count a request as sent; returns the chain time it was sent at. */
+  startRequest(): number {
+    this.#inFlight += 1;
+    return this.#clock.now();
+  }
+
+  /** Count a request that takes no chain time as answered, such as one the synthetic client mines. */
+  finishRequest(): void {
+    this.#inFlight -= 1;
+    this.#schedule();
+  }
+
+  /** Settles when the answer to a request sent at `sentAt` arrives, `delayMs` of chain time later. */
+  waitForAnswer(sentAt: number, delayMs: number): Promise<void> {
+    this.#inFlight -= 1;
     return new Promise((resolve) => {
-      this.#pending.push({ answerAt: this.#clock.now() + delayMs, resolve });
+      this.#pending.push({ answerAt: sentAt + delayMs, resolve });
       this.#schedule();
     });
   }
@@ -175,11 +205,12 @@ export class ProviderQueue {
 
   /** Move the clock to the earliest answer and deliver every answer due by then. */
   #answerNext(): void {
-    if (this.#pending.length === 0) {
+    const hasInFlight = this.#inFlight > 0;
+    if (hasInFlight || this.#pending.length === 0) {
       return;
     }
     const next = Math.min(...this.#pending.map((request) => request.answerAt));
-    this.#clock.pass(Math.max(0, next - this.#clock.now()));
+    this.#clock.catchUp(next);
     const now = this.#clock.now();
     const due = this.#pending.filter((request) => request.answerAt <= now);
     this.#pending = this.#pending.filter((request) => request.answerAt > now);
@@ -412,8 +443,7 @@ export class SyntheticChain {
   }
 
   hashOf(blockNumber: number): Bytes32 {
-    const epoch = this.#epochOf(blockNumber);
-    return numberToHex(BLOCK_TAG | (BigInt(epoch) << WORD_BITS) | BigInt(blockNumber), { size: 32 });
+    return computeBlockHash(blockNumber, this.#epochOf(blockNumber));
   }
 
   /** Replace every block from `blockNumber` with a new fork; receipts in those blocks disappear. */
@@ -696,58 +726,11 @@ export interface RpcLatency {
   readonly byLabelMs: ReadonlyMap<string, number>;
 }
 
-/** The node boundary the SDK reads through: every answer is timed and counted before it returns. */
-export function measuredNode(chain: SyntheticChain, observer: RpcObserver, latency: RpcLatency): NodeRequest {
-  return async (method, params) => {
-    const { answer, handlerMs } = answerOrRecordFailure(chain, observer, method, params);
-    const latencyMs = latency.byLabelMs.get(answer.label) ?? latency.everyRequestMs;
-    observer.answered(answer, handlerMs, latencyMs);
-    await realDelay(latencyMs);
-    return answer.value;
-  };
-}
-
-/** The daemon's transport refuses a response body above ten megabytes (`maxResponseBodySize`). */
-const TRANSPORT_RESPONSE_LIMIT_BYTES = 10 * 1_048_576;
-
 /** A paid shared provider as a cycle meets it: answers after their delays, and the largest log list it serves. */
 export interface ProviderProfile {
   readonly queue: ProviderQueue;
   /** Undefined when the provider serves a log list of any length. */
   readonly logLimit: number | undefined;
-}
-
-/**
- * The node behind a paid shared provider: every answer arrives after the delay of its kind, and a log
- * list above the provider's limit or a response above the transport's limit fails as those do.
- */
-export function providerNode(chain: SyntheticChain, observer: RpcObserver, profile: ProviderProfile): NodeRequest {
-  return async (method, params) => {
-    const { answer, handlerMs } = answerOrRecordFailure(chain, observer, method, params);
-    await profile.queue.wait(answerDelayMs(method, answer));
-    const isOverLogLimit = profile.logLimit !== undefined && answer.logs > profile.logLimit;
-    if (isOverLogLimit) {
-      observer.failed(method, handlerMs);
-      throw new Error(`query returned more than ${String(profile.logLimit)} results`);
-    }
-    if (answer.bytes > TRANSPORT_RESPONSE_LIMIT_BYTES) {
-      observer.failed(method, handlerMs);
-      throw new Error(`response body of ${String(answer.bytes)} bytes exceeds the transport limit`);
-    }
-    observer.answered(answer, handlerMs, 0);
-    // A transport parses each response into new objects. Handing over the node's own records would
-    // let the SDK keep strings the history already holds and hide what a flood costs in memory.
-    const parsed: unknown = JSON.parse(JSON.stringify(answer.value));
-    return parsed;
-  };
-}
-
-/** The modelled provider's delay before `answer` arrives. */
-function answerDelayMs(method: string, answer: Answer): number {
-  if (method !== 'eth_getLogs') {
-    return SHARED_PROVIDER_DELAYS.otherMs;
-  }
-  return answer.logs === 0 ? SHARED_PROVIDER_DELAYS.emptyLogReadMs : SHARED_PROVIDER_DELAYS.logReadMs;
 }
 
 /**
@@ -762,22 +745,6 @@ export function typedRequest(node: NodeRequest): RpcRequest {
     },
     { retryCount: 0 },
   )({}).config.request;
-}
-
-function answerOrRecordFailure(
-  chain: SyntheticChain,
-  observer: RpcObserver,
-  method: string,
-  params: readonly unknown[],
-): { readonly answer: Answer; readonly handlerMs: number } {
-  const startedAt = performance.now();
-  try {
-    const answer = chain.answer(method, params);
-    return { answer, handlerMs: performance.now() - startedAt };
-  } catch (error) {
-    observer.failed(method, performance.now() - startedAt);
-    throw error;
-  }
 }
 
 /** Real latency uses the global timer, which the child's virtual SDK timers do not replace. */

@@ -1,6 +1,6 @@
 // Synthetic deployments and histories for every benchmark family. A world depends only on its
-// scenario parameters and seed, so the benchmark child and a loopback server process can build the
-// same chain independently.
+// scenario parameters and seed, so the chain server and a loopback server process build it from a
+// description that the benchmark child sends.
 
 import type { Address, PositionKey, SupplyAnchor } from '../src/core/index.ts';
 import type {
@@ -10,10 +10,11 @@ import type {
   GriefingScenario,
   HistoryPattern,
   ReconstructionScenario,
+  ScreeningScenario,
 } from './scenarios.ts';
 import { HistoryBuilder, SeededRandom, borrowerAt, controllerAt, marketIdAt } from './synthetic-history.ts';
 import type { ActivationDelays, Classification, Market } from './synthetic-history.ts';
-import { SyntheticChain, timestampOf, transactionHashOf } from './synthetic-rpc.ts';
+import { computeBlockHash, timestampOf, transactionHashOf, SyntheticChain } from './synthetic-rpc.ts';
 import type { VirtualClock } from './synthetic-rpc.ts';
 
 export const CORE: Address = '0x000000000000000000000000000000000000c0e0';
@@ -35,6 +36,8 @@ export const REPORT_BLOCK_LAG = 2;
 export const HISTORY_BLOCKS = 50_400;
 
 export const CYCLE_MARKETS = 10;
+
+export const SCREENING_MARKETS = 10;
 
 const MINIMUM_ACTIVATION = 10n;
 
@@ -58,10 +61,23 @@ const PREVIOUS_HEARTBEAT_BLOCK = REPORT_BLOCK - 30;
 /** A market index far from the target-registry markets, for supplies another registry governs. */
 const FOREIGN_MARKET_INDEX = 1_000_000;
 
-/** A synthetic history and what building it cost. */
-export interface Built<World> {
-  readonly world: World;
+/** The world the chain server builds for one scenario or probe. */
+export type WorldSpec =
+  | { readonly kind: 'quiet' }
+  | { readonly kind: 'discovery'; readonly parameters: DiscoveryScenario; readonly seed: number }
+  | { readonly kind: 'reconstruction'; readonly parameters: ReconstructionScenario }
+  | { readonly kind: 'screening'; readonly parameters: ScreeningScenario }
+  | { readonly kind: 'cycle'; readonly parameters: CycleScenario }
+  | { readonly kind: 'liveness'; readonly positions: number; readonly markets: number }
+  | { readonly kind: 'griefing'; readonly parameters: GriefingScenario; readonly operations: number };
+
+/** A built world, and the numbers the benchmark child reads about it. */
+export interface BuiltWorld {
+  readonly chain: SyntheticChain;
+  /** The history's size and build time. */
   readonly stats: Readonly<Record<string, number>>;
+  /** The deployment blocks and what the scenario's checks expect. */
+  readonly facts: Readonly<Record<string, number>>;
 }
 
 export interface DiscoveryWorld {
@@ -92,18 +108,39 @@ export interface CycleWorld {
   readonly anchors: number;
 }
 
-/** Build a world and record the size and cost of its history. */
-export function buildWorld<World extends { readonly chain: SyntheticChain } | SyntheticChain>(
-  build: () => World,
-): Built<World> {
+/** Build the world `spec` describes and record the size and cost of its history. */
+export function buildWorld(spec: WorldSpec, clock: VirtualClock): BuiltWorld {
   const startedAt = performance.now();
-  const world = build();
-  const chain = world instanceof SyntheticChain ? world : world.chain;
+  const { chain, ...expected } = writeWorld(spec, clock);
   const size = chain.size();
   return {
-    world,
+    chain,
     stats: { datasetLogs: size.logs, datasetMb: size.bytes / 1_048_576, datasetBuildMs: performance.now() - startedAt },
+    facts: {
+      ...expected,
+      coreDeploymentBlock: chain.layout.coreDeploymentBlock,
+      registryDeploymentBlock: chain.layout.registryDeploymentBlock,
+    },
   };
+}
+
+function writeWorld(spec: WorldSpec, clock: VirtualClock): { readonly chain: SyntheticChain } {
+  switch (spec.kind) {
+    case 'quiet':
+      return { chain: quietWorld(clock) };
+    case 'discovery':
+      return discoveryWorld(spec.parameters, clock, spec.seed);
+    case 'reconstruction':
+      return reconstructionWorld(spec.parameters, clock);
+    case 'screening':
+      return { chain: screeningWorld(spec.parameters, clock) };
+    case 'cycle':
+      return cycleWorld(spec.parameters, clock);
+    case 'liveness':
+      return { chain: livenessWorld(spec.positions, spec.markets, clock) };
+    case 'griefing':
+      return griefingWorld(spec.parameters, spec.operations, clock);
+  }
 }
 
 export function syntheticChain(historyBlocks: number, clock: VirtualClock): SyntheticChain {
@@ -129,6 +166,32 @@ export function quietWorld(clock: VirtualClock): SyntheticChain {
   history.guardianAdded(REPORT_BLOCK);
   chain.seal();
   return chain;
+}
+
+/**
+ * A quiet deployment where this Guardian has flagged the first targets of a screening scenario, so
+ * screening skips them.
+ */
+export function screeningWorld(parameters: ScreeningScenario, clock: VirtualClock): SyntheticChain {
+  const chain = syntheticChain(HISTORY_BLOCKS, clock);
+  const history = new HistoryBuilder(chain, { minimumActivation: MINIMUM_ACTIVATION, delays: ACTIVATION_DELAYS });
+  history.guardianAdded(REPORT_BLOCK);
+  const { targets, ownFlagged } = countScreeningTargets(parameters);
+  for (let target = 0; target < Math.min(targets, ownFlagged); target += 1) {
+    const position = positionAt(target, SCREENING_MARKETS);
+    chain.flag(position.marketId, position.borrower, GUARDIAN);
+  }
+  chain.seal();
+  return chain;
+}
+
+/** The targets a screening scenario screens, and how many of them this Guardian has flagged. */
+export function countScreeningTargets(parameters: ScreeningScenario): {
+  readonly targets: number;
+  readonly ownFlagged: number;
+} {
+  const targets = Math.max(1, Math.floor(parameters.anchors / parameters.anchorsPerTarget));
+  return { targets, ownFlagged: Math.round(targets * parameters.ownFlagShare) };
 }
 
 /** `supplies` supplies spread over the whole history, for log-heavy transport answers. */
@@ -520,12 +583,12 @@ export function positionAt(index: number, markets: number): PositionKey {
   return { controller: controllerAt(market), marketId: marketIdAt(market), borrower: borrowerAt(index) };
 }
 
-/** A plausible anchor for work that is built directly rather than reconstructed. */
-export function syntheticAnchor(position: PositionKey, sequence: number, chain: SyntheticChain): SupplyAnchor {
+/** A plausible anchor in a world without reorgs, for work that is built directly rather than reconstructed. */
+export function syntheticAnchor(position: PositionKey, sequence: number): SupplyAnchor {
   const blockNumber = REPORT_BLOCK - DUE_MARGIN_BLOCKS - (sequence % 10_000);
   return {
     core: CORE,
-    blockHash: chain.hashOf(blockNumber),
+    blockHash: computeBlockHash(blockNumber, 0),
     transactionHash: transactionHashOf(blockNumber, sequence),
     logIndex: 1,
     marketId: position.marketId,

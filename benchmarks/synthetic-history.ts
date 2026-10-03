@@ -1,7 +1,9 @@
 // Lending history in chain order: supplies classified by their market controller, drains and
 // maturations, each with the post-event position the controller records. It follows the transitions
-// the specification documents; it does not model every contract rule, such as which operations may
-// drain part of a bucket.
+// the specification documents and the controller's activation timer: a lot's delay grows with the
+// market's decaying inflow, and a top-up restarts the timer when that ends it later. It does not model
+// every contract rule, such as which operations may drain part of a bucket. Every operation is its own
+// transaction, so no drain reverses inflow that the same transaction added.
 
 import { encodeAbiParameters, numberToHex } from 'viem';
 import type { Address, MarketId } from '../src/core/index.ts';
@@ -60,8 +62,19 @@ interface PositionInput {
 
 interface SupplyInput extends PositionInput {
   readonly assets: bigint;
-  /** The base delay of a lot this supply starts; a top-up keeps the lot's deadline. */
-  readonly delaySeconds: number;
+}
+
+/** The controller's activation delay rule: its floor, its cap and the inflow at which it reaches the cap. */
+export interface ActivationDelays {
+  readonly minActivationDelay: number;
+  readonly maxActivationDelay: number;
+  readonly maxDelayInflow: bigint;
+}
+
+/** A market's recent inflow as the controller stores it, and when it stored it. */
+interface Inflow {
+  inflow: bigint;
+  updatedAt: number;
 }
 
 export function marketIdAt(index: number): MarketId {
@@ -99,11 +112,19 @@ export class HistoryBuilder {
 
   readonly #minimumActivation: bigint;
 
+  readonly #delays: ActivationDelays;
+
   readonly #positions = new Map<string, PositionState>();
 
-  constructor(chain: SyntheticChain, options: { readonly minimumActivation: bigint }) {
+  readonly #inflows = new Map<Address, Inflow>();
+
+  constructor(
+    chain: SyntheticChain,
+    options: { readonly minimumActivation: bigint; readonly delays: ActivationDelays },
+  ) {
     this.#chain = chain;
     this.#minimumActivation = options.minimumActivation;
+    this.#delays = options.delays;
   }
 
   /** A market whose controller reports to `registry`, or an uncontrolled market for null. */
@@ -173,14 +194,44 @@ export class HistoryBuilder {
       return 'dusted';
     }
     const amount = position.dust + input.assets;
-    if (position.activating === 0n) {
-      position.activatingStart = timestampOf(at.blockNumber);
-      position.activatingDelay = input.delaySeconds;
+    const now = timestampOf(at.blockNumber);
+    const delay = this.#delayAfter(at.controller, amount, now);
+    // A top-up restarts the whole lot's timer only when that ends it later.
+    if (now + delay > position.activatingStart + position.activatingDelay) {
+      position.activatingStart = now;
+      position.activatingDelay = delay;
     }
     position.dust = 0n;
     position.activating += amount;
     this.#emit('activating', amount, position, place);
     return 'activating';
+  }
+
+  /** When the borrower's lot in the market becomes due, or null while it has none. */
+  dueAt(input: PositionInput): number | null {
+    const { controller } = input.market;
+    const position = controller === null ? undefined : this.#positions.get(`${controller}:${input.borrower}`);
+    const hasLot = position !== undefined && position.activatingStart !== 0;
+    return hasLot ? position.activatingStart + position.activatingDelay : null;
+  }
+
+  /**
+   * The delay of a lot that adds `increment` to the market's inflow at `now`. The stored inflow decays
+   * by the cap over the longest delay, takes the increment, and stays at most the cap; the delay grows
+   * linearly with it from the floor to the cap.
+   */
+  #delayAfter(controller: Address, increment: bigint, now: number): number {
+    const { minActivationDelay, maxActivationDelay, maxDelayInflow } = this.#delays;
+    const stored = this.#inflows.get(controller) ?? { inflow: 0n, updatedAt: now };
+    const decay = (maxDelayInflow * BigInt(now - stored.updatedAt)) / BigInt(maxActivationDelay);
+    const decayed = stored.inflow > decay ? stored.inflow - decay : 0n;
+    const inflow = decayed + increment < maxDelayInflow ? decayed + increment : maxDelayInflow;
+    this.#inflows.set(controller, { inflow, updatedAt: now });
+    if (inflow >= maxDelayInflow) {
+      return maxActivationDelay;
+    }
+    const span = BigInt(maxActivationDelay - minActivationDelay);
+    return minActivationDelay + Number((span * inflow) / maxDelayInflow);
   }
 
   #placeOf(blockNumber: number, input: PositionInput): EventPlace {

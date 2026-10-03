@@ -114,6 +114,8 @@ export interface LivenessScenario {
   readonly txConfirmationBlocks: number;
   readonly interBatchConfirmationBlocks: number;
   readonly inclusionBlocks: number;
+  /** Time the screening service takes to answer, charged to chain time. */
+  readonly screeningLatencyMs: number;
   /** Upper bound of the target-count search. */
   readonly maxTargets: number;
 }
@@ -190,6 +192,8 @@ export interface GriefingScenario {
   readonly screeningLatencyMs: number;
   /** Upper bound of the search. */
   readonly maxOperations: number;
+  /** The attacker's gas budget at the cheap base fee; the search also stops at the attack it buys. */
+  readonly maxAttackCostEth: number;
 }
 
 /** A cycle over the pinned production contracts on a local Anvil chain, through the SDK's own clients. */
@@ -303,6 +307,7 @@ const LIVENESS: LivenessScenario = {
   txConfirmationBlocks: 12,
   interBatchConfirmationBlocks: 2,
   inclusionBlocks: 1,
+  screeningLatencyMs: 0,
   maxTargets: 20_000,
 };
 
@@ -330,7 +335,9 @@ const GRIEFING: GriefingScenario = {
   spreadBlocks: 10_000,
   provider: 'capped',
   screeningLatencyMs: 0,
-  maxOperations: 1_000_000,
+  // The chain server holds about 2.7 GB of history per million operations.
+  maxOperations: 2_000_000,
+  maxAttackCostEth: 40,
 };
 
 const ANVIL: AnvilScenario = {
@@ -432,8 +439,9 @@ function fullLiveness(): LivenessScenario[] {
     { ...LIVENESS, interBatchConfirmationBlocks: 1 },
     { ...LIVENESS, inclusionBlocks: 2 },
     ...[50, 100].map((maxSignalBatchSize) => ({ ...LIVENESS, maxSignalBatchSize })),
-    // The daemon's own batch size and wait between batches.
+    // The daemon's own batch size and wait between batches, then with the longest wait for screening.
     { ...LIVENESS, maxSignalBatchSize: 50, interBatchConfirmationBlocks: 1 },
+    { ...LIVENESS, maxSignalBatchSize: 50, interBatchConfirmationBlocks: 1, screeningLatencyMs: 290_000 },
   ];
 }
 
