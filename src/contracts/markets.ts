@@ -17,7 +17,7 @@ import { byLogPosition } from '../chain/log-order.ts';
 import type { LogPosition } from '../chain/log-order.ts';
 import type { RpcProvider } from '../chain/rpc.ts';
 import { decodeLogs } from './decode-logs.ts';
-import type { BlockRange, ScanPlan } from '../core/outcomes.ts';
+import type { ScanPlan } from '../core/outcomes.ts';
 import type { PositionKey, SupplyAnchor } from '../core/types.ts';
 import { GuardianStop } from '../core/stop.ts';
 import { lower } from '../common/types.ts';
@@ -81,12 +81,17 @@ type SupplyCollateralLog = ParseEventLogsReturnType<typeof SUPPLY_COLLATERAL_ABI
 /** One controller lifecycle event as viem decodes it. */
 type LifecycleLog = ParseEventLogsReturnType<typeof MARKET_CONTROLLER_ABI, undefined, true>[number];
 
-/** A controller's lifecycle events in a discovery window. */
-interface WindowEvents {
-  /** Every event by its transaction, where the supply pairing looks for the log before the supply. */
-  readonly byTransaction: ReadonlyMap<TxHash, readonly LifecycleLog[]>;
-  /** Each borrower's newest event, whose position is the borrower's at the window's last block. */
-  readonly latest: ReadonlyMap<Address, LifecycleLog>;
+/** A supply to a market whose controller reports to the target registry. */
+interface TargetSupply {
+  readonly supply: SupplyLog;
+  /** The market's controller, lowered. */
+  readonly controller: Address;
+}
+
+/** A position whose activation is due and requires coverage, and the position its latest event left. */
+interface Candidate {
+  readonly key: PositionKey;
+  readonly latestPosition: Position;
 }
 
 const LIFECYCLE_TOPICS = [
@@ -106,8 +111,8 @@ const LIFECYCLE_KINDS: Record<LifecycleLog['eventName'], LifecycleEvent['kind']>
 /**
  * Reads for [discovery](../../docs/guardian-specification.md#b-discover-candidate-positions)
  * and [reconstruction](../../docs/guardian-specification.md#c-reconstruct-the-contributors).
- * Create one instance per phase call: binding caches belong to that call's report block,
- * and lifecycle events are cached by controller and discovery window. No cache crosses calls.
+ * Create one instance per phase call: binding caches belong to that call's report block.
+ * No cache crosses calls.
  */
 export class Markets {
   readonly #rpc: RpcProvider;
@@ -116,7 +121,6 @@ export class Markets {
   // Pending reads are cached, so supplies classified at once share one read per market and controller.
   readonly #controllers = new Map<MarketId, Promise<Address>>();
   readonly #registries = new Map<Address, Promise<Address>>();
-  readonly #windowEvents = new Map<string, Promise<WindowEvents>>();
 
   constructor(rpc: RpcProvider, deployment: ContractDeployment) {
     this.#rpc = rpc;
@@ -124,26 +128,51 @@ export class Markets {
     this.#deploymentBlock = deployment.deploymentBlock;
   }
 
-  /** Discover every position that may require screening under Appendix B, `concurrency` supplies at a time. */
+  /**
+   * Discover every position that may require screening under Appendix B, `concurrency` supplies or
+   * controllers at a time. The window is read forwards a piece of supplies at a time, with the controllers'
+   * events since the previous piece, so memory holds a piece of logs and the candidates, not the window.
+   */
   async discoverCandidatePositions(
     plan: ScanPlan,
     targetRegistry: Address,
     concurrency: number,
   ): Promise<PositionKey[]> {
-    const supplies = await this.supplies({
-      fromBlock: plan.discoveryRange.from.number,
-      toBlock: plan.discoveryRange.to.number,
-    });
-    const positions = await readInBatches(supplies, concurrency, (supply) =>
-      this.#candidatePositionFromSupply(plan, supply, targetRegistry),
-    );
-    const candidatesByPosition = new Map<string, PositionKey>();
-    for (const position of positions) {
-      if (position !== null) {
-        candidatesByPosition.set(`${position.marketId}:${position.borrower}`, position);
+    const window = plan.discoveryRange;
+    const candidates = new CandidatePositions();
+    // Controller events are read without gaps, so no event of a candidate is missed.
+    let firstUnreadBlock = window.from.number;
+    const supplyFilter = {
+      address: this.#core,
+      topics: SUPPLY_COLLATERAL_TOPICS,
+      fromBlock: window.from.number,
+      toBlock: window.to.number,
+    };
+    for await (const supplyLogs of this.#rpc.logBatches(supplyFilter, 'forward')) {
+      const supplies = decodeLogs(SUPPLY_COLLATERAL_ABI, supplyLogs).map((log) => this.#supplyOf(log));
+      if (supplies.length === 0) {
+        continue;
       }
+      const lastSupplyBlock = supplyLogs.reduce(
+        (last, log) => Math.max(last, Number(log.blockNumber)),
+        firstUnreadBlock,
+      );
+      const targetSupplies = await this.#filterTargetSupplies(supplies, targetRegistry, window.to.hash, concurrency);
+      const blocksToRead = { fromBlock: firstUnreadBlock, toBlock: lastSupplyBlock };
+      await this.#pairSuppliesAndApplyEvents(plan, candidates, targetSupplies, blocksToRead, concurrency);
+      firstUnreadBlock = lastSupplyBlock + 1;
     }
-    return [...candidatesByPosition.values()];
+    // Events after the last supply can still withdraw, activate or extend a candidate.
+    const blocksAfterLastSupply = { fromBlock: firstUnreadBlock, toBlock: window.to.number };
+    await this.#applyCandidateEvents(candidates, blocksAfterLastSupply, concurrency);
+
+    // [Scan phase 3](../../docs/guardian-specification.md#scan-cycle) discards a position that is not base-due at
+    // the report block. Its newest event lies in the window with its classification, so a lot withdrawn, activated
+    // or extended since is discarded here without a history walk; the work stays the same.
+    return candidates
+      .list()
+      .filter((candidate) => this.#isBaseActivationDeadlineReached(candidate.latestPosition, window.to.timestamp))
+      .map((candidate) => candidate.key);
   }
 
   /**
@@ -166,17 +195,6 @@ export class Markets {
       }
     }
     return byPosition;
-  }
-
-  /** Read the discovery window's supplies without applying cycle policy. */
-  async supplies(range: { readonly fromBlock: number; readonly toBlock: number }): Promise<SupplyLog[]> {
-    const raw = await this.#rpc.getLogs({
-      address: this.#core,
-      topics: SUPPLY_COLLATERAL_TOPICS,
-      fromBlock: range.fromBlock,
-      toBlock: range.toBlock,
-    });
-    return decodeLogs(SUPPLY_COLLATERAL_ABI, raw).map((log) => this.#supplyOf(log));
   }
 
   controllerOf(marketId: MarketId, at: Bytes32): Promise<Address> {
@@ -218,14 +236,14 @@ export class Markets {
 
   /**
    * Establish the [supply pairing](../../docs/guardian-specification.md#core-and-controllers-supply-and-activation-events)
-   * from the controller's lifecycle events in the discovery window, instead of Appendix B's transaction
-   * receipt. One read per controller serves every supply, so supplies do not multiply requests;
+   * from the controller's lifecycle events read with the supply's piece, instead of Appendix B's transaction
+   * receipt. One read per controller serves a piece of supplies, so supplies do not multiply requests;
    * transaction, adjacent log index, block hash and borrower still identify the same classification event.
    */
-  async activationBefore(supply: SupplyLog, controller: Address, window: BlockRange): Promise<Activation | null> {
-    const { byTransaction } = await this.#readWindowEvents(controller, window);
-    const inTransaction = byTransaction.get(supply.transactionHash) ?? [];
-    const before = inTransaction.filter((log) => log.logIndex === supply.logIndex - 1);
+  activationBefore(supply: SupplyLog, controller: Address, logs: readonly LifecycleLog[]): Activation | null {
+    const before = logs.filter(
+      (log) => log.transactionHash === supply.transactionHash && log.logIndex === supply.logIndex - 1,
+    );
     const log = before.length === 1 ? before[0] : undefined;
     if (log === undefined) {
       throw new GuardianStop('supply-without-controller-event');
@@ -283,40 +301,121 @@ export class Markets {
     }
   }
 
-  async #candidatePositionFromSupply(
-    plan: ScanPlan,
-    supply: SupplyLog,
+  /** Keep the supplies to markets whose controller reports to the target registry, each with that controller. */
+  async #filterTargetSupplies(
+    supplies: readonly SupplyLog[],
     targetRegistry: Address,
-  ): Promise<PositionKey | null> {
-    const controller = await this.controllerOf(supply.marketId, plan.discoveryRange.to.hash);
+    at: Bytes32,
+    concurrency: number,
+  ): Promise<TargetSupply[]> {
+    const controllers = await readInBatches(supplies, concurrency, (supply) =>
+      this.#findTargetController(supply.marketId, targetRegistry, at),
+    );
+    return supplies.flatMap((supply, index) => {
+      const controller = controllers[index] ?? null;
+      return controller === null ? [] : [{ supply, controller }];
+    });
+  }
+
+  /** The market's controller, lowered, when it reports to the target registry; otherwise null. */
+  async #findTargetController(marketId: MarketId, targetRegistry: Address, at: Bytes32): Promise<Address | null> {
+    const controller = await this.controllerOf(marketId, at);
     if (controller === zeroAddress) {
       return null;
     }
-    const reportsTo = await this.registryOf(controller, plan.discoveryRange.to.hash);
+    const reportsTo = await this.registryOf(controller, at);
     if (!isAddressEqual(reportsTo, targetRegistry)) {
       return null;
     }
+    return lower(controller);
+  }
 
-    const activation = await this.activationBefore(supply, controller, plan.discoveryRange);
-    if (activation === null) {
-      return null;
+  /**
+   * Read the lifecycle events in `blocksToRead` of the target supplies' controllers and of the candidates'
+   * controllers, a piece at a time: pair each supply with the event logged right before it, and apply every
+   * event to the candidates. A supply left without its event stops the attempt. The events are read by
+   * block number like the supplies, so a reorg between the two reads leaves a supply without its event.
+   */
+  async #pairSuppliesAndApplyEvents(
+    plan: ScanPlan,
+    candidates: CandidatePositions,
+    targetSupplies: readonly TargetSupply[],
+    blocksToRead: { readonly fromBlock: number; readonly toBlock: number },
+    concurrency: number,
+  ): Promise<void> {
+    const unpairedSupplies = new Map(
+      targetSupplies.map((target) => [`${target.supply.transactionHash}:${String(target.supply.logIndex)}`, target]),
+    );
+    const controllers = new Set([
+      ...targetSupplies.map((target) => target.controller),
+      ...candidates.listControllers(),
+    ]);
+    await readInBatches([...controllers], concurrency, async (controller) => {
+      const eventFilter = { address: controller, topics: [LIFECYCLE_TOPICS], ...blocksToRead };
+      for await (const eventLogs of this.#rpc.logBatches(eventFilter, 'forward')) {
+        const events = decodeLogs(MARKET_CONTROLLER_ABI, eventLogs);
+        this.#pairSupplies(plan, candidates, unpairedSupplies, events);
+        candidates.applyEvents(events);
+      }
+    });
+    if (unpairedSupplies.size > 0) {
+      throw new GuardianStop('supply-without-controller-event');
     }
-    const deadline = activation.position.activatingStart + activation.position.activatingDelay;
-    if (deadline > plan.discoveryRange.to.timestamp) {
-      return null;
+  }
+
+  /** Read the candidates' controllers' lifecycle events in `blocksToRead`, a piece at a time, and apply them. */
+  async #applyCandidateEvents(
+    candidates: CandidatePositions,
+    blocksToRead: { readonly fromBlock: number; readonly toBlock: number },
+    concurrency: number,
+  ): Promise<void> {
+    await readInBatches(candidates.listControllers(), concurrency, async (controller) => {
+      const eventFilter = { address: controller, topics: [LIFECYCLE_TOPICS], ...blocksToRead };
+      for await (const eventLogs of this.#rpc.logBatches(eventFilter, 'forward')) {
+        candidates.applyEvents(decodeLogs(MARKET_CONTROLLER_ABI, eventLogs));
+      }
+    });
+  }
+
+  /**
+   * Pair each unpaired supply whose event is among `events`, with the checks of `activationBefore`, and add
+   * the positions whose activation is due and not covered by the previous heartbeat to the candidates.
+   */
+  #pairSupplies(
+    plan: ScanPlan,
+    candidates: CandidatePositions,
+    unpairedSupplies: Map<string, TargetSupply>,
+    events: readonly LifecycleLog[],
+  ): void {
+    // A controller event pairs with the supply logged right after it in the same transaction.
+    const eventsBySupply = new Map<TargetSupply, LifecycleLog[]>();
+    for (const event of events) {
+      const target = unpairedSupplies.get(`${event.transactionHash}:${String(event.logIndex + 1)}`);
+      if (target === undefined) {
+        continue;
+      }
+      const supplyEvents = eventsBySupply.get(target);
+      if (supplyEvents === undefined) {
+        eventsBySupply.set(target, [event]);
+      } else {
+        supplyEvents.push(event);
+      }
     }
-    if (!this.#requiresCurrentCoverage(plan.previousHeartbeatBlock, activation.blockNumber, deadline)) {
-      return null;
+    for (const [{ supply, controller }, supplyEvents] of eventsBySupply) {
+      unpairedSupplies.delete(`${supply.transactionHash}:${String(supply.logIndex)}`);
+      const activation = this.activationBefore(supply, controller, supplyEvents);
+      if (activation === null) {
+        continue;
+      }
+      const deadline = activation.position.activatingStart + activation.position.activatingDelay;
+      if (deadline > plan.discoveryRange.to.timestamp) {
+        continue;
+      }
+      if (!this.#requiresCurrentCoverage(plan.previousHeartbeatBlock, activation.blockNumber, deadline)) {
+        continue;
+      }
+      candidates.add({ controller, marketId: supply.marketId, borrower: supply.borrower }, activation.position);
     }
-    // [Scan phase 3](../../docs/guardian-specification.md#scan-cycle) discards a position that is not base-due at
-    // the report block. Its newest event lies in the window with its classification, so a lot withdrawn, activated
-    // or extended since is discarded here without a history walk; the work stays the same.
-    const { latest } = await this.#readWindowEvents(controller, plan.discoveryRange);
-    const current = latest.get(supply.borrower)?.args.position ?? activation.position;
-    if (!this.#isBaseActivationDeadlineReached(current, plan.discoveryRange.to.timestamp)) {
-      return null;
-    }
-    return { controller: lower(controller), marketId: supply.marketId, borrower: supply.borrower };
   }
 
   #requiresCurrentCoverage(
@@ -463,46 +562,6 @@ export class Markets {
     };
   }
 
-  /**
-   * The controller's lifecycle events in the window, read once however many supplies they classify. The
-   * window is read by block number like its supplies, so a reorg between the two reads leaves a supply
-   * without its classification and stops the attempt.
-   */
-  #readWindowEvents(controller: Address, window: BlockRange): Promise<WindowEvents> {
-    const cacheKey = `${controller}:${window.from.number}:${window.to.number}`;
-    const cachedEvents = this.#windowEvents.get(cacheKey);
-    if (cachedEvents !== undefined) {
-      return cachedEvents;
-    }
-
-    const events = this.#rpc
-      .getLogs({
-        address: controller,
-        topics: [LIFECYCLE_TOPICS],
-        fromBlock: window.from.number,
-        toBlock: window.to.number,
-      })
-      .then((raw) => this.#indexWindowEvents(decodeLogs(MARKET_CONTROLLER_ABI, raw)));
-
-    this.#windowEvents.set(cacheKey, events);
-    return events;
-  }
-
-  /** Every event by its transaction, and each borrower's newest event. */
-  #indexWindowEvents(logs: readonly LifecycleLog[]): WindowEvents {
-    const byTransaction = new Map<TxHash, LifecycleLog[]>();
-    const latest = new Map<Address, LifecycleLog>();
-    for (const log of logs) {
-      byTransaction.set(log.transactionHash, [...(byTransaction.get(log.transactionHash) ?? []), log]);
-      const borrower = lower(log.args.borrower);
-      const newest = latest.get(borrower);
-      if (newest === undefined || byLogPosition(log, newest) > 0) {
-        latest.set(borrower, log);
-      }
-    }
-    return { byTransaction, latest };
-  }
-
   /** The activation named by the classification immediately before a supply. */
   #activationOf(log: LifecycleLog, borrower: Address): Activation | null {
     const isClassification = log.eventName !== 'CollateralDrained' && isAddressEqual(log.args.borrower, borrower);
@@ -554,6 +613,57 @@ export class Markets {
         logIndex: log.logIndex,
       },
     };
+  }
+}
+
+/**
+ * The candidates of one discovery call: every position whose activation is due and requires coverage,
+ * with the position its latest event read so far left.
+ */
+class CandidatePositions {
+  readonly #candidatesById = new Map<string, Candidate>();
+
+  /** Add a position with the position its activation left; a position already added keeps its record. */
+  add(key: PositionKey, position: Position): void {
+    const id = `${key.controller}:${key.marketId}:${key.borrower}`;
+    if (!this.#candidatesById.has(id)) {
+      this.#candidatesById.set(id, { key, latestPosition: position });
+    }
+  }
+
+  /**
+   * Move each candidate to the position its newest event in `events` left. A candidate left with nothing
+   * activating is removed: it is not base-due, and a later supply adds it again.
+   */
+  applyEvents(events: readonly LifecycleLog[]): void {
+    const newestEventByControllerAndBorrower = new Map<string, LifecycleLog>();
+    for (const event of events) {
+      const id = `${lower(event.address)}:${lower(event.args.borrower)}`;
+      const newest = newestEventByControllerAndBorrower.get(id);
+      if (newest === undefined || byLogPosition(event, newest) > 0) {
+        newestEventByControllerAndBorrower.set(id, event);
+      }
+    }
+    for (const [id, candidate] of this.#candidatesById) {
+      const newest = newestEventByControllerAndBorrower.get(`${candidate.key.controller}:${candidate.key.borrower}`);
+      if (newest === undefined) {
+        continue;
+      }
+      if (newest.args.position.activating === 0n) {
+        this.#candidatesById.delete(id);
+      } else {
+        this.#candidatesById.set(id, { key: candidate.key, latestPosition: newest.args.position });
+      }
+    }
+  }
+
+  /** The controllers of the candidates, each once. */
+  listControllers(): Address[] {
+    return [...new Set([...this.#candidatesById.values()].map((candidate) => candidate.key.controller))];
+  }
+
+  list(): Candidate[] {
+    return [...this.#candidatesById.values()];
   }
 }
 
