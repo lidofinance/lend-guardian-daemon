@@ -17,7 +17,7 @@ import { byLogPosition } from '../chain/log-order.ts';
 import type { LogPosition } from '../chain/log-order.ts';
 import type { RpcProvider } from '../chain/rpc.ts';
 import { decodeLogs } from './decode-logs.ts';
-import type { ScanPlan } from '../core/outcomes.ts';
+import type { ScanPlan, Work } from '../core/outcomes.ts';
 import type { PositionKey, SupplyAnchor } from '../core/types.ts';
 import { GuardianStop } from '../core/stop.ts';
 import { lower } from '../common/types.ts';
@@ -177,16 +177,24 @@ export class Markets {
 
   /**
    * Reconstruct the uncovered contributors for every candidate position under Appendix C,
-   * `concurrency` positions at a time.
+   * `concurrency` positions at a time. A position of `reusableWork` that its controller logged no event
+   * for after that work's report block keeps its anchors instead.
    */
   async reconstructWork(
     plan: ScanPlan,
     positions: readonly PositionKey[],
     concurrency: number,
+    reusableWork?: Work,
   ): Promise<ReadonlyMap<PositionKey, readonly SupplyAnchor[]>> {
+    const unchangedAnchors =
+      reusableWork === undefined
+        ? new Map<string, readonly SupplyAnchor[]>()
+        : await this.#findUnchangedAnchors(reusableWork, plan.discoveryRange.to.number, concurrency);
     const walks = await readInBatches(positions, concurrency, async (position) => ({
       position,
-      anchors: await this.#reconstructPosition(plan, position),
+      anchors:
+        unchangedAnchors.get(`${position.controller}:${position.borrower}`) ??
+        (await this.#reconstructPosition(plan, position)),
     }));
     const byPosition = new Map<PositionKey, readonly SupplyAnchor[]>();
     for (const { position, anchors } of walks) {
@@ -361,6 +369,33 @@ export class Markets {
     if (unpairedSupplies.size > 0) {
       throw new GuardianStop('supply-without-controller-event');
     }
+  }
+
+  /**
+   * The anchors of `reusableWork`'s positions, by controller and borrower, less those whose controller
+   * logged an event for them after that work's report block, through `reportBlockNumber`.
+   */
+  async #findUnchangedAnchors(
+    reusableWork: Work,
+    reportBlockNumber: number,
+    concurrency: number,
+  ): Promise<Map<string, readonly SupplyAnchor[]>> {
+    const unchangedAnchors = new Map<string, readonly SupplyAnchor[]>();
+    const controllers = new Set<Address>();
+    for (const [position, anchors] of reusableWork.entries()) {
+      unchangedAnchors.set(`${position.controller}:${position.borrower}`, anchors);
+      controllers.add(position.controller);
+    }
+    const blocksToRead = { fromBlock: reusableWork.reportBlock.number + 1, toBlock: reportBlockNumber };
+    await readInBatches([...controllers], concurrency, async (controller) => {
+      const eventFilter = { address: controller, topics: [LIFECYCLE_TOPICS], ...blocksToRead };
+      for await (const eventLogs of this.#rpc.logBatches(eventFilter, 'forward')) {
+        for (const event of decodeLogs(MARKET_CONTROLLER_ABI, eventLogs)) {
+          unchangedAnchors.delete(`${lower(event.address)}:${lower(event.args.borrower)}`);
+        }
+      }
+    });
+    return unchangedAnchors;
   }
 
   /** Read the candidates' controllers' lifecycle events in `blocksToRead`, a piece at a time, and apply them. */

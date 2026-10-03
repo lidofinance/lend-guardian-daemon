@@ -167,8 +167,9 @@ export class Guardian {
   /**
    * Run one complete [scan cycle](../../docs/guardian-specification.md#scan-cycle). The caller owns
    * scheduling and recovery between calls; observe mode returns the screened result without writes.
+   * Pass a stale outcome's `work` as `earlierWork` to the next attempt, which reuses what it reconstructed.
    */
-  async cycle(previousHeartbeatBlock?: BlockRef | null): Promise<CycleOutcome> {
+  async cycle(previousHeartbeatBlock?: BlockRef | null, earlierWork?: Work): Promise<CycleOutcome> {
     if (this.#activeCycle !== undefined) {
       throw new Error('another cycle is in progress');
     }
@@ -200,7 +201,7 @@ export class Guardian {
         reportBlock: plan.discoveryRange.to,
         positions: discovered.all(),
       });
-      const work = await this.reconstructWork(discovered);
+      const work = await this.reconstructWork(discovered, earlierWork);
       emitEvent(this.#setup.onEvent, {
         event: 'cycle.reconstructed',
         ...context,
@@ -225,7 +226,7 @@ export class Guardian {
               previousHeartbeatBlock: frozenCopy(work.previousHeartbeatBlock),
               screened,
             })
-          : frozenCopy(await this.signalAndHeartbeat(screened));
+          : attachWorkToStale(frozenCopy(await this.signalAndHeartbeat(screened)), work);
       emitEvent(this.#setup.onEvent, {
         event: 'cycle.finished',
         ...context,
@@ -294,11 +295,24 @@ export class Guardian {
   /**
    * Rebuild the contributing supplies: [scan phase 3](../../docs/guardian-specification.md#scan-cycle)
    * and [Appendix C](../../docs/guardian-specification.md#c-reconstruct-the-contributors).
+   *
+   * A position of `earlierWork`, such as a stale attempt's, keeps its anchors when that work was
+   * reconstructed from the plan's previous heartbeat at a report block that is still canonical, and the
+   * position's controller logged no lifecycle event for it since. That block's hash fixes the history
+   * below it, and every change of a lot is such an event, so a walk would find the same anchors: the work
+   * is the one a full reconstruction finds, and a retry walks only what changed.
    */
-  async reconstructWork(discovered: Discovered): Promise<Work> {
+  async reconstructWork(discovered: Discovered, earlierWork?: Work): Promise<Work> {
     const plan = discovered.plan();
     const markets = new Markets(this.#rpc, this.#setup.deployment.lidoLend);
-    const byPosition = await markets.reconstructWork(plan, discovered.all(), this.#setup.historyReadConcurrency);
+    const reusableWork =
+      earlierWork !== undefined && (await this.#canReuse(earlierWork, plan)) ? earlierWork : undefined;
+    const byPosition = await markets.reconstructWork(
+      plan,
+      discovered.all(),
+      this.#setup.historyReadConcurrency,
+      reusableWork,
+    );
     return new Work(plan, byPosition);
   }
 
@@ -637,6 +651,24 @@ export class Guardian {
     return membershipBlock;
   }
 
+  /**
+   * Whether `earlierWork` was reconstructed from the plan's previous heartbeat at a report block that is
+   * still canonical and not after the plan's. That block's hash commits to every block below it.
+   */
+  async #canReuse(earlierWork: Work, plan: ScanPlan): Promise<boolean> {
+    const earlierHeartbeat = earlierWork.previousHeartbeatBlock;
+    const currentHeartbeat = plan.previousHeartbeatBlock;
+    const isSameCoverage =
+      earlierHeartbeat === null || currentHeartbeat === null
+        ? earlierHeartbeat === currentHeartbeat
+        : earlierHeartbeat.hash === currentHeartbeat.hash;
+    if (!isSameCoverage || earlierWork.reportBlock.number > plan.discoveryRange.to.number) {
+      return false;
+    }
+    const seen = await this.#rpc.getBlock(earlierWork.reportBlock.number);
+    return seen.hash === earlierWork.reportBlock.hash;
+  }
+
   async #requireCanonicalBlock(block: BlockRef): Promise<void> {
     const seen = await this.#rpc.getBlock(block.number);
     if (seen.hash !== block.hash) {
@@ -926,6 +958,11 @@ function validateSetup(setup: GuardianState): void {
       max: 2_147_483_647,
     });
   }
+}
+
+/** A stale result carries the attempt's work to the next attempt. */
+function attachWorkToStale(result: Attested | Stale | NothingDue, work: Work): Attested | Stale | NothingDue {
+  return result.kind === 'stale' ? Object.freeze({ ...result, work }) : result;
 }
 
 /** viem caches its verdict by the text of a value, so only a string may reach it. */

@@ -263,6 +263,8 @@ export interface Attested {
 export interface Stale {
   readonly kind: 'stale';
   readonly reason: StaleReason;
+  /** Set by `Guardian.cycle`: the work this attempt reconstructed, which the next attempt can reuse. */
+  readonly work?: Work;
 }
 
 /** A complete read-only cycle: screening finished, but observe mode submitted nothing. */
