@@ -52,6 +52,8 @@ if ('previousHeartbeatBlock' in outcome) {
 }
 ```
 
+An attempt has a fixed budget: its heartbeat must be sent while the report block is at most `256 - heartbeatReserveBlocks` blocks behind the head, 248 blocks or just under 50 minutes with the example's reserve of eight blocks and 12-second slots. Discovery starts 50,400 blocks, at least seven days, before the previous heartbeat block, or before the `GuardianAdded` block when no heartbeat can be reused, and reads through the report block, so the first cycle, and the first cycle after downtime, covers everything since. Run the application without gaps from the moment the Guardian is added, and watch the time from `cycle.started` to `cycle.finished` against the budget; a stale outcome with `report-block-aged-out` is an attempt that did not fit.
+
 After reconstruction the SDK checks the plan again. A plan that can no longer be attested ends the attempt as stale before screening, so a slow attempt costs no screening.
 
 A stale outcome carries the attempt's `work`. Pass it to the next attempt as the second argument of `cycle`: a position whose controller logged nothing for it since keeps the anchors that attempt reconstructed, so a retry walks only what changed.
