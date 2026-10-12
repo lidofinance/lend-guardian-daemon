@@ -52,6 +52,8 @@ if ('previousHeartbeatBlock' in outcome) {
 }
 ```
 
+After reconstruction the SDK checks the plan again. A plan that can no longer be attested ends the attempt as stale before screening, so a slow attempt costs no screening.
+
 A stale outcome carries the attempt's `work`. Pass it to the next attempt as the second argument of `cycle`: a position whose controller logged nothing for it since keeps the anchors that attempt reconstructed, so a retry walks only what changed.
 
 `cycle` emits typed phase and terminal events through the same `onEvent` handler as RPC, transaction and report events. Missing, malformed or incomplete screening results stop the attempt before submission. In signal mode the SDK submits required suspect reports, then flag reports, verifies their canonical confirmations and finally submits and confirms the heartbeat. RPC and provider failures propagate to the application.

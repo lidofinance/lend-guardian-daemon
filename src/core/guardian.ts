@@ -167,6 +167,7 @@ export class Guardian {
   /**
    * Run one complete [scan cycle](../../docs/guardian-specification.md#scan-cycle). The caller owns
    * scheduling and recovery between calls; observe mode returns the screened result without writes.
+   * A plan that can no longer be attested once the work is reconstructed is stale before screening.
    * Pass a stale outcome's `work` as `earlierWork` to the next attempt, which reuses what it reconstructed.
    */
   async cycle(previousHeartbeatBlock?: BlockRef | null, earlierWork?: Work): Promise<CycleOutcome> {
@@ -182,14 +183,7 @@ export class Guardian {
       if (planned.kind === 'nothing-due') {
         const outcome = frozenCopy(planned);
         emitEvent(this.#setup.onEvent, { event: 'cycle.planned', ...context, result: outcome });
-        emitEvent(this.#setup.onEvent, {
-          event: 'cycle.finished',
-          ...context,
-          startedAt,
-          finishedAt: Date.now(),
-          outcome,
-        });
-        return outcome;
+        return this.#finishCycle(context, startedAt, outcome);
       }
       const plan = planned;
       emitEvent(this.#setup.onEvent, { event: 'cycle.planned', ...context, result: plan });
@@ -209,6 +203,14 @@ export class Guardian {
         positions: work.positions,
         anchors: work.all(),
       });
+      // An SDK safeguard with no step in the appendix: the plan check phase 5 makes before its first
+      // report runs here as well, so a plan that aged out, lost its report block or its stored
+      // heartbeat during reconstruction ends the attempt before screening, with the stale outcome the
+      // later check would return and the work for the next attempt.
+      const staleReason = await this.#planInvalidationReason(work);
+      if (staleReason !== null) {
+        return this.#finishCycle(context, startedAt, Object.freeze({ kind: 'stale', reason: staleReason, work }));
+      }
       const screened = await this.screenWork(work);
       emitEvent(this.#setup.onEvent, {
         event: 'cycle.screened',
@@ -227,14 +229,7 @@ export class Guardian {
               screened,
             })
           : attachWorkToStale(frozenCopy(await this.signalAndHeartbeat(screened)), work);
-      emitEvent(this.#setup.onEvent, {
-        event: 'cycle.finished',
-        ...context,
-        startedAt,
-        finishedAt: Date.now(),
-        outcome,
-      });
-      return outcome;
+      return this.#finishCycle(context, startedAt, outcome);
     } catch (error) {
       emitEvent(this.#setup.onEvent, {
         event: 'cycle.failed',
@@ -247,6 +242,12 @@ export class Guardian {
     } finally {
       this.#activeCycle = undefined;
     }
+  }
+
+  /** Report the outcome and hand it to the caller. */
+  #finishCycle(context: CycleContext, startedAt: number, outcome: CycleOutcome): CycleOutcome {
+    emitEvent(this.#setup.onEvent, { event: 'cycle.finished', ...context, startedAt, finishedAt: Date.now(), outcome });
+    return outcome;
   }
 
   /**
