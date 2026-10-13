@@ -18,7 +18,7 @@ import type { LogPosition } from '../chain/log-order.ts';
 import type { RpcProvider } from '../chain/rpc.ts';
 import { decodeLogs } from './decode-logs.ts';
 import type { ScanPlan, Work } from '../core/outcomes.ts';
-import type { PositionKey, SupplyAnchor } from '../core/types.ts';
+import type { DiscoveredPosition, LifecycleEventRef, PositionKey, SupplyAnchor } from '../core/types.ts';
 import { GuardianStop } from '../core/stop.ts';
 import { lower } from '../common/types.ts';
 import type { Address, BlockRef, Bytes32, ContractDeployment, MarketId, TxHash } from '../common/types.ts';
@@ -61,10 +61,11 @@ interface SupplyLog {
   readonly logIndex: number;
 }
 
-/** A `CollateralActivating` that classified a supply: the timer it set, and where it was logged. */
+/** A `CollateralActivating` that classified a supply: the timer it set, and the log itself. */
 interface Activation {
   readonly position: Position;
   readonly blockNumber: number;
+  readonly log: LifecycleLog;
 }
 
 type LifecycleEventStream = AsyncGenerator<LifecycleEvent>;
@@ -88,10 +89,10 @@ interface TargetSupply {
   readonly controller: Address;
 }
 
-/** A position whose activation is due and requires coverage, and the position its latest event left. */
+/** A position whose activation is due and requires coverage, with the newest event read for it so far. */
 interface Candidate {
   readonly key: PositionKey;
-  readonly latestPosition: Position;
+  readonly newestEvent: LifecycleLog;
 }
 
 const LIFECYCLE_TOPICS = [
@@ -137,7 +138,7 @@ export class Markets {
     plan: ScanPlan,
     targetRegistry: Address,
     concurrency: number,
-  ): Promise<PositionKey[]> {
+  ): Promise<DiscoveredPosition[]> {
     const window = plan.discoveryRange;
     const candidates = new CandidatePositions();
     // Controller events are read without gaps, so no event of a candidate is missed.
@@ -171,8 +172,17 @@ export class Markets {
     // or extended since is discarded here without a history walk; the work stays the same.
     return candidates
       .list()
-      .filter((candidate) => this.#isBaseActivationDeadlineReached(candidate.latestPosition, window.to.timestamp))
-      .map((candidate) => candidate.key);
+      .filter((candidate) =>
+        this.#isBaseActivationDeadlineReached(candidate.newestEvent.args.position, window.to.timestamp),
+      )
+      .map(({ key, newestEvent }) => ({
+        position: key,
+        newestEvent: {
+          blockNumber: Number(newestEvent.blockNumber),
+          logIndex: newestEvent.logIndex,
+          blockHash: newestEvent.blockHash,
+        },
+      }));
   }
 
   /**
@@ -182,7 +192,7 @@ export class Markets {
    */
   async reconstructWork(
     plan: ScanPlan,
-    positions: readonly PositionKey[],
+    candidates: readonly DiscoveredPosition[],
     concurrency: number,
     reusableWork?: Work,
   ): Promise<ReadonlyMap<PositionKey, readonly SupplyAnchor[]>> {
@@ -190,11 +200,11 @@ export class Markets {
       reusableWork === undefined
         ? new Map<string, readonly SupplyAnchor[]>()
         : await this.#findUnchangedAnchors(reusableWork, plan.discoveryRange.to.number, concurrency);
-    const walks = await readInBatches(positions, concurrency, async (position) => ({
-      position,
+    const walks = await readInBatches(candidates, concurrency, async (candidate) => ({
+      position: candidate.position,
       anchors:
-        unchangedAnchors.get(`${position.controller}:${position.borrower}`) ??
-        (await this.#reconstructPosition(plan, position)),
+        unchangedAnchors.get(`${candidate.position.controller}:${candidate.position.borrower}`) ??
+        (await this.#reconstructPosition(plan, candidate)),
     }));
     const byPosition = new Map<PositionKey, readonly SupplyAnchor[]>();
     for (const { position, anchors } of walks) {
@@ -449,7 +459,7 @@ export class Markets {
       if (!this.#requiresCurrentCoverage(plan.previousHeartbeatBlock, activation.blockNumber, deadline)) {
         continue;
       }
-      candidates.add({ controller, marketId: supply.marketId, borrower: supply.borrower }, activation.position);
+      candidates.add({ controller, marketId: supply.marketId, borrower: supply.borrower }, activation);
     }
   }
 
@@ -465,14 +475,12 @@ export class Markets {
     );
   }
 
-  async #reconstructPosition(plan: ScanPlan, position: PositionKey): Promise<SupplyAnchor[]> {
+  async #reconstructPosition(plan: ScanPlan, candidate: DiscoveredPosition): Promise<SupplyAnchor[]> {
+    const { position } = candidate;
     const events = this.lifecycleBack(position, plan.discoveryRange.to);
     const activationBlockByAnchor = new Map<string, AnchorActivation>();
     let positionAtPreviousHeartbeat: Position | null = null;
-    let current = await this.#readOlderLifecycleEvent(events);
-    if (current === null) {
-      throw new GuardianStop('position-without-history');
-    }
+    let current: LifecycleEvent | null = await this.#readNewestLifecycleEvent(events, candidate.newestEvent);
     if (!this.#isBaseActivationDeadlineReached(current.position, plan.discoveryRange.to.timestamp)) {
       return [];
     }
@@ -550,6 +558,25 @@ export class Markets {
       .map((contributor) => contributor.anchor);
   }
 
+  /**
+   * The first event of a walk, which must be the newest event discovery read for the position through
+   * the same report block. A walk whose first event differs read another history than the chain holds,
+   * so no decision is taken from it.
+   */
+  async #readNewestLifecycleEvent(
+    events: LifecycleEventStream,
+    newestEvent: LifecycleEventRef,
+  ): Promise<LifecycleEvent> {
+    const newest = await this.#readOlderLifecycleEvent(events);
+    if (newest === null) {
+      throw new GuardianStop('position-without-history');
+    }
+    if (!isSameEvent(newest.at, newestEvent)) {
+      throw new GuardianStop('position-history-broken');
+    }
+    return newest;
+  }
+
   async #readOlderLifecycleEvent(events: LifecycleEventStream): Promise<LifecycleEvent | null> {
     const next = await events.next();
     return next.done === true ? null : next.value;
@@ -606,7 +633,7 @@ export class Markets {
     if (log.eventName !== 'CollateralActivating') {
       return null;
     }
-    return { position: log.args.position, blockNumber: Number(log.blockNumber) };
+    return { position: log.args.position, blockNumber: Number(log.blockNumber), log };
   }
 
   #supplyOf(log: SupplyCollateralLog): SupplyLog {
@@ -658,11 +685,11 @@ export class Markets {
 class CandidatePositions {
   readonly #candidatesById = new Map<string, Candidate>();
 
-  /** Add a position with the position its activation left; a position already added keeps its record. */
-  add(key: PositionKey, position: Position): void {
+  /** Add a position with the activation that made it due; a position already added keeps its record. */
+  add(key: PositionKey, activation: Activation): void {
     const id = `${key.controller}:${key.marketId}:${key.borrower}`;
     if (!this.#candidatesById.has(id)) {
-      this.#candidatesById.set(id, { key, latestPosition: position });
+      this.#candidatesById.set(id, { key, newestEvent: activation.log });
     }
   }
 
@@ -687,7 +714,7 @@ class CandidatePositions {
       if (newest.args.position.activating === 0n) {
         this.#candidatesById.delete(id);
       } else {
-        this.#candidatesById.set(id, { key: candidate.key, latestPosition: newest.args.position });
+        this.#candidatesById.set(id, { key: candidate.key, newestEvent: newest });
       }
     }
   }
@@ -700,6 +727,10 @@ class CandidatePositions {
   list(): Candidate[] {
     return [...this.#candidatesById.values()];
   }
+}
+
+function isSameEvent(at: LogRef, ref: LifecycleEventRef): boolean {
+  return Number(at.blockNumber) === ref.blockNumber && at.logIndex === ref.logIndex && at.blockHash === ref.blockHash;
 }
 
 /**
