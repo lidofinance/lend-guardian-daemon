@@ -85,7 +85,7 @@ MODE=signal node example/daemon.ts
 
 The example passes the provider directly to the SDK without checking its concrete class. Incomplete requested results stop the cycle. When no anchors require screening, the SDK may send a heartbeat without calling the provider, including with the placeholder selected.
 
-`Guardian.cycle` runs `buildScanPlan → discoverCandidatePositions → reconstructWork → screenWork → signalAndHeartbeat` and emits each completed phase through `onEvent`. Signal mode sends required suspect reports, flag reports and finally a heartbeat. Missing, incomplete or malformed results and provider exceptions abort before submission. Existing own-flag exclusions remain unchanged.
+`Guardian.cycle` runs `buildScanPlan → discoverCandidatePositions → reconstructWork → screenWork → signalAndHeartbeat` and emits each completed phase through `onEvent`. Signal mode sends required suspect reports, flag reports and finally a heartbeat; a suspect that an earlier attempt since the previous heartbeat recorded is kept, not sent again, and appears as `report.skipped`. Missing, incomplete or malformed results and provider exceptions abort before submission. Existing own-flag exclusions remain unchanged.
 
 ## Delivery and recovery limits
 

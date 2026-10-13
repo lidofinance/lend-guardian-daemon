@@ -141,6 +141,7 @@ test('earlier work from another previous heartbeat is walked again', async () =>
       kind: 'plan',
       previousHeartbeatBlock: blockAt(JOINED),
       heartbeatTimestampAtStart: blockAt(JOINED).timestamp,
+      reportsSince: null,
       discoveryRange: { from: blockAt(JOINED), to: earlierWork.reportBlock },
     },
     earlierWork.entries(),

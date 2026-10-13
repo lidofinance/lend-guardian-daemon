@@ -365,7 +365,8 @@ export class Guardian {
       // commits the same set, and a malformed input stops the attempt before the first report.
       const digest = coverageDigest(work.all(), this.#coverageDigestBounds(work));
 
-      const reported = await this.#submitRequiredSignals(screened, reportConfirmationTimeoutMs);
+      const recorded = await this.#recordedSuspects(work, screened.suspects);
+      const reported = await this.#submitRequiredSignals(screened, recorded, reportConfirmationTimeoutMs);
       if ('kind' in reported) {
         return reported;
       }
@@ -375,6 +376,10 @@ export class Guardian {
         return { kind: 'stale', reason: staleReason };
       }
       if (!(await this.#areAllReportsConfirmed(reported))) {
+        return { kind: 'stale', reason: 'report-no-longer-confirmed' };
+      }
+      const stillRecorded = await this.#recordedSuspects(work, [...recorded.keys()]);
+      if (stillRecorded.size !== recorded.size) {
         return { kind: 'stale', reason: 'report-no-longer-confirmed' };
       }
 
@@ -622,11 +627,28 @@ export class Guardian {
       kind: 'plan',
       previousHeartbeatBlock: previousHeartbeatEvidence.previousHeartbeatBlock,
       heartbeatTimestampAtStart: previousHeartbeatEvidence.heartbeatTimestampAtStart,
+      reportsSince: await this.#reportsSince(previousHeartbeatEvidence, lookbackAnchorNumber),
       discoveryRange: {
         from: await this.#rpc.getBlock(firstEventBlock),
         to: reportBlock,
       },
     });
+  }
+
+  /**
+   * From when this Guardian's own reports count for the current coverage: after the block that
+   * included the previous heartbeat, or after joining for a Guardian without one. A stored heartbeat
+   * without a reusable block leaves that unknown, so no recorded report counts.
+   */
+  async #reportsSince(evidence: PreviousHeartbeatEvidence, lookbackAnchorNumber: number): Promise<number | null> {
+    if (evidence.previousHeartbeatBlock !== null) {
+      return evidence.previousHeartbeatIncludedAt;
+    }
+    if (evidence.heartbeatTimestampAtStart !== 0) {
+      return null;
+    }
+    const joined = await this.#rpc.getBlock(lookbackAnchorNumber);
+    return joined.timestamp;
   }
 
   /**
@@ -726,15 +748,23 @@ export class Guardian {
     return idle >= this.#setup.idleHeartbeatInterval;
   }
 
-  /** Reports are grouped by kind and market; all targets in a group share one registry call. */
+  /**
+   * Reports are grouped by kind and market; all targets in a group share one registry call. A
+   * suspect this Guardian already recorded for this coverage is kept, not sent again.
+   */
   async #submitRequiredSignals(
     screened: Screened,
+    recorded: ReadonlyMap<SignalTarget, number>,
     reportConfirmationTimeoutMs: number,
   ): Promise<readonly ReceiptRef[] | Stale> {
     const work = screened.work();
+    const cycle = this.#activeCycle === undefined ? {} : this.#activeCycle;
+    for (const [target, recordedAt] of recorded) {
+      emitEvent(this.#setup.onEvent, { event: 'report.skipped', ...cycle, method: 'suspect', target, recordedAt });
+    }
     const reports: ReceiptRef[] = [];
     const groups = [
-      { kind: 'suspect', targets: screened.suspects },
+      { kind: 'suspect', targets: screened.suspects.filter((target) => !recorded.has(target)) },
       { kind: 'flag', targets: screened.flags },
     ] as const;
     for (const group of groups) {
@@ -898,6 +928,37 @@ export class Guardian {
       throw new GuardianStop('head-not-canonical');
     }
     return null;
+  }
+
+  /**
+   * This Guardian's recorded suspects among the targets, by when they were recorded. The
+   * [specification](../../docs/guardian-specification.md#scan-cycle) lets a repeated attempt keep a
+   * suspect recorded since the previous heartbeat. The SDK counts one only when it was recorded after
+   * the block that included that heartbeat, or after joining, has `txConfirmationBlocks`
+   * confirmations and is inside `suspectWindow`, and asks again right before the heartbeat, so the
+   * heartbeat never relies on a shallow or expired report. Nothing counts while `reportsSince` is unknown.
+   */
+  async #recordedSuspects(work: Work, targets: readonly SignalTarget[]): Promise<ReadonlyMap<SignalTarget, number>> {
+    const recorded = new Map<SignalTarget, number>();
+    if (work.reportsSince === null || targets.length === 0) {
+      return recorded;
+    }
+    const head = await this.#rpc.getBlock();
+    // The newest block with `txConfirmationBlocks` confirmations, or the genesis of a shorter chain.
+    const confirmed = await this.#rpc.getBlock(Math.max(head.number - this.#setup.txConfirmationBlocks + 1, 0));
+    const window = await this.#registry.suspectWindow(head.hash);
+    for (const target of targets) {
+      const recordedAt = await this.#registry.suspectRecordedAt(target, head.hash);
+      if (recordedAt === null || recordedAt <= work.reportsSince) {
+        continue;
+      }
+      const isConfirmed = recordedAt <= confirmed.timestamp;
+      const isInsideWindow = recordedAt + window >= head.timestamp;
+      if (isConfirmed && isInsideWindow) {
+        recorded.set(target, recordedAt);
+      }
+    }
+    return recorded;
   }
 
   /** Reread every receipt immediately before committing coverage. */

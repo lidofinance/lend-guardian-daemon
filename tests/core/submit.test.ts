@@ -6,9 +6,10 @@ import test from 'node:test';
 import * as core from '../../src/core/index.ts';
 import { coverageDigest } from '../../src/core/digest.ts';
 import type { ScreeningResult } from '../../src/core/screening-provider.ts';
-import type { TxHash } from '../../src/core/index.ts';
+import type { SdkEvent, TxHash } from '../../src/core/index.ts';
+import type { Address } from '../../src/common/types.ts';
 import { blockAt, BORROWER, CHAIN_ID, CORE, fakeNode, GUARDIAN, MARKET, REGISTRY } from './fake-node.ts';
-import type { FakeNode, Lot, Script } from './fake-node.ts';
+import type { FakeNode, Lot, Script, SuspectRecord } from './fake-node.ts';
 import { guardianOver, IDLE_HEARTBEAT_SECONDS } from './setup.ts';
 
 const HEAD = 200_000;
@@ -560,4 +561,158 @@ test('shared report confirmation uses the configured polling interval', { timeou
   });
   assert.ok(latestReads >= 3);
   assert.deepEqual(built.sent.calls, ['flags']);
+});
+
+// ── A repeated attempt keeps a suspect this Guardian recorded since the previous heartbeat.
+
+const OTHER_GUARDIAN: Address = '0x00000000000000000000000000000000000000a1';
+const COVERED = blockAt(95_000);
+/** The previous heartbeat reported `COVERED`; its transaction landed three blocks later. */
+const HEARTBEATED: Script = {
+  ...ONE_DUE,
+  heartbeatTimestamp: COVERED.timestamp,
+  heartbeats: [{ blockNumber: COVERED.number, timestamp: COVERED.timestamp, includedAt: COVERED.number + 3 }],
+};
+/** Recorded long after that heartbeat, with more than twelve confirmations and inside a week. */
+const RECENT = blockAt(HEAD - 100).timestamp;
+/** A window that outlives every scripted record, so only the other conditions decide. */
+const LONG_WINDOW = 10 * 365 * 24 * 60 * 60;
+
+function ownSuspect(reportedAt: number): SuspectRecord[] {
+  return [{ guardian: GUARDIAN, reportedAt }];
+}
+
+/** A top-up of the due lot fifty blocks before the head: a new contributor that restarts its timer. */
+const TOP_UP: Lot = {
+  kind: 'activating',
+  blockNumber: HEAD - 50,
+  logIndex: 4,
+  amount: 5n,
+  position: { dust: 0n, activating: 10n, activatingStart: blockAt(HEAD - 50).timestamp, activatingDelay: 60 },
+  supplied: 5n,
+};
+
+/** The calldata of an `eth_call`, or an empty string for another request. */
+function callData(params: readonly unknown[]): string {
+  const call = params[0];
+  if (typeof call !== 'object' || call === null) {
+    return '';
+  }
+  return 'data' in call ? String(call.data) : '';
+}
+
+async function suspectCycle(script: Script, tuning: Partial<core.GuardianSetup> = {}) {
+  const built = await submitOver(script, 'suspect', undefined, tuning);
+  return { ...built, outcome: await built.guardian.signalAndHeartbeat(built.screened) };
+}
+
+test('a suspect recorded since the previous heartbeat is kept, not sent again', async () => {
+  const events: SdkEvent[] = [];
+  const { outcome, sent } = await suspectCycle(
+    { ...HEARTBEATED, suspectedBy: ownSuspect(RECENT) },
+    { onEvent: (event) => events.push(event) },
+  );
+  assert.equal(outcome.kind, 'attested');
+  assert.deepEqual(sent.calls, ['heartbeat']);
+  assert.deepEqual(
+    events.filter((event) => event.event === 'report.skipped'),
+    [{ event: 'report.skipped', method: 'suspect', target: TARGET, recordedAt: RECENT }],
+  );
+});
+
+test('a suspect recorded no later than the block that included the previous heartbeat is sent again', async () => {
+  const { outcome, sent } = await suspectCycle({
+    ...HEARTBEATED,
+    suspectedBy: ownSuspect(blockAt(COVERED.number + 3).timestamp),
+    suspectWindow: LONG_WINDOW,
+  });
+  assert.equal(outcome.kind, 'attested');
+  assert.deepEqual(sent.calls, ['suspects', 'heartbeat']);
+});
+
+test('a recorded suspect with fewer than txConfirmationBlocks confirmations is sent again', async () => {
+  const { sent } = await suspectCycle({ ...HEARTBEATED, suspectedBy: ownSuspect(blockAt(HEAD - 10).timestamp) });
+  assert.deepEqual(sent.calls, ['suspects', 'heartbeat']);
+});
+
+test('a recorded suspect outside suspectWindow is sent again', async () => {
+  const { sent } = await suspectCycle({ ...HEARTBEATED, suspectedBy: ownSuspect(RECENT), suspectWindow: 60 });
+  assert.deepEqual(sent.calls, ['suspects', 'heartbeat']);
+});
+
+test('a stored heartbeat without a reusable block keeps no recorded suspect', async () => {
+  const { sent } = await suspectCycle({
+    ...HEARTBEATED,
+    heartbeatTimestamp: COVERED.timestamp + 1,
+    suspectedBy: ownSuspect(RECENT),
+  });
+  assert.deepEqual(sent.calls, ['suspects', 'heartbeat']);
+});
+
+test('a Guardian without a heartbeat keeps a suspect recorded after the block it joined in', async () => {
+  const { sent } = await suspectCycle({ ...ONE_DUE, suspectedBy: ownSuspect(RECENT) });
+  assert.deepEqual(sent.calls, ['heartbeat']);
+});
+
+test('a Guardian without a heartbeat sends again a suspect recorded no later than it joined', async () => {
+  const { sent } = await suspectCycle({
+    ...ONE_DUE,
+    suspectedBy: ownSuspect(blockAt(1_000).timestamp),
+    suspectWindow: LONG_WINDOW,
+  });
+  assert.deepEqual(sent.calls, ['suspects', 'heartbeat']);
+});
+
+test("another Guardian's suspect does not count", async () => {
+  const { sent } = await suspectCycle({
+    ...HEARTBEATED,
+    suspectedBy: [{ guardian: OTHER_GUARDIAN, reportedAt: RECENT }],
+  });
+  assert.deepEqual(sent.calls, ['suspects', 'heartbeat']);
+});
+
+test('a kept suspect that is gone right before the heartbeat makes the attempt stale', async () => {
+  let reads = 0;
+  const built = await submitOver(
+    { ...HEARTBEATED, suspectedBy: ownSuspect(RECENT) },
+    'suspect',
+    (node, method, params) => {
+      if (method === 'eth_call' && callData(params).startsWith('0x3075b592')) {
+        reads += 1;
+        if (reads === 1) {
+          node.setSuspectedBy([]);
+        }
+      }
+    },
+  );
+  assert.deepEqual(await built.guardian.signalAndHeartbeat(built.screened), {
+    kind: 'stale',
+    reason: 'report-no-longer-confirmed',
+  });
+  assert.deepEqual(built.sent.calls, []);
+  assert.equal(reads, 2);
+});
+
+test('a top-up during a repeated attempt is covered by the suspect recorded since the previous heartbeat', async () => {
+  const { outcome, sent, work } = await suspectCycle({
+    ...HEARTBEATED,
+    lots: [LOT, TOP_UP],
+    suspectedBy: ownSuspect(blockAt(HEAD - 100).timestamp),
+  });
+  assert.equal(outcome.kind, 'attested');
+  assert.equal(work.all().length, 2);
+  assert.deepEqual(sent.calls, ['heartbeat']);
+});
+
+test('a top-up after the previous heartbeat gets a fresh suspect although the earlier one is still inside the window', async () => {
+  const { outcome, sent, work } = await suspectCycle({
+    ...HEARTBEATED,
+    lots: [LOT, TOP_UP],
+    suspectedBy: ownSuspect(blockAt(COVERED.number + 1).timestamp),
+    suspectWindow: LONG_WINDOW,
+  });
+  assert.equal(outcome.kind, 'attested');
+  assert.equal(work.all().length, 2);
+  assert.deepEqual(sent.suspects, [[TARGET]]);
+  assert.deepEqual(sent.calls, ['suspects', 'heartbeat']);
 });

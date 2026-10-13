@@ -24,6 +24,7 @@ const PLAN: ScanPlan = {
   kind: 'plan',
   previousHeartbeatBlock: null,
   heartbeatTimestampAtStart: 0,
+  reportsSince: null,
   discoveryRange: { from: blockAt(99_600), to: blockAt(HEAD - 2) },
 };
 

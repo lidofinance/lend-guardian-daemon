@@ -154,6 +154,7 @@ const PLAN: ScanPlan = {
   kind: 'plan',
   previousHeartbeatBlock: null,
   heartbeatTimestampAtStart: 0,
+  reportsSince: null,
   discoveryRange: WINDOW,
 };
 

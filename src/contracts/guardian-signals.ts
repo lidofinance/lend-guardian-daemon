@@ -1,7 +1,7 @@
 // GuardianSignals state, history and writes. This layer owns the ABI and contract address;
 // Guardian decides which reports to send and when; its configured client signs and broadcasts them.
 
-import { encodeEventTopics, encodeFunctionData, getAbiItem, decodeFunctionResult } from 'viem';
+import { encodeEventTopics, encodeFunctionData, getAbiItem, decodeFunctionResult, isAddressEqual } from 'viem';
 import { lower } from '../common/types.ts';
 import type { Address, BlockRef, Bytes32, ContractDeployment, MarketId, Hex } from '../common/types.ts';
 import type { SignalTarget } from '../core/types.ts';
@@ -17,12 +17,16 @@ const GUARDIAN_ADDED_ABI = [getAbiItem({ abi: GUARDIAN_SIGNALS_ABI, name: 'Guard
 /** Chain evidence recovered for phase A of the scan cycle. */
 export interface PreviousHeartbeatEvidence {
   readonly previousHeartbeatBlock: BlockRef | null;
+  /** The timestamp of the block that included the reusable heartbeat, or null without one. */
+  readonly previousHeartbeatIncludedAt: number | null;
   readonly heartbeatTimestampAtStart: number;
 }
 
 interface HeartbeatLog {
   readonly blockNumber: number;
   readonly timestamp: number;
+  /** The block that included the heartbeat transaction. */
+  readonly includedAt: number;
 }
 
 interface GuardianSignalsConfig {
@@ -99,20 +103,26 @@ export class GuardianSignals {
     hintedPreviousHeartbeatBlock: BlockRef | null = null,
   ): Promise<PreviousHeartbeatEvidence> {
     const heartbeatTimestampAtStart = await this.getHeartbeat(observationBlock.hash);
+    const notReusable = { heartbeatTimestampAtStart, previousHeartbeatBlock: null, previousHeartbeatIncludedAt: null };
     if (heartbeatTimestampAtStart === 0) {
-      return { heartbeatTimestampAtStart, previousHeartbeatBlock: null };
+      return notReusable;
     }
 
     const searchFrom = await this.#heartbeatSearchFrom(heartbeatTimestampAtStart, hintedPreviousHeartbeatBlock);
     const latestHeartbeat = await this.#latestHeartbeatEvent(searchFrom, observationBlock);
     if (latestHeartbeat?.timestamp !== heartbeatTimestampAtStart) {
-      return { heartbeatTimestampAtStart, previousHeartbeatBlock: null };
+      return notReusable;
     }
 
     const reportedBlock = await this.#rpc.getBlock(latestHeartbeat.blockNumber);
+    if (reportedBlock.timestamp !== heartbeatTimestampAtStart) {
+      return notReusable;
+    }
+    const includingBlock = await this.#rpc.getBlock(latestHeartbeat.includedAt);
     return {
       heartbeatTimestampAtStart,
-      previousHeartbeatBlock: reportedBlock.timestamp === heartbeatTimestampAtStart ? reportedBlock : null,
+      previousHeartbeatBlock: reportedBlock,
+      previousHeartbeatIncludedAt: includingBlock.timestamp,
     };
   }
 
@@ -125,6 +135,26 @@ export class GuardianSignals {
     const data = await this.#rpc.call(this.#registry, encodeFunctionData(request), at);
     const flaggers = decodeFunctionResult({ ...request, data });
     return flaggers.map(lower);
+  }
+
+  /** When this Guardian's own suspect on the target was recorded, or null while none is recorded. */
+  async suspectRecordedAt(target: SignalTarget, at: Bytes32): Promise<number | null> {
+    const request = {
+      abi: GUARDIAN_SIGNALS_ABI,
+      functionName: 'getSuspectedBy',
+      args: [target.marketId, target.borrower],
+    } as const;
+    const data = await this.#rpc.call(this.#registry, encodeFunctionData(request), at);
+    const [guardians, reportedAt] = decodeFunctionResult({ ...request, data });
+    const index = guardians.findIndex((guardian) => isAddressEqual(guardian, this.#guardian));
+    const recordedAt = index === -1 ? undefined : reportedAt[index];
+    return recordedAt ?? null;
+  }
+
+  async suspectWindow(at: Bytes32): Promise<number> {
+    const request = { abi: GUARDIAN_SIGNALS_ABI, functionName: 'getSuspectWindow' } as const;
+    const data = await this.#rpc.call(this.#registry, encodeFunctionData(request), at);
+    return Number(decodeFunctionResult({ ...request, data }));
   }
 
   suspect(marketId: MarketId, borrowers: readonly Address[], options: SendOptions): Promise<ReceiptRef> {
@@ -199,6 +229,7 @@ export class GuardianSignals {
     return {
       blockNumber: Number(latest.args.blockNumber),
       timestamp: Number(latest.args.timestamp),
+      includedAt: Number(latest.blockNumber),
     };
   }
 
