@@ -5,8 +5,11 @@ import { SEND_TIMEOUT_MS, signingClient } from './client.ts';
 import test from 'node:test';
 import * as core from '../../src/core/index.ts';
 import { coverageDigest } from '../../src/core/digest.ts';
+import { encodeFunctionData } from 'viem';
+import { GUARDIAN_SIGNALS_ABI } from '../../abi/GuardianSignals.abi.ts';
 import type { ScreeningResult } from '../../src/core/screening-provider.ts';
 import type { TxHash } from '../../src/core/index.ts';
+import type { Address, Hex } from '../../src/common/types.ts';
 import { blockAt, BORROWER, CHAIN_ID, CORE, fakeNode, GUARDIAN, MARKET, REGISTRY } from './fake-node.ts';
 import type { FakeNode, Lot, Script } from './fake-node.ts';
 import { guardianOver, IDLE_HEARTBEAT_SECONDS } from './setup.ts';
@@ -561,3 +564,78 @@ test('shared report confirmation uses the configured polling interval', { timeou
   assert.ok(latestReads >= 3);
   assert.deepEqual(built.sent.calls, ['flags']);
 });
+
+// ── A receipt the heartbeat relies on must name the report that was sent: this signer, the registry, that calldata.
+
+const STRANGER: Address = '0x00000000000000000000000000000000000000f1';
+
+/** Another registry call than the report: a flag on another borrower. */
+const OTHER_CALL: Hex = encodeFunctionData({
+  abi: GUARDIAN_SIGNALS_ABI,
+  functionName: 'flag',
+  args: [MARKET, GUARDIAN, [STRANGER]],
+});
+
+function stopsWith(reason: core.StopReason): (error: unknown) => boolean {
+  return (error) => {
+    assert.ok(error instanceof core.GuardianStop);
+    assert.equal(error.reason, reason);
+    return true;
+  };
+}
+
+const FOREIGN = { from: { from: STRANGER }, to: { to: STRANGER }, input: { input: OTHER_CALL } } as const;
+
+for (const field of ['from', 'to', 'input'] as const) {
+  test(`a confirmed report whose transaction has another ${field} stops the attempt before heartbeat`, async () => {
+    const after = afterInclusion((node, hash) => {
+      node.replaceTransaction(hash, FOREIGN[field]);
+    });
+    const { guardian, screened, sent } = await submitOver(ONE_DUE, 'flag', after);
+    await assert.rejects(guardian.signalAndHeartbeat(screened), stopsWith('report-receipt-foreign'));
+    assert.deepEqual(sent.calls, ['flags']);
+  });
+
+  test(`a confirmed heartbeat whose transaction has another ${field} cannot return attested`, async () => {
+    const after = afterInclusion((node, hash) => {
+      node.replaceTransaction(hash, FOREIGN[field]);
+    });
+    const { guardian, screened, sent } = await submitOver(ONE_DUE, 'clean', after);
+    await assert.rejects(guardian.signalAndHeartbeat(screened), stopsWith('report-receipt-foreign'));
+    assert.deepEqual(sent.calls, ['heartbeat']);
+  });
+}
+
+test('a client that answers the flag batch with the suspect receipt stops the attempt before heartbeat', async () => {
+  const node = fakeNode(ONE_DUE);
+  const both: ScreeningResult = { status: 'judged', requiresSuspect: true, requiresFlag: true };
+  const { guardian } = guardianOver(ONE_DUE, {
+    client: repeatingClient(signingClient([{ node: node.transport }])),
+    screening: { screen: (request) => Promise.resolve(request.anchors.map(() => both)) },
+  });
+  const plan = await guardian.buildScanPlan();
+  assert.equal(plan.kind, 'plan');
+  const work = await guardian.reconstructWork(await guardian.discoverCandidatePositions(plan));
+  const screened = await guardian.screenWork(work);
+  await assert.rejects(guardian.signalAndHeartbeat(screened), stopsWith('report-receipt-foreign'));
+  assert.deepEqual(node.sent.calls, ['suspects', 'flags']);
+});
+
+/** A client that answers every send with the receipt of its first, as a broken adapter might. */
+function repeatingClient(client: core.RpcClient): core.RpcClient {
+  const first: { receipt?: core.ReceiptRef } = {};
+  const send: core.RpcClient['send'] = async (transaction, options) => {
+    const receipt = await client.send(transaction, options);
+    first.receipt ??= receipt;
+    return first.receipt;
+  };
+  return new Proxy(client, {
+    get: (target, property): unknown => {
+      if (property === 'send') {
+        return send;
+      }
+      const value: unknown = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}

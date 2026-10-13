@@ -9,7 +9,14 @@ import { Markets } from '../contracts/markets.ts';
 import { GuardianSignals } from '../contracts/guardian-signals.ts';
 import type { PreviousHeartbeatEvidence } from '../contracts/guardian-signals.ts';
 import { BroadcastFailure, replacementFee } from '../chain/rpc.ts';
-import type { PreparedTransaction, ReceiptRef, RpcClient, RpcProvider, TransactionAttempt } from '../chain/rpc.ts';
+import type {
+  ChainTransaction,
+  PreparedTransaction,
+  ReceiptRef,
+  RpcClient,
+  RpcProvider,
+  TransactionAttempt,
+} from '../chain/rpc.ts';
 import { emitEvent } from '../events.ts';
 import type { CycleContext, EventHandler, OperationContext, ReportContext, TransactionContext } from '../events.ts';
 import type { SignalTarget } from './types.ts';
@@ -121,6 +128,12 @@ type GuardianState = GuardianConfig &
         readonly sendTimeoutMs: number;
       }
   );
+
+/** A report the client delivered, with the operation it was sent for. */
+interface SentReport {
+  readonly context: OperationContext;
+  readonly receipt: ReceiptRef;
+}
 
 /** Fixed gas for an EOA self-transfer with no calldata. */
 const CANCELLATION_GAS = 21_000n;
@@ -685,15 +698,15 @@ export class Guardian {
   async #submitRequiredSignals(
     screened: Screened,
     reportConfirmationTimeoutMs: number,
-  ): Promise<readonly ReceiptRef[] | Stale> {
+  ): Promise<readonly SentReport[] | Stale> {
     const work = screened.work();
-    const reports: ReceiptRef[] = [];
+    const reports: SentReport[] = [];
     const groups = [
       { kind: 'suspect', targets: screened.suspects },
       { kind: 'flag', targets: screened.flags },
     ] as const;
     for (const group of groups) {
-      const landed: { context: OperationContext; receipt: ReceiptRef }[] = [];
+      const landed: SentReport[] = [];
       for (const { marketId, borrowers } of this.#signalBatches(group.targets)) {
         const reason = await this.#planInvalidationReason(work);
         if (reason !== null) {
@@ -707,18 +720,14 @@ export class Guardian {
         });
         landed.push({ context, receipt });
       }
-      const stale = await this.#confirmSignalTransactions(
-        work,
-        landed.map((report) => report.receipt),
-        reportConfirmationTimeoutMs,
-      );
+      const stale = await this.#confirmSignalTransactions(work, landed, reportConfirmationTimeoutMs);
       if (stale !== null) {
         return stale;
       }
       for (const { context, receipt } of landed) {
         this.#emitConfirmedReport(context, receipt);
       }
-      reports.push(...landed.map((report) => report.receipt));
+      reports.push(...landed);
     }
     return reports;
   }
@@ -749,10 +758,10 @@ export class Guardian {
    */
   async #confirmSignalTransactions(
     work: Work,
-    receipts: readonly ReceiptRef[],
+    reports: readonly SentReport[],
     timeoutMs: number,
   ): Promise<Stale | null> {
-    if (receipts.length === 0) {
+    if (reports.length === 0) {
       return null;
     }
     const deadline = Date.now() + timeoutMs;
@@ -762,11 +771,11 @@ export class Guardian {
         return { kind: 'stale', reason };
       }
       const head = await this.#rpc.getBlock();
-      const deepEnough = receipts.every(
-        (receipt) => head.number - receipt.blockNumber + 1 >= this.#setup.txConfirmationBlocks,
+      const deepEnough = reports.every(
+        ({ receipt }) => head.number - receipt.blockNumber + 1 >= this.#setup.txConfirmationBlocks,
       );
       if (deepEnough) {
-        return (await this.#areAllReportsConfirmed(receipts))
+        return (await this.#areAllReportsConfirmed(reports))
           ? null
           : { kind: 'stale', reason: 'report-no-longer-confirmed' };
       }
@@ -780,18 +789,17 @@ export class Guardian {
 
   /** Commit coverage only after every required report has passed the final check. */
   async #submitHeartbeat(work: Work, digest: Bytes32): Promise<Attested> {
-    const depth = this.#setup.txConfirmationBlocks;
     const context = this.#startReportOperation({
       method: 'heartbeat',
       reportBlock: work.reportBlock,
       coverageDigest: digest,
     });
     const receipt = await this.#registry.heartbeat(work.reportBlock, digest, {
-      confirmations: depth,
+      confirmations: this.#setup.txConfirmationBlocks,
       context,
     });
     const heartbeat = receipt.transactionHash;
-    if (!(await this.#rpc.isConfirmed(receipt, await this.#rpc.getBlock(), depth))) {
+    if (!(await this.#isReportConfirmed({ context, receipt }, await this.#rpc.getBlock()))) {
       throw new Error(`Heartbeat ${heartbeat} is no longer confirmed`);
     }
     this.#emitConfirmedReport(context, receipt);
@@ -856,14 +864,52 @@ export class Guardian {
   }
 
   /** Reread every receipt immediately before committing coverage. */
-  async #areAllReportsConfirmed(receipts: readonly ReceiptRef[]): Promise<boolean> {
+  async #areAllReportsConfirmed(reports: readonly SentReport[]): Promise<boolean> {
     const head = await this.#rpc.getBlock();
-    for (const receipt of receipts) {
-      if (!(await this.#rpc.isConfirmed(receipt, head, this.#setup.txConfirmationBlocks))) {
+    for (const report of reports) {
+      if (!(await this.#isReportConfirmed(report, head))) {
         return false;
       }
     }
     return true;
+  }
+
+  /**
+   * Whether a report is still confirmed and is the report that was sent. The receipt and the
+   * transaction behind it are read again through the client's plain reads rather than its verdict,
+   * so a client that confirms the wrong transaction cannot pass the heartbeat gate: the transaction
+   * must be this Guardian's signer calling the registry with the report's own calldata, and anything
+   * else is a broken client rather than chain state, which stops the attempt.
+   */
+  async #isReportConfirmed({ context, receipt }: SentReport, head: BlockRef): Promise<boolean> {
+    const landed = await this.#rpc.getReceipt(receipt.transactionHash);
+    if (landed?.status !== 'success') {
+      return false;
+    }
+    const sameTransaction = landed.transactionHash === receipt.transactionHash;
+    const sameBlock = landed.blockHash === receipt.blockHash && landed.blockNumber === receipt.blockNumber;
+    if (!sameTransaction || !sameBlock) {
+      return false;
+    }
+    const transaction = await this.#rpc.getTransaction(receipt.transactionHash);
+    if (transaction === null) {
+      return false;
+    }
+    this.#requireOwnReport(transaction, context);
+    const canonical = await this.#rpc.getBlock(receipt.blockNumber);
+    const isCanonical = canonical.hash === receipt.blockHash;
+    return isCanonical && head.number - receipt.blockNumber + 1 >= this.#setup.txConfirmationBlocks;
+  }
+
+  #requireOwnReport(transaction: ChainTransaction, report: ReportContext): void {
+    const signer = this.#setup.mode === 'observe' ? undefined : this.#setup.client.signer;
+    const registry = this.#setup.deployment.guardianSignals.address;
+    const isToRegistry = transaction.to !== null && isAddressEqual(transaction.to, registry);
+    const isFromSigner = signer !== undefined && isAddressEqual(transaction.from, signer);
+    const isOwnCall = isToRegistry && isFromSigner;
+    if (!isOwnCall || transaction.input !== this.#registry.encodeReport(report)) {
+      throw new GuardianStop('report-receipt-foreign');
+    }
   }
 
   #coverageDigestBounds(work: Work): CoverageBounds {

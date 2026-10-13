@@ -7,6 +7,7 @@ import type { Address, BlockRef, Bytes32, ContractDeployment, MarketId, Hex } fr
 import type { SignalTarget } from '../core/types.ts';
 import { GUARDIAN_SIGNALS_ABI } from '../../abi/GuardianSignals.abi.ts';
 import type { ReceiptRef, RpcProvider, RpcClient, SendOptions } from '../chain/rpc.ts';
+import type { ReportContext } from '../events.ts';
 import { decodeLogs } from './decode-logs.ts';
 import { GuardianStop } from '../core/stop.ts';
 
@@ -128,30 +129,31 @@ export class GuardianSignals {
   }
 
   suspect(marketId: MarketId, borrowers: readonly Address[], options: SendOptions): Promise<ReceiptRef> {
-    const data = encodeFunctionData({
-      abi: GUARDIAN_SIGNALS_ABI,
-      functionName: 'suspect',
-      args: [marketId, this.#guardian, borrowers],
-    });
-    return this.#send(data, options);
+    return this.#send(this.encodeReport({ method: 'suspect', marketId, accounts: borrowers }), options);
   }
 
   flag(marketId: MarketId, borrowers: readonly Address[], options: SendOptions): Promise<ReceiptRef> {
-    const data = encodeFunctionData({
-      abi: GUARDIAN_SIGNALS_ABI,
-      functionName: 'flag',
-      args: [marketId, this.#guardian, borrowers],
-    });
-    return this.#send(data, options);
+    return this.#send(this.encodeReport({ method: 'flag', marketId, accounts: borrowers }), options);
   }
 
   heartbeat(block: BlockRef, digest: Bytes32, options: SendOptions): Promise<ReceiptRef> {
-    const data = encodeFunctionData({
+    return this.#send(this.encodeReport({ method: 'heartbeat', reportBlock: block, coverageDigest: digest }), options);
+  }
+
+  /** The registry call a report is sent as; a delivered transaction must carry exactly this. */
+  encodeReport(report: ReportContext): Hex {
+    if (report.method === 'heartbeat') {
+      return encodeFunctionData({
+        abi: GUARDIAN_SIGNALS_ABI,
+        functionName: 'heartbeat',
+        args: [this.#guardian, report.reportBlock, report.coverageDigest],
+      });
+    }
+    return encodeFunctionData({
       abi: GUARDIAN_SIGNALS_ABI,
-      functionName: 'heartbeat',
-      args: [this.#guardian, block, digest],
+      functionName: report.method,
+      args: [report.marketId, this.#guardian, report.accounts],
     });
-    return this.#send(data, options);
   }
 
   #send(data: Hex, options: SendOptions): Promise<ReceiptRef> {

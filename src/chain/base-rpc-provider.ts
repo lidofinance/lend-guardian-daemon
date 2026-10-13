@@ -1,9 +1,11 @@
 // Shared JSON-RPC reads. No client is constructed here; request uses the caller's transport.
 import { hexToBigInt, hexToNumber, numberToHex } from 'viem';
 import type { RpcLog, PublicRpcSchema } from 'viem';
+import { lower } from '../common/types.ts';
 import type { Address, BlockRef, Bytes32, Hex, TxHash } from '../common/types.ts';
 import { requireInteger } from '../common/validation.ts';
 import type {
+  ChainTransaction,
   BlockLogFilter,
   ChainLog,
   LogFilter,
@@ -75,6 +77,20 @@ export class BaseRpcProvider implements RpcProvider {
       blockHash: receipt.blockHash,
       blockNumber: hexToNumber(receipt.blockNumber),
       status: receipt.status === '0x1' ? 'success' : 'reverted',
+    };
+  }
+
+  /** JSON-RPC null means unknown. A pending transaction is returned with the call it carries. */
+  async getTransaction(hash: TxHash): Promise<ChainTransaction | null> {
+    const transaction = await this.request({ method: 'eth_getTransactionByHash', params: [hash] });
+    if (transaction === null) {
+      return null;
+    }
+    return {
+      transactionHash: transaction.hash,
+      from: lower(transaction.from),
+      to: transaction.to === null ? null : lower(transaction.to),
+      input: transaction.input,
     };
   }
 
