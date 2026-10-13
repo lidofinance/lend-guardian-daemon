@@ -285,13 +285,13 @@ export class Guardian {
   async discoverCandidatePositions(plan: ScanPlan): Promise<Discovered> {
     const markets = new Markets(this.#rpc, this.#setup.deployment.lidoLend);
     await this.#requireCanonicalBlock(plan.discoveryRange.to);
-    const positions = await markets.discoverCandidatePositions(
+    const candidates = await markets.discoverCandidatePositions(
       plan,
       this.#setup.deployment.guardianSignals.address,
       this.#setup.historyReadConcurrency,
     );
     await this.#requireCanonicalBlock(plan.discoveryRange.to);
-    return new Discovered(plan, positions);
+    return new Discovered(plan, candidates);
   }
 
   /**
@@ -311,7 +311,7 @@ export class Guardian {
       earlierWork !== undefined && (await this.#canReuse(earlierWork, plan)) ? earlierWork : undefined;
     const byPosition = await markets.reconstructWork(
       plan,
-      discovered.all(),
+      discovered.candidates(),
       this.#setup.historyReadConcurrency,
       reusableWork,
     );

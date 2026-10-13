@@ -1,7 +1,7 @@
 // What the five phases hand back. Each value says what the cycle established and what the caller
 // may do next, so the loop around them is a decision over values rather than over exceptions.
 
-import type { PositionKey, SignalTarget, SupplyAnchor } from './types.ts';
+import type { DiscoveredPosition, PositionKey, SignalTarget, SupplyAnchor } from './types.ts';
 import type { ScreeningResult } from './screening-provider.ts';
 import type { Address, BlockRef, Bytes32, TxHash } from '../common/types.ts';
 import { frozenCopy } from '../common/immutable.ts';
@@ -50,9 +50,9 @@ export interface ScanPlan {
 export class Discovered {
   readonly #plan: ScanPlan;
 
-  readonly #positions: readonly PositionKey[];
+  readonly #candidates: readonly DiscoveredPosition[];
 
-  constructor(plan: ScanPlan, positions: readonly PositionKey[]) {
+  constructor(plan: ScanPlan, candidates: readonly DiscoveredPosition[]) {
     this.#plan = frozenCopy({
       kind: 'plan',
       previousHeartbeatBlock: plan.previousHeartbeatBlock,
@@ -60,7 +60,7 @@ export class Discovered {
       reportsSince: plan.reportsSince,
       discoveryRange: plan.discoveryRange,
     });
-    this.#positions = frozenCopy(positions);
+    this.#candidates = frozenCopy(candidates);
     Object.freeze(this);
   }
 
@@ -69,7 +69,12 @@ export class Discovered {
   }
 
   all(): PositionKey[] {
-    return [...this.#positions];
+    return this.#candidates.map((candidate) => candidate.position);
+  }
+
+  /** Every candidate with the newest event discovery read for it. */
+  candidates(): DiscoveredPosition[] {
+    return [...this.#candidates];
   }
 }
 

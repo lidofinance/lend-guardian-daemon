@@ -763,3 +763,39 @@ function hasCause(error: unknown, predicate: (candidate: unknown) => boolean): b
   }
   return false;
 }
+
+test('a walk that lacks the newest event discovery read stops instead of deciding from an older history', async () => {
+  // A top-up at 150_000 restarted the timer; the replica serving walks is behind it.
+  const topUp: Lot = {
+    kind: 'activating',
+    blockNumber: 150_000,
+    logIndex: 4,
+    amount: 2n,
+    position: { dust: 0n, activating: 7n, activatingStart: blockAt(150_000).timestamp, activatingDelay: DAY },
+    supplied: 2n,
+  };
+  await assertStops(
+    { head: HEAD, guardianAddedAt: CORE_DEPLOYED, lots: [activation(100_000, 5n, 5n), topUp], walksLagBehind: 140_000 },
+    'position-history-broken',
+  );
+});
+
+test('a drained lot resupplied beyond the walk replica is not dropped from the work in silence', async () => {
+  // Drained at 120_000, started again at 150_000: a walk cut at 140_000 would see no timer and return nothing.
+  const drained: Lot = {
+    kind: 'drained',
+    blockNumber: 120_000,
+    logIndex: 4,
+    amount: 5n,
+    position: { dust: 0n, activating: 0n, activatingStart: 0, activatingDelay: 0 },
+  };
+  await assertStops(
+    {
+      head: HEAD,
+      guardianAddedAt: CORE_DEPLOYED,
+      lots: [activation(100_000, 5n, 5n), drained, activation(150_000, 5n, 5n)],
+      walksLagBehind: 140_000,
+    },
+    'position-history-broken',
+  );
+});
