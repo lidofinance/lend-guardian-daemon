@@ -66,7 +66,7 @@ For viem, create one reusable transport, use it to configure the public and wall
 
 `createViemRpcTransport` sends each request to the first endpoint that answers and falls back to the next one. A load balancer or a lagging endpoint can then answer a log range without its latest blocks, and the SDK cannot see that.
 
-Reconstruction also compares the first event of each position's history walk with the newest event discovery read for it and stops on a difference, so one lagging answer cannot drop a position from the work or rebuild it from an older history; two answers that lag alike still can.
+Reconstruction also compares the first event of each position's history walk with the newest event discovery read for it, checks that this event sits in the canonical block at its number, and checks the report block before and after the walks as discovery does; a difference stops the attempt, so one lagging or forked answer cannot drop a position from the work or rebuild it from another history. Two answers that lag alike still can.
 
 With the `logQuorum` option the transport asks every provider for logs and compares their answers. Every other request is sent to the endpoints in turn as without the option.
 

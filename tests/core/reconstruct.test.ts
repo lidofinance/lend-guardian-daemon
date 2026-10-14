@@ -8,7 +8,9 @@ import type { GuardianSetup } from '../../src/core/guardian.ts';
 import type { Work } from '../../src/core/outcomes.ts';
 import { GuardianStop } from '../../src/core/stop.ts';
 import type { StopReason } from '../../src/core/stop.ts';
-import { blockAt, BORROWER, CONTROLLER, MARKET } from './fake-node.ts';
+import { isRecord } from '../../src/common/validation.ts';
+import type { NodeRequest } from './client.ts';
+import { blockAt, BORROWER, CONTROLLER, fakeNode, MARKET } from './fake-node.ts';
 import type { LogsCap } from './fake-node.ts';
 import type { Lot, Script } from './fake-node.ts';
 import { CORE_DEPLOYED, guardianOver } from './setup.ts';
@@ -799,3 +801,63 @@ test('a drained lot resupplied beyond the walk replica is not dropped from the w
     'position-history-broken',
   );
 });
+
+test('a newest event served under a block the chain does not hold stops the attempt', async () => {
+  // The top-up's log names another block hash than the chain holds at its number: a branch the walk read.
+  const forked: Lot = {
+    kind: 'activating',
+    blockNumber: 150_000,
+    logIndex: 4,
+    amount: 2n,
+    position: { dust: 0n, activating: 7n, activatingStart: blockAt(150_000).timestamp, activatingDelay: DAY },
+    controllerBlockHash: blockAt(1).hash,
+  };
+  await assertStops(
+    { head: HEAD, guardianAddedAt: CORE_DEPLOYED, lots: [activation(100_000, 5n, 5n), forked] },
+    'log-not-canonical',
+  );
+});
+
+test('a report block that leaves the chain before or during the walks stops the attempt', async () => {
+  const script: Script = { head: HEAD, guardianAddedAt: CORE_DEPLOYED, lots: [activation(100_000, 5n, 5n)] };
+  const before = fakeNode(script);
+  const { guardian: guardianBefore } = guardianOver(script, { endpoints: [{ node: before.transport }] });
+  const planned = await guardianBefore.buildScanPlan();
+  assert.ok(planned.kind === 'plan');
+  const discovered = await guardianBefore.discoverCandidatePositions(planned);
+  before.reorgBlock(REPORT);
+  await assert.rejects(guardianBefore.reconstructWork(discovered), stopsWith('node-behind-the-plan'));
+
+  // The branch changes after the first walk read: the check after the walks catches it.
+  const during = fakeNode(script);
+  const transport: NodeRequest = async (method, params) => {
+    const answer = await during.transport(method, params);
+    if (method === 'eth_getLogs' && isWalkQuery(params)) {
+      during.reorgBlock(REPORT);
+    }
+    return answer;
+  };
+  const { guardian: guardianDuring } = guardianOver(script, { endpoints: [{ node: transport }] });
+  const plan = await guardianDuring.buildScanPlan();
+  assert.ok(plan.kind === 'plan');
+  const candidates = await guardianDuring.discoverCandidatePositions(plan);
+  await assert.rejects(guardianDuring.reconstructWork(candidates), stopsWith('node-behind-the-plan'));
+});
+
+/** A walk reads the controller and names the borrower in a topic. */
+function isWalkQuery(params: readonly unknown[]): boolean {
+  const filter = params[0];
+  if (!isRecord(filter)) {
+    return false;
+  }
+  const isControllerRead = String(filter.address).toLowerCase() === CONTROLLER.toLowerCase();
+  return isControllerRead && Array.isArray(filter.topics) && filter.topics.length > 1;
+}
+
+function stopsWith(reason: StopReason): (error: unknown) => boolean {
+  return (error) => {
+    assert.ok(error instanceof GuardianStop);
+    assert.equal(error.reason, reason);
+    return true;
+  };
+}

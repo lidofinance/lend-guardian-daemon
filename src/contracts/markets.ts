@@ -561,8 +561,9 @@ export class Markets {
 
   /**
    * The first event of a walk, which must be the newest event discovery read for the position through
-   * the same report block. A walk whose first event differs read another history than the chain holds,
-   * so no decision is taken from it.
+   * the same report block, and must sit in the canonical block at its number. A walk whose first event
+   * differs, or came from a branch the chain does not hold, read another history, so no decision is
+   * taken from it.
    */
   async #readNewestLifecycleEvent(
     events: LifecycleEventStream,
@@ -574,6 +575,10 @@ export class Markets {
     }
     if (!isSameEvent(newest.at, newestEvent)) {
       throw new GuardianStop('position-history-broken');
+    }
+    const canonical = await this.#rpc.getBlock(Number(newest.at.blockNumber));
+    if (canonical.hash !== newest.at.blockHash) {
+      throw new GuardianStop('log-not-canonical');
     }
     return newest;
   }
