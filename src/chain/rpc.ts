@@ -40,11 +40,6 @@ export interface LogFilter {
   readonly toBlock: number;
 }
 
-export interface BlockLogFilter {
-  readonly address: Address;
-  readonly blockHash: Bytes32;
-}
-
 /** Chain reads in SDK types, independent of the library implementing request. */
 export interface RpcProvider {
   readonly request: RpcRequest;
@@ -53,7 +48,7 @@ export interface RpcProvider {
   getTransactionCount(address: Address, at: 'latest' | 'pending' | number): Promise<number>;
   getBlock(number?: number): Promise<BlockRef>;
   getReceipt(hash: TxHash): Promise<TransactionReceipt | null>;
-  getLogs(filter: LogFilter | BlockLogFilter): Promise<ChainLog[]>;
+  getLogs(filter: LogFilter): Promise<ChainLog[]>;
   logBatches(filter: LogFilter, direction: 'forward' | 'backward'): AsyncIterable<ChainLog[]>;
   /** Decode every fetched log before selecting the newest; stop before older ranges. */
   getLastLog<Result>(filter: LogFilter, decode: (log: ChainLog) => Result): Promise<Result | undefined>;

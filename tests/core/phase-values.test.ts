@@ -10,6 +10,7 @@ function inputs() {
     kind: 'plan',
     previousHeartbeatBlock: blockAt(150_000),
     heartbeatTimestampAtStart: blockAt(150_000).timestamp,
+    reportsSince: null,
     discoveryRange: { from: blockAt(100_000), to: blockAt(200_000) },
   };
   const key = { controller: CONTROLLER, marketId: MARKET, borrower: BORROWER };
