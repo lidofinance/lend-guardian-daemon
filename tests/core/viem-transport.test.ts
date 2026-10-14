@@ -146,7 +146,7 @@ for (const status of [401, 403, 429, 503]) {
   });
 }
 
-test('retains Retry-After and the original HTTP error while viem retries', async (context) => {
+test('passes a Retry-After within the request timeout on to viem', async (context) => {
   let calls = 0;
   const fixture = transportFixture(
     context,
@@ -156,16 +156,69 @@ test('retains Retry-After and the original HTTP error while viem retries', async
         calls === 1 ? new Response('limited', { status: 429, headers: { 'retry-after': '1' } }) : answer(init);
       return Promise.resolve(response);
     },
-    { urls: [URLS[0]], retryCount: 1 },
+    { urls: [URLS[0]], retryCount: 1, timeoutMs: 2_000 },
   );
   const startedAt = performance.now();
 
   assert.equal(await fixture.request(CHAIN_ID_REQUEST), '0x1');
   assert.ok(performance.now() - startedAt >= 900);
-  const error = nestedError(finished(fixture.events)[0]?.error, (candidate) => candidate instanceof HttpRequestError);
+  const limited = finished(fixture.events)[0];
+  assert.equal(limited?.retryAfterMs, 1_000);
+  const error = nestedError(limited.error, (candidate) => candidate instanceof HttpRequestError);
   assert.ok(error instanceof HttpRequestError);
   assert.equal(error.headers?.get('retry-after'), '1');
 });
+
+test('shortens a Retry-After longer than the request timeout to it', async (context) => {
+  let calls = 0;
+  const fixture = transportFixture(
+    context,
+    (_input, init) => {
+      calls += 1;
+      const response =
+        calls === 1 ? new Response('limited', { status: 429, headers: { 'retry-after': '3600' } }) : answer(init);
+      return Promise.resolve(response);
+    },
+    { urls: [URLS[0]], retryCount: 1, timeoutMs: 1_000 },
+  );
+  const startedAt = performance.now();
+
+  assert.equal(await fixture.request(CHAIN_ID_REQUEST), '0x1');
+  const elapsed = performance.now() - startedAt;
+  assert.ok(elapsed >= 900 && elapsed < 5_000, `paused ${String(elapsed)} ms`);
+  const limited = finished(fixture.events)[0];
+  assert.equal(limited?.retryAfterMs, 1_000);
+  const error = nestedError(limited.error, (candidate) => candidate instanceof HttpRequestError);
+  assert.ok(error instanceof HttpRequestError);
+  assert.equal(error.headers?.get('retry-after'), '1');
+});
+
+for (const [form, header] of [
+  ['a Retry-After date', 'Wed, 21 Oct 2015 07:28:00 GMT'],
+  ['a Retry-After bounded below one second', '3600'],
+] as const) {
+  test(`drops ${form}, so viem backs off as configured`, async (context) => {
+    let calls = 0;
+    const fixture = transportFixture(
+      context,
+      (_input, init) => {
+        calls += 1;
+        const limited = { status: 429, headers: { 'retry-after': header } };
+        return Promise.resolve(calls === 1 ? new Response('limited', limited) : answer(init));
+      },
+      { urls: [URLS[0]], retryCount: 1, timeoutMs: 100 },
+    );
+    const startedAt = performance.now();
+
+    assert.equal(await fixture.request(CHAIN_ID_REQUEST), '0x1');
+    assert.ok(performance.now() - startedAt < 500);
+    const limited = finished(fixture.events)[0];
+    assert.equal(limited?.retryAfterMs, undefined);
+    const error = nestedError(limited?.error, (candidate) => candidate instanceof HttpRequestError);
+    assert.ok(error instanceof HttpRequestError);
+    assert.equal(error.headers?.get('retry-after'), null);
+  });
+}
 
 test('preserves JSON-RPC revert code and data from an HTTP error response', async (context) => {
   let calls = 0;
@@ -301,11 +354,13 @@ test('a malformed reply to a failed HTTP request keeps the status and retry head
   const fixture = transportFixture(
     context,
     () => Promise.resolve(Response.json(reply, { status: 429, headers: { 'retry-after': '1' } })),
-    { urls: [URLS[0]], retryCount: 0 },
+    { urls: [URLS[0]], retryCount: 0, timeoutMs: 2_000 },
   );
 
   await assert.rejects(fixture.request(CHAIN_ID_REQUEST));
-  const failure = nestedError(finished(fixture.events)[0]?.error, (candidate) => candidate instanceof HttpRequestError);
+  const limited = finished(fixture.events)[0];
+  assert.equal(limited?.retryAfterMs, 1_000);
+  const failure = nestedError(limited.error, (candidate) => candidate instanceof HttpRequestError);
   assert.ok(failure instanceof HttpRequestError);
   assert.equal(failure.status, 429);
   assert.equal(failure.headers?.get('retry-after'), '1');

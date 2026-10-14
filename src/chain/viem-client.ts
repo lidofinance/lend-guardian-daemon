@@ -29,7 +29,7 @@ export interface ViemRpcClientOptions {
 }
 
 class DeliveryLimit extends Error {
-  readonly reason: 'send-attempts-exhausted' | 'confirmation-timeout';
+  readonly reason: 'send-attempts-exhausted' | 'confirmation-timeout' | 'signing-timeout';
 
   constructor(reason: DeliveryLimit['reason']) {
     super(`Transaction delivery stopped: ${reason}`);
@@ -104,7 +104,7 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
         }
         if (prepared.maxFeePerGas <= this.transactionPolicy.maxFeePerGas) {
           stage = 'signing';
-          const signed = await this.#sign(walletClient, prepared, attempts, context);
+          const signed = await this.#sign(walletClient, prepared, attempts, context, deadline);
           if (Date.now() >= deadline) {
             throw new DeliveryLimit('confirmation-timeout');
           }
@@ -193,6 +193,7 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
     }
     const call = Object.freeze({ ...transaction });
     const { attempt, context } = frozenCopy(options);
+    const deadline = Date.now() + this.transactionPolicy.sendTimeoutMs;
     this.#isSending = true;
     try {
       if ((await this.getChainId()) !== call.chainId) {
@@ -201,7 +202,7 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
       if (call.maxFeePerGas > this.transactionPolicy.maxFeePerGas) {
         throw new RangeError('Transaction fee exceeds maxFeePerGas');
       }
-      const signed = await this.#sign(walletClient, call, attempt, context);
+      const signed = await this.#sign(walletClient, call, attempt, context, deadline);
       try {
         return await this.#broadcast(signed, call.nonce, attempt, context);
       } catch (error) {
@@ -234,14 +235,22 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
     };
   }
 
+  /** A signer that never answers, such as a remote key service, must not hold the send past its budget. */
   async #sign(
     walletClient: WalletClient<Transport, Chain, Account>,
     prepared: PreparedTransaction,
     attempt: number,
     context: TransactionContext | undefined,
+    deadline: number,
   ): Promise<Hex> {
     const startedAt = performance.timeOrigin + performance.now();
-    const signed = await walletClient.signTransaction({ ...prepared, type: 'eip1559' });
+    const remainingMs = Math.max(deadline - Date.now(), 0);
+    // An unreferenced timer: a signature that returns in time leaves nothing holding the process open,
+    // and one that returns after the deadline is dropped.
+    const signingLimit = sleep(remainingMs, undefined, { ref: false }).then(() => {
+      throw new DeliveryLimit('signing-timeout');
+    });
+    const signed = await Promise.race([walletClient.signTransaction({ ...prepared, type: 'eip1559' }), signingLimit]);
     emitEvent(this.#onEvent, {
       event: 'transaction.signing',
       context,
