@@ -16,7 +16,7 @@ The lending protocol lets borrowers supply collateral to borrow. Collateral that
 
 A Guardian daemon performs this screening offchain. In each cycle, it selects a recent Ethereum block, finds the delayed collateral that must be reviewed by then, screens the relevant supply transactions, and submits any required `suspect` or `flag` reports.
 
-After screening is complete and all required reports are confirmed, the daemon sends a heartbeat for the selected block. This tells controllers that the Guardian has completed all screening due through the end of that block. Because controllers use heartbeats to decide when delayed collateral can activate, sending one too early can allow unscreened collateral to become active.
+After screening is complete and all required reports are confirmed, the daemon sends a heartbeat for the selected block. This tells controllers that the Guardian has completed all screening due through the end of that block. Because controllers use heartbeats to decide when delayed collateral can activate, sending one too early can allow unscreened collateral to become active. A controller uses heartbeats this way only while its `maxGuardiansQuorumDelay` is nonzero. With zero, delayed collateral activates at its base deadline whether or not it was screened, and this specification defines no procedure for such a market.
 
 This document defines the behavior required of a Guardian daemon. [Appendix: Example Pseudocode](#appendix-example-pseudocode) shows one possible implementation. Other designs are valid if they identify and screen every supply transaction that requires review and confirm all required reports before sending the heartbeat.
 
