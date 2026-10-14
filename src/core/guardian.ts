@@ -284,13 +284,13 @@ export class Guardian {
   async discoverCandidatePositions(plan: ScanPlan): Promise<Discovered> {
     const markets = new Markets(this.#rpc, this.#setup.deployment.lidoLend);
     await this.#requireCanonicalBlock(plan.discoveryRange.to);
-    const positions = await markets.discoverCandidatePositions(
+    const candidates = await markets.discoverCandidatePositions(
       plan,
       this.#setup.deployment.guardianSignals.address,
       this.#setup.historyReadConcurrency,
     );
     await this.#requireCanonicalBlock(plan.discoveryRange.to);
-    return new Discovered(plan, positions);
+    return new Discovered(plan, candidates);
   }
 
   /**
@@ -302,18 +302,23 @@ export class Guardian {
    * position's controller logged no lifecycle event for it since. That block's hash fixes the history
    * below it, and every change of a lot is such an event, so a walk would find the same anchors: the work
    * is the one a full reconstruction finds, and a retry walks only what changed.
+   *
+   * The report block is checked canonical before and after the walks, as around discovery, so an
+   * endpoint that moved to another branch meanwhile stops the attempt instead of feeding it a history.
    */
   async reconstructWork(discovered: Discovered, earlierWork?: Work): Promise<Work> {
     const plan = discovered.plan();
     const markets = new Markets(this.#rpc, this.#setup.deployment.lidoLend);
     const reusableWork =
       earlierWork !== undefined && (await this.#canReuse(earlierWork, plan)) ? earlierWork : undefined;
+    await this.#requireCanonicalBlock(plan.discoveryRange.to);
     const byPosition = await markets.reconstructWork(
       plan,
-      discovered.all(),
+      discovered.candidates(),
       this.#setup.historyReadConcurrency,
       reusableWork,
     );
+    await this.#requireCanonicalBlock(plan.discoveryRange.to);
     return new Work(plan, byPosition);
   }
 

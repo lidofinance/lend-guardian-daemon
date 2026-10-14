@@ -191,7 +191,11 @@ const PHASES: Readonly<Record<string, (guardian: Guardian, count: number) => Pro
     return discovered.all().map((position) => position.borrower);
   },
   reconstruction: async (guardian, count) => {
-    const work = await guardian.reconstructWork(new Discovered(PLAN, positionsFor(count)));
+    const candidates = positionsFor(count).map((position, index) => ({
+      position,
+      newestEvent: { blockNumber: 100_000 + index, logIndex: 4, blockHash: blockAt(100_000 + index).hash },
+    }));
+    const work = await guardian.reconstructWork(new Discovered(PLAN, candidates));
     return [...work.entries()].map(([position]) => position.borrower);
   },
 };
