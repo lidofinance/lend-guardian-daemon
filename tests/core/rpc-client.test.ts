@@ -215,3 +215,24 @@ test('invalid receipt status is rejected instead of becoming a confirmed result'
   });
   await assert.rejects(client.getReceipt(padHex('0x01')), /RPC receipt has no valid status/);
 });
+
+test('a transaction carries its sender and recipient in lower case, no recipient for a creation, null when unknown', async () => {
+  const answer = {
+    hash: padHex('0x01'),
+    from: '0x000000000000000000000000000000000000AbCd',
+    to: '0x00000000000000000000000000000000000000Ef',
+    input: '0x1234',
+  };
+  const provider = (to: string | null) =>
+    new BaseRpcProvider({ request: rpcRequest(() => Promise.resolve({ ...answer, to })), maxLogBlockRange: 1 });
+  const known = await provider(answer.to).getTransaction(answer.hash);
+  assert.deepEqual(known, {
+    transactionHash: answer.hash,
+    from: '0x000000000000000000000000000000000000abcd',
+    to: '0x00000000000000000000000000000000000000ef',
+    input: '0x1234',
+  });
+  assert.equal((await provider(null).getTransaction(answer.hash))?.to, null);
+  const unknown = new BaseRpcProvider({ request: rpcRequest(() => Promise.resolve(null)), maxLogBlockRange: 1 });
+  assert.equal(await unknown.getTransaction(answer.hash), null);
+});

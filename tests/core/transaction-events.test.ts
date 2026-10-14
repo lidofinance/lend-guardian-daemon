@@ -17,6 +17,7 @@ import type {
   SignalTarget,
   Stale,
   TxHash,
+  Hex,
 } from '../../src/core/index.ts';
 import { GUARDIAN_SIGNALS_ABI } from '../../abi/GuardianSignals.abi.ts';
 import { Screened, Work } from '../../src/core/outcomes.ts';
@@ -46,7 +47,12 @@ interface BatchState extends ChainState {
   nonce: number;
 }
 
-function reader(state: ChainState, receipts: ReadonlyMap<TxHash, ReceiptRef>, useFixedReceipt: boolean): NodeRequest {
+function reader(
+  state: ChainState,
+  receipts: ReadonlyMap<TxHash, ReceiptRef>,
+  calls: ReadonlyMap<TxHash, Hex>,
+  useFixedReceipt: boolean,
+): NodeRequest {
   const block = (number: number) => ({
     number: numberToHex(number),
     hash: padHex(numberToHex(number)),
@@ -64,6 +70,11 @@ function reader(state: ChainState, receipts: ReadonlyMap<TxHash, ReceiptRef>, us
     }
     if (method === 'eth_call') {
       return padHex(state.hasMovedHeartbeat ? numberToHex(2000) : '0x0');
+    }
+    if (method === 'eth_getTransactionByHash') {
+      const input = calls.get(`0x${String(params[0]).slice(2)}`);
+      assert.ok(input !== undefined);
+      return { hash: params[0], from: GUARDIAN, to: REGISTRY, input, nonce: '0x0', value: '0x0' };
     }
     assert.equal(method, 'eth_getTransactionReceipt');
     const hash = params[0];
@@ -89,7 +100,8 @@ function reportClient(
   recordedCalls: unknown[][],
   useFixedReceipt: boolean,
 ): RpcClient {
-  const request = rpcRequest(reader(state, receipts, useFixedReceipt));
+  const calls = new Map<TxHash, Hex>();
+  const request = rpcRequest(reader(state, receipts, calls, useFixedReceipt));
   return Object.assign(new BaseRpcProvider({ request, maxLogBlockRange: 1000 }), {
     signer: GUARDIAN,
     transactionPolicy: {
@@ -120,6 +132,7 @@ function reportClient(
       };
       broadcasts.push(state.head);
       receipts.set(hash, receipt);
+      calls.set(hash, transaction.data);
       events.push({
         event: 'transaction.broadcast',
         context: options.context,

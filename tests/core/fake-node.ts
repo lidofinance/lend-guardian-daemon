@@ -21,7 +21,7 @@ import {
 } from 'viem';
 import { GUARDIAN_SIGNALS_ABI } from '../../abi/GuardianSignals.abi.ts';
 import type { SignalTarget } from '../../src/core/types.ts';
-import type { Address, BlockRef, Bytes32, MarketId, TxHash } from '../../src/common/types.ts';
+import type { Address, BlockRef, Bytes32, Hex, MarketId, TxHash } from '../../src/common/types.ts';
 
 export const CHAIN_ID = 1;
 
@@ -187,6 +187,7 @@ export interface Sent {
     hash: TxHash;
     from: Address;
     to: Address;
+    input: Hex;
     nonce: number;
     chainId: number;
   }[];
@@ -227,6 +228,8 @@ export interface FakeNode {
   forkHead(): void;
   /** Replaces one numbered block while leaving the current head canonical. */
   reorgBlock(number: number): void;
+  /** Makes the node answer another transaction for a recorded hash, as a broken client's receipt would name. */
+  replaceTransaction(hash: TxHash, fields: Partial<Pick<Sent['transactions'][number], 'from' | 'to' | 'input'>>): void;
 }
 
 export function fakeNode(script: Script): FakeNode {
@@ -266,6 +269,13 @@ export function fakeNode(script: Script): FakeNode {
     reorgBlock: (number) => {
       state.reorgedBlockNumbers.add(number);
     },
+    replaceTransaction: (hash, fields) => {
+      const recorded = state.sent.transactions.find((entry) => entry.hash === hash);
+      if (recorded === undefined) {
+        throw new Error('the node recorded no such transaction');
+      }
+      Object.assign(recorded, fields);
+    },
   };
 }
 
@@ -297,6 +307,9 @@ function answer(script: NodeState, method: string, params: readonly unknown[], q
   }
   if (method === 'eth_getTransactionReceipt') {
     return receiptAnswer(script, params);
+  }
+  if (method === 'eth_getTransactionByHash') {
+    return transactionAnswer(script, params);
   }
   throw new Error(`the script has no answer for ${method}`);
 }
@@ -496,6 +509,26 @@ function lifecycleLogs(script: Script): LogRecord[] {
 }
 
 /** A report's receipt when the script holds one, a supply's when a lot sent it, and null otherwise. */
+function transactionAnswer(script: NodeState, params: readonly unknown[]): unknown {
+  const hash = String(params[0]);
+  const recorded = script.sent.transactions.find((entry) => entry.hash === hash);
+  if (recorded === undefined) {
+    return null;
+  }
+  const receipt = script.submitted.get(recorded.hash);
+  return {
+    hash,
+    from: recorded.from,
+    to: recorded.to,
+    input: recorded.input,
+    nonce: numberToHex(recorded.nonce),
+    blockHash: receipt?.blockHash ?? null,
+    blockNumber: receipt === undefined || receipt === null ? null : numberToHex(receipt.blockNumber),
+    transactionIndex: '0x0',
+    value: '0x0',
+  };
+}
+
 function receiptAnswer(script: NodeState, params: readonly unknown[]): unknown {
   const hash = String(params[0]);
   const submitted = [...script.submitted.entries()].find(([key]) => key === hash);
@@ -619,6 +652,7 @@ async function recordTransaction(script: NodeState, raw: unknown): Promise<TxHas
     hash,
     from,
     to: transaction.to,
+    input: transaction.data,
     nonce: transaction.nonce ?? 0,
     chainId: transaction.chainId ?? 0,
   });
