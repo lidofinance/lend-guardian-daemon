@@ -106,7 +106,7 @@ test('numeric setup accepts its documented limits and rejects values outside the
     { field: 'lidoLendDeploymentBlock', min: 0, max: Number.MAX_SAFE_INTEGER },
     { field: 'guardianSignalsDeploymentBlock', min: 0, max: Number.MAX_SAFE_INTEGER },
     { field: 'idleHeartbeatInterval', min: 1, max: Number.MAX_SAFE_INTEGER },
-    { field: 'txConfirmationBlocks', min: 1, max: Number.MAX_SAFE_INTEGER },
+    { field: 'txConfirmationBlocks', min: 1, max: 64 },
     { field: 'heartbeatReserveBlocks', min: 1, max: 254 },
     { field: 'screeningTimeoutMs', min: 1, max: 2_147_483_647 },
   ];

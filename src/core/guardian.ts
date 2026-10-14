@@ -104,6 +104,9 @@ export type GuardianSetup = GuardianConfig &
 /** How far back the EVM's `blockhash` opcode can still answer, which bounds a heartbeat's life. */
 const BLOCKHASH_LOOKBACK = 256;
 
+/** Two epochs of confirmations, the earliest finality; a deeper wait adds nothing before it. */
+const MAX_CONFIRMATION_DEPTH = 64;
+
 const DEFAULT_REPORT_BLOCK_LAG = 2;
 
 const DEFAULT_FLAGGER_READ_CONCURRENCY = 8;
@@ -1064,7 +1067,7 @@ function validateSetup(setup: GuardianState): void {
     min: 0,
   });
   requireInteger('idleHeartbeatInterval', setup.idleHeartbeatInterval, { min: 1 });
-  requireInteger('txConfirmationBlocks', setup.txConfirmationBlocks, { min: 1 });
+  requireInteger('txConfirmationBlocks', setup.txConfirmationBlocks, { min: 1, max: MAX_CONFIRMATION_DEPTH });
   requireInteger('reportBlockLag', setup.reportBlockLag, { min: 1, max: BLOCKHASH_LOOKBACK - 1 });
   requireInteger('flaggerReadConcurrency', setup.flaggerReadConcurrency, { min: 1 });
   requireInteger('historyReadConcurrency', setup.historyReadConcurrency, { min: 1 });
