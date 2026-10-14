@@ -41,6 +41,8 @@ An application supplies:
 - a `ScreeningProvider` that returns one decision for each requested anchor, in the same order;
 - a serial cycle loop and recovery policy.
 
+The SDK does not read or check a market's `maxGuardiansQuorumDelay`; the [specification](docs/guardian-specification.md) states what a zero value means.
+
 Run one iteration with the last confirmed heartbeat block as an optional search hint. The SDK
 revalidates it against current chain evidence before using it:
 
