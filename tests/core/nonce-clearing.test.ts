@@ -141,6 +141,10 @@ test('does not write when the signer has no pending nonce', async () => {
   await fixture.guardian.clearPendingNonces();
   assert.equal(fixture.prepared.length, 0);
   assert.equal(fixture.broadcasts.length, 0);
+  assert.deepEqual(
+    fixture.events.filter((event) => event.event === 'nonce.checked').map((event) => [event.latest, event.pending]),
+    [[7, 7]],
+  );
 });
 
 test('clears one pending nonce with a zero-value self-transfer and confirms it', async () => {
@@ -158,6 +162,13 @@ test('clears one pending nonce with a zero-value self-transfer and confirms it',
     maxPriorityFeePerGas: 8n,
   });
   assert.equal(fixture.broadcasts.length, 1);
+  assert.deepEqual(
+    fixture.events.filter((event) => event.event === 'nonce.checked').map((event) => [event.latest, event.pending]),
+    [
+      [7, 8],
+      [8, 8],
+    ],
+  );
   assert.deepEqual(
     fixture.events
       .filter((event) => event.event === 'nonce.cleared')

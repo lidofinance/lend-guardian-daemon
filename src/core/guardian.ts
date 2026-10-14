@@ -362,6 +362,8 @@ export class Guardian {
   /**
    * Explicit recovery for a dedicated signer before a fresh signal cycle. This is runner policy,
    * not a scan phase: an old transaction or our cancellation must consume each pending nonce.
+   * Each decision reports the counts it was made by: equal counts mean the answering node sees no
+   * pending transaction, which the SDK cannot verify.
    */
   async clearPendingNonces(): Promise<void> {
     if (this.#setup.mode === 'observe') {
@@ -383,11 +385,13 @@ export class Guardian {
       await this.#requireChain();
       while (true) {
         this.#requireClearingTime(deadline);
-        const nonce = await this.#pendingNonce(signer);
-        if (nonce === undefined) {
+        const latest = await this.#rpc.getTransactionCount(signer, 'latest');
+        const pending = await this.#rpc.getTransactionCount(signer, 'pending');
+        emitEvent(this.#setup.onEvent, { event: 'nonce.checked', context, latest, pending });
+        if (pending <= latest) {
           return;
         }
-        await this.#clearNonce(client, { signer, nonce, context, deadline });
+        await this.#clearNonce(client, { signer, nonce: latest, context, deadline });
       }
     } catch (error) {
       emitEvent(this.#setup.onEvent, { event: 'transaction.failed', context, stage: 'nonce-clearing', error });
@@ -395,12 +399,6 @@ export class Guardian {
     } finally {
       this.#isWriting = false;
     }
-  }
-
-  async #pendingNonce(signer: Address): Promise<number | undefined> {
-    const nonce = await this.#rpc.getTransactionCount(signer, 'latest');
-    const pending = await this.#rpc.getTransactionCount(signer, 'pending');
-    return pending > nonce ? nonce : undefined;
   }
 
   async #clearNonce(

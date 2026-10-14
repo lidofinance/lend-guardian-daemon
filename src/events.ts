@@ -126,6 +126,13 @@ export type SdkEvent =
   | CycleEvent
   | RpcEvent
   | {
+      /** The signer's transaction counts a clearing decision was made by, as the answering node reported them. */
+      readonly event: 'nonce.checked';
+      readonly context: TransactionContext;
+      readonly latest: number;
+      readonly pending: number;
+    }
+  | {
       readonly event: 'nonce.cleared';
       readonly context: TransactionContext;
       readonly nonce: number;
