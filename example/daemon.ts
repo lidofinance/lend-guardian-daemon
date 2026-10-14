@@ -137,7 +137,8 @@ function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
   const guardianAddress = env.address('GUARDIAN');
   const transport = createViemRpcTransport({
     urls: nodeUrls,
-    // Unset, one endpoint answers a log read like any other request.
+    // Unset, one endpoint answers a log read like any other request. The option stays optional; the README on
+    // comparing logs explains what only a quorum catches: a range beyond an endpoint's head answered without an error.
     logQuorum: env.optionalPositiveInteger('RPC_LOG_QUORUM'),
     timeoutMs: RPC_REQUEST_TIMEOUT_MS,
     maxResponseBodySize: MAX_RPC_RESPONSE_BODY_SIZE,

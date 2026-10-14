@@ -58,7 +58,7 @@ For viem, create one reusable transport, use it to configure the public and wall
 
 ### Comparing logs between providers
 
-`createViemRpcTransport` sends each request to the first endpoint that answers and falls back to the next one. A load balancer or a lagging endpoint can then answer a log range without its latest blocks, and the SDK cannot see that.
+`createViemRpcTransport` sends each request to the first endpoint that answers and falls back to the next one. A node of a current client whose head is behind the requested range rejects the read as an error, which the transport reports and viem retries on the next endpoint. A provider's endpoint can answer the same range without an error, with the logs up to the head it has. Guardian stops an attempt whose node does not know the report block, but a load balancer can answer that check from one backend and the log read from another. The option below exists for that case; signal mode in production should use it with at least three independent providers and a quorum of two, so that one may be down while another lags.
 
 With the `logQuorum` option the transport asks every provider for logs and compares their answers. Every other request is sent to the endpoints in turn as without the option.
 
