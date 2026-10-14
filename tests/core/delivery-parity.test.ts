@@ -79,6 +79,7 @@ test('an orphaned first report stops Guardian before its second batch or heartbe
     screening: { screen: () => Promise.resolve([]) },
     maxSignalBatchSize: 1,
     idleHeartbeatInterval: 1,
+    screeningTimeoutMs: 10_000,
     heartbeatReserveBlocks: 8,
     txConfirmationBlocks: 2,
     onEvent: fake.observe,

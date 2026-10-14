@@ -32,6 +32,7 @@ import type { ScreeningProvider } from './screening-provider.ts';
 import { GuardianStop } from './stop.ts';
 import { requireDefined, requireInteger } from '../common/validation.ts';
 import { frozenCopy } from '../common/immutable.ts';
+import { rejectAfter } from '../common/timeout.ts';
 import type { Address, BlockRef, Bytes32, ContractDeployment, MarketId } from '../common/types.ts';
 
 /** The deployment a Guardian screens. Every field is fixed for the life of the process. */
@@ -68,6 +69,8 @@ interface GuardianConfig {
   readonly txConfirmationBlocks: number;
   /** Borrowers per registry report transaction; grouping and ordering belong to Guardian. */
   readonly maxSignalBatchSize: number;
+  /** Longest wait for the provider's answer in `screenWork`; when it ends first the attempt stops as incomplete. */
+  readonly screeningTimeoutMs: number;
   /** Delivery observations and canonically confirmed actions; omitted when no observer is needed. */
   readonly onEvent?: EventHandler;
   /** Required in signal mode: the delegate the registry must name, or zero when none is expected. */
@@ -295,6 +298,7 @@ export class Guardian {
    * skip provider screening for their targets; every remaining anchor needs a complete decision.
    * The [provider boundary](../../docs/guardian-specification.md#screening-provider) leaves risk policy
    * to the adapter. Skipped anchors remain in Work and therefore in the heartbeat's coverage digest.
+   * The provider's answer is awaited no longer than `screeningTimeoutMs`; a later answer is dropped.
    */
   async screenWork(work: Work): Promise<Screened> {
     const { pending, skipped } = await this.#screeningTargets(work);
@@ -306,7 +310,14 @@ export class Guardian {
       reportBlock: work.reportBlock,
       anchors,
     });
-    const answers = anchors.length === 0 ? [] : await this.#setup.screening.screen(request);
+    if (anchors.length === 0) {
+      return Screened.fromAnswers(work, { pending, skipped }, []);
+    }
+    // A provider that never answers must not hold the cycle lock.
+    const answers = await Promise.race([
+      this.#setup.screening.screen(request),
+      rejectAfter(this.#setup.screeningTimeoutMs, new GuardianStop('screening-result-incomplete')),
+    ]);
     return Screened.fromAnswers(work, { pending, skipped }, answers);
   }
 
@@ -898,6 +909,7 @@ function validateSetup(setup: GuardianState): void {
   requireInteger('flaggerReadConcurrency', setup.flaggerReadConcurrency, { min: 1 });
   requireInteger('interBatchConfirmationBlocks', setup.interBatchConfirmationBlocks, { min: 1 });
   requireInteger('confirmationPollIntervalMs', setup.confirmationPollIntervalMs, { min: 1, max: 2_147_483_647 });
+  requireInteger('screeningTimeoutMs', setup.screeningTimeoutMs, { min: 1, max: 2_147_483_647 });
   requireInteger('heartbeatReserveBlocks', setup.heartbeatReserveBlocks, {
     min: 1,
     max: BLOCKHASH_LOOKBACK - setup.reportBlockLag,
@@ -950,6 +962,7 @@ function snapshotSetup(setup: GuardianSetup): GuardianState {
     heartbeatReserveBlocks: setup.heartbeatReserveBlocks,
     txConfirmationBlocks: setup.txConfirmationBlocks,
     maxSignalBatchSize: setup.maxSignalBatchSize,
+    screeningTimeoutMs: setup.screeningTimeoutMs,
     ...(setup.onEvent === undefined ? {} : { onEvent: setup.onEvent }),
   };
   if (setup.mode === 'observe') {

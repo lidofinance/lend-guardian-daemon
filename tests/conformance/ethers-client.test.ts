@@ -122,6 +122,7 @@ test('ethers request and signing run discovery, reconstruction, screening, repor
       },
       maxSignalBatchSize: 20,
       idleHeartbeatInterval: 1,
+      screeningTimeoutMs: 10_000,
       heartbeatReserveBlocks: 8,
       txConfirmationBlocks: 1,
       onEvent,

@@ -232,6 +232,7 @@ function guardianOf(fixture: ProtocolFixture, screening: ScreeningProvider): Gua
     client: signingClient([{ node: fixture.anvil.rpcUrl }], DELEGATE_KEY, 25),
     maxSignalBatchSize: 20,
     idleHeartbeatInterval: 1,
+    screeningTimeoutMs: 10_000,
     heartbeatReserveBlocks: 8,
     txConfirmationBlocks: 1,
   });

@@ -31,6 +31,7 @@ function configuration() {
     heartbeatReserveBlocks: 8,
     txConfirmationBlocks: 12,
     confirmationPollIntervalMs: 12_000,
+    screeningTimeoutMs: 10_000,
   };
 }
 
@@ -43,6 +44,7 @@ const NUMERIC_FIELDS = [
   'idleHeartbeatInterval',
   'heartbeatReserveBlocks',
   'txConfirmationBlocks',
+  'screeningTimeoutMs',
 ];
 
 function withNumber(setup: GuardianSetup, field: string, value: unknown): GuardianSetup {
@@ -106,6 +108,7 @@ test('numeric setup accepts its documented limits and rejects values outside the
     { field: 'idleHeartbeatInterval', min: 1, max: Number.MAX_SAFE_INTEGER },
     { field: 'txConfirmationBlocks', min: 1, max: Number.MAX_SAFE_INTEGER },
     { field: 'heartbeatReserveBlocks', min: 1, max: 254 },
+    { field: 'screeningTimeoutMs', min: 1, max: 2_147_483_647 },
   ];
   for (const { field, min, max } of ranges) {
     assert.doesNotThrow(() => new Guardian(withNumber(setup, field, min)));

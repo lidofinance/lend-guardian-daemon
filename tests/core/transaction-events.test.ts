@@ -172,6 +172,7 @@ function batches(size = 1, useFixedReceipt = false) {
       txConfirmationBlocks: depth,
       heartbeatReserveBlocks: 8,
       idleHeartbeatInterval: 1,
+      screeningTimeoutMs: 10_000,
       onEvent: (event) => {
         events.push(event);
         if (event.event === 'report.confirmed') {
