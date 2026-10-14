@@ -52,6 +52,7 @@ export function guardianOver(
     },
     maxSignalBatchSize: 20,
     idleHeartbeatInterval: IDLE_HEARTBEAT_SECONDS,
+    screeningTimeoutMs: 10_000,
     heartbeatReserveBlocks: 8,
     txConfirmationBlocks: TX_CONFIRMATIONS,
     ...parts,

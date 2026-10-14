@@ -33,6 +33,7 @@ function observerOver(script: Script) {
     screening: { screen: () => Promise.resolve([]) },
     maxSignalBatchSize: 20,
     idleHeartbeatInterval: 12 * 60 * 60,
+    screeningTimeoutMs: 10_000,
     heartbeatReserveBlocks: 8,
     txConfirmationBlocks: 12,
     client: new BaseRpcProvider({
