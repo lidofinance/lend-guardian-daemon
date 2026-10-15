@@ -52,6 +52,9 @@ const REPLACEMENT_FEE_BUMP_BPS = 1_000;
 const MAX_FEE_PER_GAS_WEI = 100_000_000_000n;
 const REPLACEMENT_TIMEOUT_MS = 36_000;
 const SEND_ATTEMPTS = 5;
+// A report costs more gas when other guardians report the same accounts first, so the gas limit adds
+// a fifth to the node's estimate.
+const GAS_HEADROOM_BPS = 2_000;
 
 /**
  * Schedule [scan attempts](../docs/guardian-specification.md#scan-cycle). The intervals below are
@@ -169,6 +172,7 @@ function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
       maxFeePerGas: MAX_FEE_PER_GAS_WEI,
       replacementTimeoutMs: REPLACEMENT_TIMEOUT_MS,
       sendAttempts: SEND_ATTEMPTS,
+      gasHeadroomBps: GAS_HEADROOM_BPS,
     },
   });
 

@@ -4,11 +4,14 @@ import { signingClient } from '../core/client.ts';
 // Internal phase values isolate submission here; guardian-cycle.test.ts also runs all five phases.
 import assert from 'node:assert/strict';
 import { after, afterEach, before, beforeEach, test } from 'node:test';
-import { isHex, padHex, zeroHash } from 'viem';
+import { createWalletClient, http, isHex, numberToHex, padHex, zeroHash } from 'viem';
+import type { PrivateKeyAccount } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 import { Guardian } from '../../src/core/index.ts';
 import type { Address, Bytes32, SignalTarget, TxHash } from '../../src/core/index.ts';
 import { Screened, Work } from '../../src/core/outcomes.ts';
 import { GuardianSignals } from '../../src/contracts/guardian-signals.ts';
+import { isRecord } from '../../src/common/validation.ts';
 import { BORROWER, DELEGATE_KEY, deployProtocolFixture } from './fixtures/protocol.ts';
 import type { ProtocolFixture } from './fixtures/protocol.ts';
 
@@ -105,6 +108,38 @@ test('sends every target in market batches before the shared depth-12 wait', asy
   for (const target of targets) {
     assert.deepEqual(await suspectedBy(fixture, target.marketId, target.borrower), [fixture.admin.address]);
   }
+});
+
+test('a report lands when another guardian reports its accounts between the estimate and the broadcast', async () => {
+  const fixture = await deployed;
+  const [late, ...early] = await otherGuardians(fixture, 4);
+  assert.ok(late !== undefined);
+  const accounts = Array.from({ length: 20 }, (_unused, index) => padHex(numberToHex(0x2000 + index), { size: 20 }));
+  // With reports that stay current, every earlier report on an account makes a further one cost more gas.
+  await fixture.setSuspectWindow(86_400);
+  for (const guardian of early) {
+    await suspectAs(fixture, guardian, accounts);
+  }
+  const targets = accounts.map((borrower) => ({ marketId: fixture.primaryMarket.id, borrower }));
+  let estimate: bigint | undefined;
+  const built = await prepared(fixture, targets, 'suspect', async (method, response) => {
+    const gas = estimatedGas(method, response);
+    if (gas !== undefined && estimate === undefined) {
+      estimate = gas;
+      await suspectAs(fixture, late, accounts);
+    }
+    if (method === 'eth_sendRawTransaction') {
+      await fixture.anvil.testClient.mine({ blocks: 11 });
+    }
+  });
+  const outcome = await built.guardian.signalAndHeartbeat(built.screened);
+  assert.equal(outcome.kind, 'attested');
+  const [report] = built.hashes;
+  assert.ok(report !== undefined && estimate !== undefined);
+  const receipt = await fixture.anvil.publicClient.getTransactionReceipt({ hash: report });
+  assert.equal(receipt.status, 'success');
+  // The late report raised the cost above the estimate; only the headroom kept the report from running out of gas.
+  assert.ok(receipt.gasUsed > estimate);
 });
 
 test('stops before the next market batch when the plan expires during shallow confirmation', async () => {
@@ -310,3 +345,59 @@ test('sends again a suspect recorded before the previous heartbeat', async () =>
   assert.equal(built.hashes.length, 2);
   assert.equal(built.hashes[1], outcome.heartbeat);
 });
+/** The gas the node estimated, from whichever request viem prepared the transaction with. */
+function estimatedGas(method: string, response: unknown): bigint | undefined {
+  if (method === 'eth_estimateGas' && typeof response === 'string') {
+    return BigInt(response);
+  }
+  if (method !== 'eth_fillTransaction') {
+    return undefined;
+  }
+  const transaction = isRecord(response) ? response.tx : undefined;
+  return isRecord(transaction) && typeof transaction.gas === 'string' ? BigInt(transaction.gas) : undefined;
+}
+
+/** Further guardians with funded keys; the snapshot taken before each test removes them again. */
+async function otherGuardians(fixture: ProtocolFixture, count: number): Promise<PrivateKeyAccount[]> {
+  const admin = createWalletClient({
+    account: fixture.admin,
+    chain: fixture.anvil.chain,
+    transport: http(fixture.anvil.rpcUrl),
+  });
+  const guardians = Array.from({ length: count }, (_unused, index) =>
+    privateKeyToAccount(padHex(numberToHex(0x1000 + index), { size: 32 })),
+  );
+  for (const guardian of guardians) {
+    await fixture.anvil.testClient.setBalance({ address: guardian.address, value: 10n ** 20n });
+    const hash = await admin.writeContract({
+      address: fixture.guardianSignals,
+      abi: fixture.guardianAbi,
+      functionName: 'addGuardian',
+      args: [guardian.address],
+      gas: 1_000_000n,
+    });
+    assert.equal((await fixture.anvil.publicClient.waitForTransactionReceipt({ hash })).status, 'success');
+  }
+  return guardians;
+}
+
+/** A guardian's own suspect report, sent with ample gas so the fixture does not depend on estimates. */
+async function suspectAs(
+  fixture: ProtocolFixture,
+  guardian: PrivateKeyAccount,
+  accounts: readonly Address[],
+): Promise<void> {
+  const wallet = createWalletClient({
+    account: guardian,
+    chain: fixture.anvil.chain,
+    transport: http(fixture.anvil.rpcUrl),
+  });
+  const hash = await wallet.writeContract({
+    address: fixture.guardianSignals,
+    abi: fixture.guardianAbi,
+    functionName: 'suspect',
+    args: [fixture.primaryMarket.id, guardian.address, accounts],
+    gas: 10_000_000n,
+  });
+  assert.equal((await fixture.anvil.publicClient.waitForTransactionReceipt({ hash })).status, 'success');
+}
