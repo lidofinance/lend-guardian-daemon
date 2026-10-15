@@ -19,10 +19,10 @@ import type { Mode } from './env.ts';
 /** Mainnet and Hoodi both use 12-second slots; Guardian derives a seven-day lookback from this. */
 const SLOT_SECONDS = 12;
 
-/** A cycle with nothing due is a handful of reads, so the pace is how soon new work should be seen. */
-const CYCLE_INTERVAL_MS = 60_000;
+/** The specification's reference interval: 30 blocks between cycle starts, one block per slot. */
+const CYCLE_INTERVAL_MS = 30 * SLOT_SECONDS * 1_000;
 
-/** A failed cycle waits longer, so a node that is down is not asked again every minute. */
+/** A failed attempt is followed by the next one this much later, so a node that is down is not asked again at once. */
 const RETRY_INTERVAL_MS = 5 * 60_000;
 
 // Guardian policy for this example, chosen by the application.
@@ -33,33 +33,39 @@ const HISTORY_READ_CONCURRENCY = 8;
 const INTER_BATCH_CONFIRMATION_BLOCKS = 1;
 const MAX_REPORT_ATTEMPTS = 3;
 const CONFIRMATION_POLL_INTERVAL_MS = 12_000;
-const MAX_SIGNAL_BATCH_SIZE = 20;
+// A report costs up to about 156,000 gas per borrower, so 50 borrowers stay under half of the
+// 16,777,216 gas one transaction may use.
+const MAX_SIGNAL_BATCH_SIZE = 50;
 const IDLE_HEARTBEAT_INTERVAL_SECONDS = 12 * 60 * 60;
 const HEARTBEAT_RESERVE_BLOCKS = 8;
+// Deeper than any reorg Ethereum's proof of stake has produced, seven slots in May 2022.
 const TRANSACTION_CONFIRMATION_BLOCKS = 12;
 // The provider's answer is awaited no longer than this; a slower provider stops the attempt as incomplete.
 const SCREENING_TIMEOUT_MS = 290_000;
 
-// The SDK's viem transport applies these settings to every physical HTTP attempt.
-const RPC_REQUEST_TIMEOUT_MS = 10_000;
+// The SDK's viem transport applies these settings to every physical HTTP attempt. A shared provider
+// can take many seconds for a log read, and viem retries an attempt that timed out.
+const RPC_REQUEST_TIMEOUT_MS = 30_000;
 const RPC_RETRY_COUNT = 2;
 const RPC_RETRY_DELAY_MS = 150;
 const MAX_RPC_RESPONSE_BODY_SIZE = 10 * 1024 * 1024;
 const RPC_USER_AGENT = 'guardian-daemon-sdk-example';
-const MAX_LOG_BLOCK_RANGE = 10_000;
+const DEFAULT_MAX_LOG_BLOCK_RANGE = 10_000;
 
 // Transaction delivery policy for this example.
-const SEND_TIMEOUT_MS = 264_000;
 const REPLACEMENT_FEE_BUMP_BPS = 1_000;
 const MAX_FEE_PER_GAS_WEI = 100_000_000_000n;
 const REPLACEMENT_TIMEOUT_MS = 36_000;
 const SEND_ATTEMPTS = 5;
+// A send fits every attempt's inclusion wait, then the confirmations and one slot.
+const SEND_TIMEOUT_MS =
+  SEND_ATTEMPTS * REPLACEMENT_TIMEOUT_MS + (TRANSACTION_CONFIRMATION_BLOCKS + 1) * SLOT_SECONDS * 1_000;
 // A report costs more gas when other guardians report the same accounts first, so the gas limit adds
 // a fifth to the node's estimate.
 const GAS_HEADROOM_BPS = 2_000;
 
 /**
- * Schedule [scan attempts](../docs/guardian-specification.md#scan-cycle). The intervals below are
+ * Schedule [scan attempts](../docs/guardian-specification.md#scan-cycle). The intervals above are
  * example policy and must be chosen for the operator's agreed SLA; the SDK supplies no scheduler.
  * [Failed attempts](../docs/guardian-specification.md#failure-handling) leave the heartbeat hint unchanged
  * and are followed by another attempt after a delay.
@@ -81,6 +87,7 @@ async function main(): Promise<void> {
   // This block only spares the next plan a wider event search, so losing it on restart costs nothing else.
   let previousHeartbeatBlock: BlockRef | null = null;
   while (true) {
+    const startedAt = Date.now();
     try {
       previousHeartbeatBlock = await cycle(guardian, previousHeartbeatBlock);
     } catch (error) {
@@ -96,7 +103,7 @@ async function main(): Promise<void> {
       continue;
     }
 
-    await sleep(CYCLE_INTERVAL_MS);
+    await sleep(Math.max(0, startedAt + CYCLE_INTERVAL_MS - Date.now()));
   }
 }
 
@@ -167,7 +174,8 @@ function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
     publicClient,
     walletClient,
     onEvent,
-    maxLogBlockRange: MAX_LOG_BLOCK_RANGE,
+    // A provider's own limit; a range it refuses is read again in halves, costing a request each time.
+    maxLogBlockRange: env.optionalPositiveInteger('MAX_LOG_BLOCK_RANGE') ?? DEFAULT_MAX_LOG_BLOCK_RANGE,
     transactionPolicy: {
       sendTimeoutMs: SEND_TIMEOUT_MS,
       replacementFeeBumpBps: REPLACEMENT_FEE_BUMP_BPS,

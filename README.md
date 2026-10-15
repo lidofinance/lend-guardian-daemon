@@ -23,7 +23,7 @@ Install a pinned commit from the public repository:
 npm install git+https://github.com/lidofinance/lido-lend-guardian-daemon-sdk.git#<commit>
 ```
 
-Node.js 24 or newer is required. The package currently uses `private: true` to disable npm registry publication; installation from Git is supported.
+Node.js 24 or newer is required. The package is not published to the npm registry yet; install it from Git.
 
 Both entry points need viem at run time. The package declares it as a peer dependency, `^2.55.19`, so the application and the SDK share one viem installation; the SDK is tested with viem 2.55.19. npm installs a missing peer automatically. With a package manager that does not, add viem to the application.
 
@@ -39,12 +39,11 @@ An application supplies:
 - deployment and Guardian configuration;
 - a read-only `RpcProvider` for observe mode or an `RpcClient` with a signer for signal mode;
 - a `ScreeningProvider` that returns one decision for each requested anchor, in the same order;
-- a serial cycle loop and recovery policy.
+- a loop that runs one cycle at a time, and a recovery policy for failed cycles.
 
 The SDK does not read or check a market's `maxGuardiansQuorumDelay`; the [specification](docs/guardian-specification.md) states what a zero value means.
 
-Run one iteration with the last confirmed heartbeat block as an optional search hint. The SDK
-revalidates it against current chain evidence before using it:
+Run one cycle with the last confirmed heartbeat block as an optional search hint. The SDK checks it against the chain before using it:
 
 ```ts
 let previousHeartbeatBlock: BlockRef | null = null;
@@ -78,7 +77,7 @@ Three waits are bounded. The client waits for a signature no longer than the rem
 
 Reconstruction also compares the first event of each position's history walk with the newest event discovery read for it, checks that this event sits in the canonical block at its number, and checks the report block before and after the walks as discovery does; a difference stops the attempt, so one lagging or forked answer cannot drop a position from the work or rebuild it from another history. Two answers that lag alike still can.
 
-With the `logQuorum` option the transport asks every provider for logs and compares their answers. Every other request is sent to the endpoints in turn as without the option.
+With the `logQuorum` option the transport asks every provider for logs and compares their answers. All other requests go to the endpoints in turn, as without the option.
 
 ```ts
 createViemRpcTransport({
@@ -88,13 +87,13 @@ createViemRpcTransport({
 });
 ```
 
-- `logQuorum` is at least two and at most the number of URLs. Two providers give comparison without tolerance of an outage; three keep working while one is unavailable. A quorum below the majority of the URLs lets that many providers decide which logs are returned.
-- Logs are returned when a quorum returned them alike and they include every log that any other provider returned. The order of the logs in an answer is not compared. A provider that only lacks logs is lagging and does not stop the read; a log that the quorum lacks rejects it.
+- `logQuorum` is at least two and at most the number of URLs. With two providers, log reads fail while one of them is unavailable; with three, they continue. A quorum smaller than a majority of the URLs lets that many providers decide which logs are returned.
+- A read succeeds when a quorum of providers returned the same logs, in any order, and no other provider returned a log that the quorum lacks. A provider that only lacks logs is lagging: it is reported but does not stop the read.
 - A provider that fails or sends an invalid list takes no part in the comparison.
 - Log reads wait until every configured provider responds or reaches `timeoutMs`.
-- A rejected read fails with `LogsNotConfirmedError` as the cause of the error viem reports, after the configured retries.
+- After the configured retries, a rejected read fails with a viem error whose cause is `LogsNotConfirmedError`.
 - Every difference is reported as an `rpc.answersDiffer` event, including the ones that did not reject the read.
-- With `logQuorum` the transport is a viem custom transport around the fallback, so viem does not keep the requests of a filter on the endpoint that created it.
+- With `logQuorum` the transport is a viem custom transport around the fallback, so viem no longer sends all requests of a filter to the endpoint that created it. The SDK uses no filters; this matters only if your application does.
 
 Only `eth_getLogs` is compared: calls, block headers, receipts and filters are not. The comparison cannot detect a log that every answering provider omits: while one of three providers does not answer, two providers that lack the same log form a quorum.
 
@@ -127,7 +126,7 @@ Tests use scripted nodes and isolated local Anvil processes; they make no extern
 - [`src/contracts/`](src/contracts/): core, market-controller and `GuardianSignals` access.
 - [`src/chain/`](src/chain/): generic RPC reads, viem transport and transaction delivery.
 - [`abi/`](abi/): minimal ABI fragments used by the SDK.
-- [`example/`](example/README.md): reference Guardian application.
+- [`example/`](example/): example Guardian application built on the SDK.
 - [`tests/`](tests/): core, example and contract-conformance tests.
 - [`docs/guardian-specification.md`](docs/guardian-specification.md): Guardian specification 0.3.0.
 
