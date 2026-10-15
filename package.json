@@ -45,7 +45,10 @@
     "test:core": "node --test 'tests/core/**/*.test.ts'",
     "test:example": "node --test 'tests/example/**/*.test.ts'",
     "test:daemon": "node --test 'tests/daemon/**/*.test.ts'",
-    "test:conformance": "node --test 'tests/conformance/*.test.ts'"
+    "test:conformance": "node --test 'tests/conformance/*.test.ts'",
+    "benchmark:smoke": "node benchmarks/run.ts --preset smoke",
+    "benchmark": "node benchmarks/run.ts --preset full",
+    "benchmark:profile": "node benchmarks/run.ts --profile"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
