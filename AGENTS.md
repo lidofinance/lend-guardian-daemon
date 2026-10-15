@@ -108,6 +108,8 @@ Conventional Commits are used, but the maintainer makes commits. A change is com
 
 Keep README and docs focused on maintained API, configuration, operating behavior and user instructions. Do not add task plans, implementation proposals, approval history, refactoring diaries, line-count comparisons, temporary paths or local execution reports. Keep working notes and transient check results in the local todo list or outside the repository.
 
+The README opens with the three ways partners run a Guardian — their own implementation of the specification, the SDK in their own application, the daemon image with their own services — and who owns what at each; it links to the owning documents instead of repeating them. The daemon guide owns building and running the image.
+
 ## Public reference distribution
 
 Keep product naming out of prose unless it is required for compatibility. Preserve public configuration fields, ABI signatures and the coverage domain. Do not publish private contract repository URLs in source, fixtures, tests, manifests or documentation. Fixture ABIs include only entries used by the tests or SDK and omit parameter names and Solidity `internalType` metadata; creation bytecode stays pinned. The example is a partner entry point and its guide must match shipped files and behavior.
