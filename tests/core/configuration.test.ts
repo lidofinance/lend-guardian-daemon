@@ -382,6 +382,7 @@ for (const field of [
   'historyReadConcurrency',
   'interBatchConfirmationBlocks',
   'confirmationPollIntervalMs',
+  'maxReportAttempts',
 ]) {
   test(`optional ${field} defaults only when omitted and rejects malformed values`, () => {
     const setup = configuration();

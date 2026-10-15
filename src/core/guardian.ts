@@ -70,6 +70,8 @@ interface GuardianConfig {
   readonly interBatchConfirmationBlocks?: number;
   /** Interval between shared report-confirmation checks. Defaults to one network slot. */
   readonly confirmationPollIntervalMs?: number;
+  /** Passes over a report kind before a report that a reorg keeps dropping makes the attempt stale. Defaults to 3. */
+  readonly maxReportAttempts?: number;
   /** Seconds after the stored heartbeat before a cycle with no work heartbeats again. */
   readonly idleHeartbeatInterval: number;
   /** Blocks of the 256-block `blockhash` window reserved for the heartbeat's own inclusion. */
@@ -101,6 +103,19 @@ export type GuardianSetup = GuardianConfig &
       }
   );
 
+/** One registry call: the targets of one market that a report transaction names. */
+interface SignalBatch {
+  readonly marketId: MarketId;
+  readonly borrowers: Address[];
+}
+
+/** A report transaction, its operation and the batch it reported. */
+interface SentReport {
+  readonly batch: SignalBatch;
+  readonly context: OperationContext;
+  readonly receipt: ReceiptRef;
+}
+
 /** How far back the EVM's `blockhash` opcode can still answer, which bounds a heartbeat's life. */
 const BLOCKHASH_LOOKBACK = 256;
 
@@ -114,6 +129,8 @@ const DEFAULT_FLAGGER_READ_CONCURRENCY = 8;
 const DEFAULT_HISTORY_READ_CONCURRENCY = 1;
 
 const DEFAULT_INTER_BATCH_CONFIRMATION_BLOCKS = 2;
+
+const DEFAULT_MAX_REPORT_ATTEMPTS = 3;
 
 const MILLISECONDS_PER_SECOND = 1_000;
 
@@ -130,6 +147,7 @@ type GuardianState = GuardianConfig &
       | 'historyReadConcurrency'
       | 'interBatchConfirmationBlocks'
       | 'confirmationPollIntervalMs'
+      | 'maxReportAttempts'
     >
   > &
   (
@@ -142,12 +160,6 @@ type GuardianState = GuardianConfig &
         readonly sendTimeoutMs: number;
       }
   );
-
-/** A report the client delivered, with the operation it was sent for. */
-interface SentReport {
-  readonly context: OperationContext;
-  readonly receipt: ReceiptRef;
-}
 
 /** Fixed gas for an EOA self-transfer with no calldata. */
 const CANCELLATION_GAS = 21_000n;
@@ -374,10 +386,12 @@ export class Guardian {
    * [heartbeat requirements](../../docs/guardian-specification.md#heartbeat-requirements).
    * [Appendix D](../../docs/guardian-specification.md#d-submit-signals-and-send-the-heartbeat) groups all
    * reports in one SEND; the SDK groups each kind by market and waits for full depth once per kind.
-   * Plan checks between batches and during the shared wait stop stale attempts. Every report must
-   * still be canonical before heartbeat; the cycle ends only after the heartbeat is confirmed.
-   * The client's `sendTimeoutMs` bounds each send and the shared wait of each report kind. When
-   * the wait ends first the attempt stops with `report-confirmation-timeout`, its reports included.
+   * Plan checks between batches and during the shared wait stop stale attempts. A report that is
+   * not canonical at full depth after the shared wait, because a reorg dropped it, is sent again,
+   * for at most `maxReportAttempts` passes. Every report must still be canonical before heartbeat;
+   * the cycle ends only after the heartbeat is confirmed. The client's `sendTimeoutMs` bounds each
+   * send and each shared wait. When a wait ends first the attempt stops with
+   * `report-confirmation-timeout`, its reports included.
    */
   async signalAndHeartbeat(screened: Screened): Promise<Attested | Stale | NothingDue> {
     if (this.#isWriting) {
@@ -399,7 +413,7 @@ export class Guardian {
 
       const recorded = await this.#recordedSuspects(work, screened.suspects);
       const reported = await this.#submitRequiredSignals(screened, recorded, reportConfirmationTimeoutMs);
-      if ('kind' in reported) {
+      if (isStale(reported)) {
         return reported;
       }
 
@@ -803,23 +817,9 @@ export class Guardian {
       { kind: 'flag', targets: screened.flags },
     ] as const;
     for (const group of groups) {
-      const landed: SentReport[] = [];
-      for (const { marketId, borrowers } of this.#signalBatches(group.targets)) {
-        const reason = await this.#planInvalidationReason(work);
-        if (reason !== null) {
-          return { kind: 'stale', reason };
-        }
-        const depth = Math.min(this.#setup.txConfirmationBlocks, this.#setup.interBatchConfirmationBlocks);
-        const context = this.#startReportOperation({ method: group.kind, marketId, accounts: borrowers });
-        const receipt = await this.#registry[group.kind](marketId, borrowers, {
-          confirmations: depth,
-          context,
-        });
-        landed.push({ context, receipt });
-      }
-      const stale = await this.#confirmSignalTransactions(work, landed, reportConfirmationTimeoutMs);
-      if (stale !== null) {
-        return stale;
+      const landed = await this.#submitSignalKind(work, group.kind, group.targets, reportConfirmationTimeoutMs);
+      if (isStale(landed)) {
+        return landed;
       }
       for (const { context, receipt } of landed) {
         this.#emitConfirmedReport(context, receipt);
@@ -829,7 +829,71 @@ export class Guardian {
     return reports;
   }
 
-  #signalBatches(targets: readonly SignalTarget[]): { marketId: MarketId; borrowers: Address[] }[] {
+  /**
+   * Send the batches of one report kind and wait once for full depth. A batch whose report is not
+   * canonical at that depth, because a reorg dropped it, is sent again on the next pass; after
+   * `maxReportAttempts` passes the attempt is stale. A report the reorg only moved may then
+   * land twice, which [scan phase 5](../../docs/guardian-specification.md#scan-cycle) permits.
+   */
+  async #submitSignalKind(
+    work: Work,
+    kind: 'suspect' | 'flag',
+    targets: readonly SignalTarget[],
+    reportConfirmationTimeoutMs: number,
+  ): Promise<readonly SentReport[] | Stale> {
+    const pending = new Set(this.#signalBatches(targets));
+    const confirmed: SentReport[] = [];
+    let attempts = 0;
+    while (pending.size > 0) {
+      if (attempts === this.#setup.maxReportAttempts) {
+        return { kind: 'stale', reason: 'report-no-longer-confirmed' };
+      }
+      const landed = await this.#sendSignalBatches(work, kind, pending, reportConfirmationTimeoutMs);
+      if (isStale(landed)) {
+        return landed;
+      }
+      const head = await this.#rpc.getBlock();
+      for (const report of landed) {
+        if (await this.#isReportConfirmed(report, head)) {
+          pending.delete(report.batch);
+          confirmed.push(report);
+        }
+      }
+      attempts += 1;
+    }
+    return confirmed;
+  }
+
+  /** Send each batch after a plan check, then wait once until every report is at full depth. */
+  async #sendSignalBatches(
+    work: Work,
+    kind: 'suspect' | 'flag',
+    batches: ReadonlySet<SignalBatch>,
+    reportConfirmationTimeoutMs: number,
+  ): Promise<SentReport[] | Stale> {
+    const landed: SentReport[] = [];
+    for (const batch of batches) {
+      const { marketId, borrowers } = batch;
+      const reason = await this.#planInvalidationReason(work);
+      if (reason !== null) {
+        return { kind: 'stale', reason };
+      }
+      const depth = Math.min(this.#setup.txConfirmationBlocks, this.#setup.interBatchConfirmationBlocks);
+      const context = this.#startReportOperation({ method: kind, marketId, accounts: borrowers });
+      const receipt = await this.#registry[kind](marketId, borrowers, {
+        confirmations: depth,
+        context,
+      });
+      landed.push({ batch, context, receipt });
+    }
+    const stale = await this.#confirmSignalTransactions(work, landed, reportConfirmationTimeoutMs);
+    if (stale !== null) {
+      return stale;
+    }
+    return landed;
+  }
+
+  #signalBatches(targets: readonly SignalTarget[]): SignalBatch[] {
     const byMarket = new Map<MarketId, Address[]>();
     for (const target of targets) {
       const borrowers = byMarket.get(target.marketId);
@@ -872,9 +936,7 @@ export class Guardian {
         ({ receipt }) => head.number - receipt.blockNumber + 1 >= this.#setup.txConfirmationBlocks,
       );
       if (deepEnough) {
-        return (await this.#areAllReportsConfirmed(reports))
-          ? null
-          : { kind: 'stale', reason: 'report-no-longer-confirmed' };
+        return null;
       }
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) {
@@ -1009,7 +1071,10 @@ export class Guardian {
    * must be this Guardian's signer calling the registry with the report's own calldata, and anything
    * else is a broken client rather than chain state, which stops the attempt.
    */
-  async #isReportConfirmed({ context, receipt }: SentReport, head: BlockRef): Promise<boolean> {
+  async #isReportConfirmed(
+    { context, receipt }: Pick<SentReport, 'context' | 'receipt'>,
+    head: BlockRef,
+  ): Promise<boolean> {
     const landed = await this.#rpc.getReceipt(receipt.transactionHash);
     if (landed?.status !== 'success') {
       return false;
@@ -1074,6 +1139,7 @@ function validateSetup(setup: GuardianState): void {
   requireInteger('interBatchConfirmationBlocks', setup.interBatchConfirmationBlocks, { min: 1 });
   requireInteger('confirmationPollIntervalMs', setup.confirmationPollIntervalMs, { min: 1, max: 2_147_483_647 });
   requireInteger('screeningTimeoutMs', setup.screeningTimeoutMs, { min: 1, max: 2_147_483_647 });
+  requireInteger('maxReportAttempts', setup.maxReportAttempts, { min: 1 });
   requireInteger('heartbeatReserveBlocks', setup.heartbeatReserveBlocks, {
     min: 1,
     max: BLOCKHASH_LOOKBACK - setup.reportBlockLag,
@@ -1094,6 +1160,11 @@ function validateSetup(setup: GuardianState): void {
 /** A stale result carries the attempt's work to the next attempt. */
 function attachWorkToStale(result: Attested | Stale | NothingDue, work: Work): Attested | Stale | NothingDue {
   return result.kind === 'stale' ? Object.freeze({ ...result, work }) : result;
+}
+
+/** Whether a submission step stopped on a stale plan instead of returning its reports. */
+function isStale(result: object): result is Stale {
+  return 'kind' in result && result.kind === 'stale';
 }
 
 /** viem caches its verdict by the text of a value, so only a string may reach it. */
@@ -1119,6 +1190,7 @@ function snapshotSetup(setup: GuardianSetup): GuardianState {
     historyReadConcurrency = DEFAULT_HISTORY_READ_CONCURRENCY,
     interBatchConfirmationBlocks = DEFAULT_INTER_BATCH_CONFIRMATION_BLOCKS,
     confirmationPollIntervalMs = setup.deployment.slotSeconds * MILLISECONDS_PER_SECOND,
+    maxReportAttempts = DEFAULT_MAX_REPORT_ATTEMPTS,
   } = setup;
   const common = {
     deployment: frozenCopy(setup.deployment),
@@ -1129,6 +1201,7 @@ function snapshotSetup(setup: GuardianSetup): GuardianState {
     historyReadConcurrency,
     interBatchConfirmationBlocks,
     confirmationPollIntervalMs,
+    maxReportAttempts,
     idleHeartbeatInterval: setup.idleHeartbeatInterval,
     heartbeatReserveBlocks: setup.heartbeatReserveBlocks,
     txConfirmationBlocks: setup.txConfirmationBlocks,

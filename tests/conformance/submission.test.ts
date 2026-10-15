@@ -163,7 +163,7 @@ test('stops before the next market batch when the plan expires during shallow co
   assert.equal(await heartbeatTimestamp(fixture), 0);
 });
 
-test('a report receipt lost after inclusion stops the shared wait before heartbeat', async () => {
+test('a report receipt lost after inclusion is sent again before heartbeat', async () => {
   const fixture = await deployed;
   const beforeReport: { value: `0x${string}` | null } = { value: null };
   const lost: TxHash[] = [];
@@ -173,7 +173,8 @@ test('a report receipt lost after inclusion stops the shared wait before heartbe
     'suspect',
     async (method, response, hashes) => {
       if (method === 'eth_sendRawTransaction') {
-        await fixture.anvil.testClient.mine({ blocks: 1 });
+        // The first report only reaches the depth between batches; the rest reach full depth at once.
+        await fixture.anvil.testClient.mine({ blocks: hashes.length === 1 ? 1 : 12 });
       }
       if (method !== 'eth_getBlockByNumber' || hashes.length === 0) {
         return;
@@ -196,12 +197,11 @@ test('a report receipt lost after inclusion stops the shared wait before heartbe
     },
   );
   beforeReport.value = await fixture.anvil.testClient.snapshot();
-  assert.deepEqual(await built.guardian.signalAndHeartbeat(built.screened), {
-    kind: 'stale',
-    reason: 'report-no-longer-confirmed',
-  });
-  assert.equal(built.hashes.length, 1);
-  assert.equal(await heartbeatTimestamp(fixture), 0);
+  const outcome = await built.guardian.signalAndHeartbeat(built.screened);
+  assert.equal(outcome.kind, 'attested');
+  assert.equal(built.hashes.length, 3, 'the report, the same report sent again and the heartbeat');
+  assert.deepEqual(await suspectedBy(fixture, fixture.primaryMarket.id, BORROWER), [fixture.admin.address]);
+  assert.equal(await heartbeatTimestamp(fixture), built.screened.work().reportBlock.timestamp);
 });
 
 test('propagates an unauthorized registry write instead of returning a receipt', async () => {
