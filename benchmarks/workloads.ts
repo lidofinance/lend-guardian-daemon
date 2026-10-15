@@ -4,11 +4,16 @@
 // family states checks about its own result, so a benchmark that measured the wrong behaviour fails
 // instead of reporting numbers.
 
+import { decodeFunctionData } from 'viem';
+import { GUARDIAN_SIGNALS_ABI } from '../abi/GuardianSignals.abi.ts';
+import { HttpScreening } from '../daemon/screening.ts';
 import { Guardian, GuardianStop } from '../src/core/index.ts';
 import type {
+  BlockRef,
   CycleOutcome,
   PositionKey,
   ScanPlan,
+  ScreeningProvider,
   ScreeningResult,
   SdkEvent,
   SupplyAnchor,
@@ -39,6 +44,7 @@ import { BLOCKHASH_LOOKBACK, CHAIN_ID, ProviderQueue, SLOT_SECONDS, timestampOf 
 import type { ProviderProfile, RpcLatency, VirtualClock } from './synthetic-rpc.ts';
 import { runAnvil } from './anvil.ts';
 import { runDaemon } from './daemon.ts';
+import { ScreeningService } from './screening-service.ts';
 import { runTransport } from './transport.ts';
 import {
   CORE,
@@ -78,6 +84,7 @@ interface RunContext {
   readonly clock: VirtualClock;
   readonly presetName: string;
   readonly scenarioId: string;
+  readonly seed: number;
 }
 
 interface GuardianSettings {
@@ -92,6 +99,8 @@ interface GuardianSettings {
   /** A paid shared provider's delays and log limit instead of `rpcLatency`, when set. */
   readonly providerProfile: ProviderProfile | undefined;
   readonly provider: ProviderPlan;
+  /** A screening provider of its own in place of the one `provider` plans, when set. */
+  readonly screening: ScreeningProvider | undefined;
   readonly onIncluded: ((delivery: Delivery) => Promise<void>) | undefined;
   /** Sees every SDK event after the harness's own observers. */
   readonly onEvent: ((event: SdkEvent) => void) | undefined;
@@ -108,6 +117,7 @@ const DEFAULT_SETTINGS: GuardianSettings = {
   rpcLatency: NO_LATENCY,
   providerProfile: undefined,
   provider: { decide: () => CLEAN, latency: { kind: 'real', ms: 0 } },
+  screening: undefined,
   onIncluded: undefined,
   onEvent: undefined,
 };
@@ -163,7 +173,7 @@ interface Settled<Result> {
 
 /** Run one scenario in this process and report what it measured. */
 export function runScenario(scenario: Scenario, clock: VirtualClock, presetName: string): Promise<RunReport> {
-  const context: RunContext = { clock, presetName, scenarioId: scenario.id };
+  const context: RunContext = { clock, presetName, scenarioId: scenario.id, seed: scenario.seed };
   const { parameters } = scenario;
   switch (parameters.family) {
     case 'discovery':
@@ -304,7 +314,7 @@ async function screeningMeasurement(
     () => harness.phases.time('screening', () => harness.guardian.screenWork(input.work)),
     () => 'screened',
   );
-  const expectedOutcome = parameters.incomplete === 'none' ? 'screened' : 'stop:screening-result-incomplete';
+  const expectedIncomplete = parameters.incomplete === 'none' ? 0 : 1;
   return {
     outcome: result.outcome,
     counts: {
@@ -314,7 +324,8 @@ async function screeningMeasurement(
       skippedTargets: result.value?.skipped.length ?? 0,
     },
     checks: [
-      check('outcome', expectedOutcome, result.outcome),
+      check('outcome', 'screened', result.outcome),
+      check('incomplete anchors', expectedIncomplete, result.value?.incomplete.length ?? 'none'),
       check('flagger reads', input.targets, harness.rpc.count('screening', 'eth_call:getFlaggedBy')),
       check(
         'anchors sent to the provider',
@@ -514,6 +525,7 @@ const CYCLE_OUTCOMES: Readonly<Record<Exclude<CycleProfile, 'steady-state'>, str
   'reorg-before-heartbeat': 'stale:report-block-reorged',
   'lost-confirmation': 'attested',
   'restart-after-stale': 'attested',
+  'slow-screening': 'attested',
 };
 
 const CYCLE_FAULTS: Readonly<Record<CycleProfile, SubmissionFault>> = {
@@ -529,9 +541,13 @@ const CYCLE_FAULTS: Readonly<Record<CycleProfile, SubmissionFault>> = {
   'lost-confirmation': 'receipt-lost-after-last',
   'restart-after-stale': 'age-out-after-middle',
   'steady-state': 'none',
+  'slow-screening': 'none',
 };
 
 async function runCycle(parameters: CycleScenario, context: RunContext): Promise<RunReport> {
+  if (parameters.profile === 'slow-screening') {
+    return runSlowScreening(parameters, context);
+  }
   return runOnChainServer(context, async (chain) => {
     const world = await chain.build(context.presetName, context.scenarioId);
     const reportTransactions = expectedReportTransactions({
@@ -646,6 +662,145 @@ async function heartbeatCheck(harness: Harness): Promise<Check> {
   const reportBlocks = harness.plans.reportBlocks();
   const expected = reportBlocks === undefined ? 0 : timestampOf(reportBlocks.last);
   return check('stored heartbeat', expected, await harness.chain.heartbeatTimestamp());
+}
+
+// ─── Cycles against a screening service of limited throughput.
+
+/** The daemon's default `CYCLE_INTERVAL_MS`: thirty slots from the start of one cycle to the next. */
+const CYCLE_INTERVAL_MS = 30 * SLOT_SECONDS * 1_000;
+
+/** Cycles after which a slow-screening run stops as stuck. */
+const MAX_SCHEDULED_CYCLES = 500;
+
+interface ScheduledRun {
+  readonly outcomes: readonly string[];
+  /** The first cycle that sent a report, counted from one, or zero when none did. */
+  readonly firstReportCycle: number;
+  readonly startedAtMs: number;
+  readonly finishedAtMs: number;
+}
+
+/**
+ * Cycles as the daemon schedules them, against a service that judges a few transactions at a time:
+ * the daemon's `HttpScreening` posts the anchors it holds no judged answer for, each incomplete cycle
+ * sends the reports its judged answers require, and the first cycle after the service has judged every
+ * transaction attests.
+ */
+async function runSlowScreening(parameters: CycleScenario, context: RunContext): Promise<RunReport> {
+  const service = new ScreeningService({
+    clock: context.clock,
+    seed: context.seed,
+    transactionScreeningMs: parameters.transactionScreeningMs,
+    concurrency: parameters.screeningConcurrency,
+    judgement: DECISIONS[parameters.decision],
+  });
+  const url = await service.listen();
+  try {
+    return await runOnChainServer(context, async (chain) => {
+      const world = await chain.build(context.presetName, context.scenarioId);
+      let failedBatches = 0;
+      const screening = new HttpScreening(url, {
+        onEvent: (event) => {
+          if (event.error !== undefined) {
+            failedBatches += 1;
+          }
+        },
+      });
+      const harness = harnessOf(chain, world, context.clock, { ...DEFAULT_SETTINGS, screening });
+      return measured(harness, world.stats, async () => {
+        const run = await scheduledCycles(harness, context.clock);
+        return slowScreeningMeasurement(parameters, { harness, run, world, service, failedBatches });
+      });
+    });
+  } finally {
+    service.close();
+  }
+}
+
+/**
+ * Cycles as daemon/main.ts schedules them, until one ends otherwise than incomplete: each starts the
+ * cycle interval after the previous one started, or at once when that one took longer, from the work
+ * and the heartbeat hint of the incomplete cycle before it.
+ */
+async function scheduledCycles(harness: Harness, clock: VirtualClock): Promise<ScheduledRun> {
+  const outcomes: string[] = [];
+  const startedAtMs = clock.now();
+  let firstReportCycle = 0;
+  let previousHeartbeatBlock: BlockRef | null = null;
+  let earlierWork: Work | undefined;
+  while (outcomes.length < MAX_SCHEDULED_CYCLES) {
+    const cycleStartedAtMs = clock.now();
+    const result = await settle(() => harness.guardian.cycle(previousHeartbeatBlock, earlierWork), outcomeOf);
+    outcomes.push(result.outcome);
+    const isFirstReport = firstReportCycle === 0 && hasSentReports(harness);
+    if (isFirstReport) {
+      firstReportCycle = outcomes.length;
+    }
+    const outcome = result.value;
+    if (outcome?.kind !== 'incomplete') {
+      break;
+    }
+    previousHeartbeatBlock = outcome.previousHeartbeatBlock;
+    earlierWork = outcome.work;
+    await clock.sleep(Math.max(0, cycleStartedAtMs + CYCLE_INTERVAL_MS - clock.now()));
+  }
+  return { outcomes, firstReportCycle, startedAtMs, finishedAtMs: clock.now() };
+}
+
+function hasSentReports(harness: Harness): boolean {
+  return harness.client.deliveries().some((delivery) => delivery.method !== 'heartbeat');
+}
+
+async function slowScreeningMeasurement(
+  parameters: CycleScenario,
+  input: {
+    readonly harness: Harness;
+    readonly run: ScheduledRun;
+    readonly world: WorldFacts;
+    readonly service: ScreeningService;
+    readonly failedBatches: number;
+  },
+): Promise<Measured> {
+  const outcome = input.run.outcomes.at(-1) ?? 'error:no cycle';
+  const reports = readFact(input.world, 'targets') * REPORT_KINDS[parameters.decision];
+  const reported = reportedTargets(input.harness.client.deliveries());
+  const distinct = new Set(reported).size;
+  const service = input.service.totals();
+  return {
+    outcome,
+    counts: {
+      supplies: readFact(input.world, 'supplies'),
+      anchors: readFact(input.world, 'anchors'),
+      targets: readFact(input.world, 'targets'),
+      cycles: input.run.outcomes.length,
+      firstReportCycle: input.run.firstReportCycle,
+      ...service,
+      serviceFinishedAfterMs: input.service.finishedAtMs() - input.run.startedAtMs,
+      attestedAfterMs: input.run.finishedAtMs - input.run.startedAtMs,
+      ...(await livenessCounts(input.harness)),
+    },
+    checks: [
+      outcomeCheck(expectedCycleOutcome(parameters), outcome),
+      check('failed screening requests', 0, input.failedBatches),
+      check('transactions asked again after a judged answer', 0, service.transactionsAskedAgain),
+      check('targets reported', reports, distinct),
+      check('targets reported twice', 0, reported.length - distinct),
+      await heartbeatCheck(input.harness),
+    ],
+  };
+}
+
+/** The target of each mined report, by report kind, market and borrower; a target reported twice appears twice. */
+function reportedTargets(deliveries: readonly Delivery[]): string[] {
+  return deliveries.flatMap((delivery) => {
+    const call = decodeFunctionData({ abi: GUARDIAN_SIGNALS_ABI, data: delivery.input });
+    const isReport = call.functionName === 'suspect' || call.functionName === 'flag';
+    if (!isReport || delivery.status !== 'success') {
+      return [];
+    }
+    const [marketId, , accounts] = call.args;
+    return accounts.map((account) => `${call.functionName} ${marketId} ${account.toLowerCase()}`);
+  });
 }
 
 // ─── Liveness: how many targets one submission can confirm before the report block ages out.
@@ -1031,7 +1186,7 @@ function harnessOf(chain: RemoteChain, world: WorldFacts, clock: VirtualClock, s
       lidoLend: { address: CORE, deploymentBlock: readFact(world, 'coreDeploymentBlock') },
       guardianSignals: { address: REGISTRY, deploymentBlock: readFact(world, 'registryDeploymentBlock') },
     },
-    screening: providers.provider(settings.provider, clock),
+    screening: settings.screening ?? providers.provider(settings.provider, clock),
     onEvent: (event) => {
       phases.onEvent(event);
       plans.onEvent(event);
@@ -1184,6 +1339,8 @@ function outcomeOf(outcome: CycleOutcome): string {
       return `nothing-due:${outcome.reason}`;
     case 'observed':
       return 'observed';
+    case 'incomplete':
+      return 'incomplete';
   }
 }
 

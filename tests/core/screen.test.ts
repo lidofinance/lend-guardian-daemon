@@ -82,11 +82,27 @@ async function screenOver(script: Script, answers: readonly ScreeningResult[]) {
       return Promise.resolve(answers);
     },
   };
-  const { guardian } = guardianOver(script, { screening });
+  const { guardian, node, sent } = guardianOver(script, { screening });
   const planned = await guardian.buildScanPlan();
   assert.ok(planned.kind === 'plan');
   const work = await guardian.reconstructWork(await guardian.discoverCandidatePositions(planned));
-  return { guardian, work, requests };
+  return { guardian, node, sent, work, requests };
+}
+
+/** A Guardian whose provider answers every request from the queue, one answer list per request. */
+function answeringInTurn(script: Script, queue: (readonly ScreeningResult[])[]) {
+  const requests: ScreeningRequest[] = [];
+  const built = guardianOver(script, {
+    screening: {
+      screen: (request) => {
+        requests.push(request);
+        const answers = queue.shift();
+        assert.ok(answers !== undefined, 'the provider was asked more often than planned');
+        return Promise.resolve(answers);
+      },
+    },
+  });
+  return { ...built, requests };
 }
 
 async function assertStops(script: Script, answers: readonly ScreeningResult[], reason: StopReason) {
@@ -314,25 +330,97 @@ test('another Guardian flag does not excuse this one from screening', async () =
   assert.deepEqual(screened.skipped, []);
 });
 
-test('a provider slower than screeningTimeoutMs stops the attempt as incomplete and its late answer is dropped', async () => {
+test('a provider slower than screeningTimeoutMs leaves the asked anchors incomplete, its late answer is dropped, and the heartbeat follows its first answer in time', async () => {
   let answerLate: (answers: readonly ScreeningResult[]) => void = () => undefined;
+  let isAnsweringInTime = false;
   const screening = {
-    screen: () =>
-      new Promise<readonly ScreeningResult[]>((resolve) => {
+    screen: (request: ScreeningRequest) => {
+      if (isAnsweringInTime) {
+        return Promise.resolve(request.anchors.map(() => CLEAN));
+      }
+      return new Promise<readonly ScreeningResult[]>((resolve) => {
         answerLate = resolve;
-      }),
+      });
+    },
   };
   const { guardian, sent } = guardianOver(ONE_DUE, { screening, screeningTimeoutMs: 20 });
 
-  await assert.rejects(guardian.cycle(), { name: 'GuardianStop', reason: 'screening-result-incomplete' });
+  const first = await guardian.cycle();
+  assert.ok(first.kind === 'incomplete');
+  assert.equal(first.incomplete.length, 1);
   answerLate([CLEAN]);
-  // The lock is released: the next cycle asks the provider again instead of failing as still in progress.
-  await assert.rejects(guardian.cycle(), { name: 'GuardianStop', reason: 'screening-result-incomplete' });
+  // The lock is released and the late answer was dropped: the next cycle asks the provider again.
+  const second = await guardian.cycle(null, first.work);
+  assert.ok(second.kind === 'incomplete');
+  assert.deepEqual(sent.calls, []);
+
+  // The attempts before cost nothing but their asks: the first answer in time completes the screening.
+  isAnsweringInTime = true;
+  const third = await guardian.cycle(null, second.work);
+  assert.ok(third.kind === 'attested');
+  assert.deepEqual(sent.calls, ['heartbeat']);
+});
+
+test('an incomplete result requires no report, keeps its anchor incomplete and withholds the heartbeat', async () => {
+  const { guardian, work, sent } = await screenOver(ONE_DUE, [INCOMPLETE]);
+  const screened = await guardian.screenWork(work);
+  assert.deepEqual(screened.results, [{ anchor: work.all()[0], result: INCOMPLETE }]);
+  assert.deepEqual(screened.incomplete, work.all());
+  assert.deepEqual(screened.suspects, []);
+  assert.deepEqual(screened.flags, []);
+  assert.equal(screened.work(), work);
+
+  const outcome = await guardian.signalAndHeartbeat(screened);
+  assert.ok(outcome.kind === 'incomplete');
+  assert.deepEqual(outcome.incomplete, work.all());
   assert.deepEqual(sent.calls, []);
 });
 
-test('an incomplete result stops the attempt instead of passing as clean', async () => {
-  await assertStops(ONE_DUE, [INCOMPLETE], 'screening-result-incomplete');
+test('the next attempt asks the provider about every anchor again, and reports the target its complete answer requires', async () => {
+  const { guardian, sent, requests } = answeringInTurn(TWO_ANCHORS, [
+    [CLEAN, INCOMPLETE],
+    [CLEAN, SUSPECT],
+  ]);
+
+  const first = await guardian.cycle();
+  assert.ok(first.kind === 'incomplete');
+  assert.deepEqual(sent.calls, []);
+  const work = first.work;
+  assert.ok(work !== undefined);
+  const [dustAnchor, activatingAnchor] = work.all();
+  assert.ok(dustAnchor !== undefined && activatingAnchor !== undefined);
+  assert.deepEqual(first.incomplete, [activatingAnchor]);
+
+  const second = await guardian.cycle(null, work);
+  assert.ok(second.kind === 'attested');
+  assert.deepEqual(
+    requests.map((request) => request.anchors),
+    [
+      [dustAnchor, activatingAnchor],
+      [dustAnchor, activatingAnchor],
+    ],
+  );
+  assert.deepEqual(sent.calls, ['suspects', 'heartbeat']);
+  assert.deepEqual(sent.suspects, [[TARGET]]);
+});
+
+test('a suspect sent by an incomplete attempt is kept by the attempt that completes the screening', async () => {
+  const { guardian, node, sent, requests } = answeringInTurn(TWO_ANCHORS, [
+    [SUSPECT, INCOMPLETE],
+    [SUSPECT, CLEAN],
+  ]);
+
+  const first = await guardian.cycle();
+  assert.ok(first.kind === 'incomplete');
+  assert.deepEqual(sent.calls, ['suspects']);
+  // The registry recorded the suspect, and the chain moved on past the confirmation depth.
+  node.setSuspectedBy([{ guardian: GUARDIAN, reportedAt: blockAt(HEAD).timestamp }]);
+  node.advanceTo(HEAD + 30);
+
+  const second = await guardian.cycle(null, first.work);
+  assert.ok(second.kind === 'attested');
+  assert.equal(requests.at(-1)?.anchors.length, 2);
+  assert.deepEqual(sent.calls, ['suspects', 'heartbeat']);
 });
 
 for (const evidenceReference of ['', 7, { case: 'invalid' }]) {
@@ -361,7 +449,7 @@ test('evidence may be absent but a supplied reference must be a nonempty string'
     assert.deepEqual(screen(answer).results, [{ anchor: work.all()[0], result: answer }]);
   }
   for (const evidenceReference of ['case-17', null]) {
-    assert.throws(() => screen({ ...INCOMPLETE, evidenceReference }), { reason: 'screening-result-incomplete' });
+    assert.deepEqual(screen({ ...INCOMPLETE, evidenceReference }).incomplete, work.all());
   }
   for (const evidenceReference of ['', 7]) {
     assert.throws(() => screen({ ...INCOMPLETE, evidenceReference }), { reason: 'screening-result-malformed' });
@@ -389,12 +477,23 @@ for (const evidenceReference of [undefined, null]) {
   });
 }
 
-test('null evidence on an incomplete result still blocks the heartbeat as incomplete', async () => {
-  await assertStops(ONE_DUE, [{ ...INCOMPLETE, evidenceReference: null }], 'screening-result-incomplete');
+test('null evidence on an incomplete result still leaves it incomplete', async () => {
+  const { guardian, work } = await screenOver(ONE_DUE, [{ ...INCOMPLETE, evidenceReference: null }]);
+  const screened = await guardian.screenWork(work);
+  assert.deepEqual(screened.incomplete, work.all());
+  assert.ok((await guardian.signalAndHeartbeat(screened)).kind === 'incomplete');
 });
 
-test('an incomplete result stops the attempt even beside a flag on the same target', async () => {
-  await assertStops(TWO_ANCHORS, [FLAG, INCOMPLETE], 'screening-result-incomplete');
+test('a flag beside an incomplete anchor of the same target is sent, and the heartbeat waits', async () => {
+  const { guardian, work, sent } = await screenOver(TWO_ANCHORS, [FLAG, INCOMPLETE]);
+  const screened = await guardian.screenWork(work);
+  assert.deepEqual(screened.flags, [TARGET]);
+  assert.deepEqual(screened.incomplete, [work.all()[1]]);
+
+  const outcome = await guardian.signalAndHeartbeat(screened);
+  assert.ok(outcome.kind === 'incomplete');
+  assert.deepEqual(sent.calls, ['flags']);
+  assert.deepEqual(sent.heartbeats, []);
 });
 
 test('a provider that answers for fewer anchors than asked stops the attempt', async () => {
@@ -410,7 +509,7 @@ test('an answer of a shape nobody defined is not acted on: a status unknown, a r
   const targets = { pending: [{ target: TARGET, anchors: work.all() }], skipped: [] };
   const screen = (answer: unknown) => Screened.fromAnswers(work, targets, [answer]);
   assert.deepEqual(screen(SUSPECT).suspects, [TARGET]);
-  assert.throws(() => screen(INCOMPLETE), { reason: 'screening-result-incomplete' });
+  assert.deepEqual(screen(INCOMPLETE).incomplete, work.all());
   for (const answer of [
     { status: 'judgd', requiresSuspect: true, requiresFlag: false },
     { status: 'judged', requiresSuspect: true },

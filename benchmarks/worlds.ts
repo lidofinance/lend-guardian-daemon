@@ -326,6 +326,7 @@ export function reconstructionWorld(parameters: ReconstructionScenario, clock: V
   const { written } = writePositions(chain, {
     ...parameters,
     joinedAt: REPORT_BLOCK,
+    firstBlock: chain.layout.coreDeploymentBlock + 1,
     lastBlock: REPORT_BLOCK - DUE_MARGIN_BLOCKS,
   });
   chain.seal();
@@ -351,6 +352,7 @@ const CYCLE_PATTERNS: Readonly<Record<CycleProfile, HistoryPattern>> = {
   'lost-confirmation': 'single',
   'restart-after-stale': 'single',
   'steady-state': 'single',
+  'slow-screening': 'single',
 };
 
 export function cycleWorld(parameters: CycleScenario, clock: VirtualClock): CycleWorld {
@@ -363,6 +365,7 @@ export function cycleWorld(parameters: CycleScenario, clock: VirtualClock): Cycl
     events: parameters.events,
     markets: CYCLE_MARKETS,
     joinedAt: isSteadyState ? chain.layout.coreDeploymentBlock : REPORT_BLOCK,
+    firstBlock: cycleSupplyStart(parameters, chain),
     lastBlock: coverageBlock - DUE_MARGIN_BLOCKS,
   });
   const fresh = isSteadyState ? writeSteadyState(chain, positions, parameters) : 0;
@@ -379,6 +382,18 @@ export function cycleWorld(parameters: CycleScenario, clock: VirtualClock): Cycl
   };
 }
 
+/**
+ * The block of a cycle world's first supply: the start of the discovery window, or half a window later
+ * for `slow-screening`, whose cycles wait hours for the service, so that no supply leaves the window
+ * before the service has judged it.
+ */
+function cycleSupplyStart(parameters: CycleScenario, chain: SyntheticChain): number {
+  if (parameters.profile === 'slow-screening') {
+    return REPORT_BLOCK - HISTORY_BLOCKS / 2;
+  }
+  return chain.layout.coreDeploymentBlock + 1;
+}
+
 /** `positions` due lots, one per borrower, spread over `markets` markets and the whole discovery window. */
 export function livenessWorld(positions: number, markets: number, clock: VirtualClock): SyntheticChain {
   const chain = syntheticChain(HISTORY_BLOCKS, clock);
@@ -388,6 +403,7 @@ export function livenessWorld(positions: number, markets: number, clock: Virtual
     events: 1,
     markets,
     joinedAt: REPORT_BLOCK,
+    firstBlock: chain.layout.coreDeploymentBlock + 1,
     lastBlock: REPORT_BLOCK - DUE_MARGIN_BLOCKS,
   });
   chain.seal();
@@ -402,7 +418,10 @@ interface WrittenPositions {
   readonly minimumActivation: bigint;
 }
 
-/** A Guardian that joined at `joinedAt`, `markets` target markets and one history per position. */
+/**
+ * A Guardian that joined at `joinedAt`, `markets` target markets and one history per position, spread
+ * from `firstBlock` to `lastBlock`.
+ */
 function writePositions(
   chain: SyntheticChain,
   shape: {
@@ -411,6 +430,7 @@ function writePositions(
     readonly events: number;
     readonly markets: number;
     readonly joinedAt: number;
+    readonly firstBlock: number;
     readonly lastBlock: number;
   },
 ): WrittenPositions {
@@ -428,7 +448,7 @@ function writePositions(
       position,
       positions: shape.positions,
       events: shape.events,
-      firstBlock: chain.layout.coreDeploymentBlock + 1,
+      firstBlock: shape.firstBlock,
       lastBlock: shape.lastBlock,
       minimumActivation,
     }),

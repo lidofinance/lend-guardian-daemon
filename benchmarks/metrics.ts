@@ -472,6 +472,9 @@ const FAMILY_COLUMNS: Readonly<Record<string, readonly Column[]>> = {
     { header: 'event KB', metric: 'eventKb', digits: 0 },
     { header: 'largest event KB', metric: 'largestEventKb', digits: 1 },
     { header: 'max concurrent posts', metric: 'maxConcurrentPosts', digits: 0 },
+    { header: 'cycles', metric: 'cycles', digits: 0 },
+    { header: 'screening requests', metric: 'screeningRequests', digits: 0 },
+    { header: 'anchors posted', metric: 'screeningAnchors', digits: 0 },
     { header: 'screening request KB', metric: 'screeningRequestKb', digits: 1 },
   ],
 };

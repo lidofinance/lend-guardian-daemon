@@ -13,6 +13,7 @@ import type {
   ScreeningResult,
   SdkEvent,
   TransactionPolicy,
+  Work,
 } from '../src/core/index.ts';
 import { ResourceWindow, check, spreadOf } from './metrics.ts';
 import type { Check, RunReport } from './metrics.ts';
@@ -320,14 +321,27 @@ export function observeGuardian(
 }
 
 /** One cycle without a previous heartbeat: its outcome and the anchors it screened, or the error that ended it. */
-export function observeOnce(guardian: Guardian): Promise<{ readonly kind: string; readonly anchors: number }> {
-  return guardian.cycle(null).then(
-    (result) => ({ kind: result.kind, anchors: result.kind === 'observed' ? result.screened.results.length : 0 }),
+/** One observe cycle, from the work an earlier incomplete one handed on when given, as the daemon's cycles pass it. */
+export function observeOnce(guardian: Guardian, earlierWork?: Work): Promise<ObserveResult> {
+  return guardian.cycle(null, earlierWork).then(
+    (result) => ({
+      kind: result.kind,
+      anchors: result.kind === 'observed' ? result.screened.results.length : 0,
+      ...(result.kind === 'incomplete' ? { work: result.work } : {}),
+    }),
     (error: unknown) => ({
       kind: `error:${error instanceof Error ? error.message.slice(0, 100) : 'unknown'}`,
       anchors: 0,
     }),
   );
+}
+
+export interface ObserveResult {
+  readonly kind: string;
+  /** Anchors the provider was asked about, once the cycle is complete. */
+  readonly anchors: number;
+  /** The work of an incomplete cycle, for the next one. */
+  readonly work?: Work | undefined;
 }
 
 function percentileOf(values: readonly number[], fraction: number): number {

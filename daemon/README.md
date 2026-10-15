@@ -1,6 +1,6 @@
 # Guardian daemon
 
-A deployable Guardian built on the SDK and its [reference example](../example/): the example's Guardian policy and transaction delivery as the defaults of its settings, a schedule of its own, screening over HTTP, JSON logs without endpoint URLs, every event posted to a receiver, and a liveness endpoint. Monitoring is the operator's: its receiver turns the events into its own metrics and alerts. The daemon runs the SDK from the sources of this repository.
+A deployable Guardian built on the SDK and its [reference example](../example/): the example's Guardian policy and transaction delivery as the defaults of its settings, a schedule of its own, screening over HTTP in batches with the judged answers kept for the next cycle, JSON logs without endpoint URLs, every event posted to a receiver, and a liveness endpoint. Monitoring is the operator's: its receiver turns the events into its own metrics and alerts. The daemon runs the SDK from the sources of this repository.
 
 | File                                                     | Role                                                                                        |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
@@ -64,8 +64,9 @@ Invalid or missing configuration ends the process with exit code 1 before any RP
 
 - A cycle starts every `CYCLE_INTERVAL_MS` from the start of the previous one, whatever its outcome; a longer cycle is followed at once.
 - In signal mode every cycle first clears the signer's pending nonces: each pending transaction is awaited or cancelled, so no transaction of an earlier cycle or process blocks this one. The signer must have no other writer. When the clearing fails, the cycle does not start and the next one tries again.
-- A stale plan is rebuilt at once, up to `MAX_RESTARTS_PER_CYCLE` times; then the cycle waits for the next one. Each new attempt keeps the anchors the stale one reconstructed for the positions nothing changed since.
-- A failed cycle keeps the heartbeat hint it started from, and the next cycle repeats it.
+- A stale plan is rebuilt at once, up to `MAX_RESTARTS_PER_CYCLE` times; then the cycle waits for the next one. Each new attempt keeps the anchors the stale one reconstructed for the positions nothing changed since, and asks the service only about the anchors it has not judged.
+- A cycle whose screening is incomplete sends the reports its complete answers require and no heartbeat, and keeps its work for the next scheduled cycle, which asks the service only about the anchors it has not judged.
+- A failed cycle keeps the heartbeat hint it started from and the work it was given, and the next cycle repeats it.
 
 ### Settings
 
@@ -97,7 +98,9 @@ Every setting is optional and keeps its default while unset; a set value must be
 | `REPLACEMENT_TIMEOUT_MS`          | 36000                  | Wait for inclusion before a transaction is replaced at a higher fee.                                                                                                |
 | `SEND_ATTEMPTS`                   | 5                      | Preparations of one transaction, replacements included.                                                                                                             |
 | `GAS_HEADROOM_BPS`                | 2000, a fifth          | Gas added to the node's estimate, in basis points: a report costs more when other guardians report the same accounts first.                                         |
-| `SCREENING_TIMEOUT_MS`            | 290000                 | Wait for the screening service; at most 290000, because Node's fetch waits at most 300 seconds for response headers.                                                |
+| `SCREENING_BATCH_SIZE`            | 1000                   | Anchors in one request to the screening service.                                                                                                                    |
+| `SCREENING_TIMEOUT_MS`            | 290000                 | Wait for one request's answer; at most 290000, because Node's fetch waits at most 300 seconds for response headers.                                                 |
+| `SCREENING_BUDGET_MS`             | 1200000, 20 minutes    | Wait for the whole screening of a cycle; the anchors not asked about by then stay incomplete until the next cycle.                                                  |
 | `FORWARD_TIMEOUT_MS`              | 5000                   | Wait for the receiver before a post is abandoned.                                                                                                                   |
 | `HEALTH_PORT`                     | 8080                   | Port of `GET /health`.                                                                                                                                              |
 | `HEALTH_WINDOW_MS`                | 600000, 10 minutes     | Time without an event after which `/health` answers 503; longer than `CYCLE_INTERVAL_MS` and `SCREENING_TIMEOUT_MS`.                                                |
@@ -109,22 +112,22 @@ These requirements come from measurements of a pre-release version. Later versio
 - **Resources: 2 vCPU, 4 GB of memory and 1 GB of disk.** The daemon keeps no state, so it needs no persistent volume; the disk holds the image and rotated logs. Set `NODE_OPTIONS=--max-old-space-size=3072` so that Node's heap can use three quarters of the container's memory; by default it takes about half.
 - **Why this margin.** A first cycle over 1,000 to 5,000 positions peaks near 420 MB of memory and keeps at most about 1.5 CPUs busy. A receiver that answers each post in one second keeps thousands of posts open and raises the memory to about 620 MB. The daemon image measured the cycles in a container with these resources against local nodes; the receiver figure comes from [the benchmark suite](../benchmarks/) on a laptop and is indicative. [The benchmark results](../benchmarks/RESULTS.md) list both. Under normal conditions these resources are enough in every scenario.
 - **RPC endpoints of a paid provider or your own node.** Each endpoint serves `eth_getLogs` with address and topic filters over ranges of up to `MAX_LOG_BLOCK_RANGE` blocks, back to the core's deployment block, and up to eight concurrent requests. A provider may refuse a range that holds too many logs; the daemon reads it again in halves. A first cycle sends about five log reads and one call per position, and a cycle after a heartbeat about a hundred requests. In signal mode the reports and the heartbeat must follow within about 49 minutes of the report block, so a first cycle must read all its positions well within that time. A shared provider can take seconds for a log read, most of all for one that finds nothing; with many positions, use a faster node or raise `HISTORY_READ_CONCURRENCY` within the provider's rate limit.
-- **Screening service.** One request carries every anchor of a cycle, about 0.5 KB each, and must be answered within `SCREENING_TIMEOUT_MS`. A cycle that fails before its heartbeat is followed by one that sends the same anchors again; an anchor names one supply log, so the service can answer one it judged recently from a cache and leave the cycle more of its time.
+- **Screening service.** A request carries at most `SCREENING_BATCH_SIZE` anchors, about 0.5 KB each, and must be answered within `SCREENING_TIMEOUT_MS`. The daemon keeps a complete answer until the heartbeat, so it asks about an anchor again only after an `incomplete` or after a restart; the service needs no state of its own.
 - **Event receiver.** It must answer each post at once; the largest event lists every anchor, about 0.45 KB each. See [Limitations](#limitations).
 
 ## HTTP interfaces
 
 The daemon calls two services of yours and serves one endpoint. It sends requests to the configured URLs as they are, without adding a path.
 
-| Direction                  | Request                                                     | Body                                                                                | Expected answer                                      | Time limit             |
-| -------------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------- | ---------------------- |
-| Daemon → screening service | `POST` to `SCREENING_URL`, `Content-Type: application/json` | Every anchor of a cycle with work, as [Screening service](#screening-service) shows | `200` with one result per anchor                     | `SCREENING_TIMEOUT_MS` |
-| Daemon → event receiver    | `POST` to `EVENTS_URL`, `Content-Type: application/json`    | One event record, as [Events and liveness](#events-and-liveness) describes          | Any; the daemon ignores the answer                   | `FORWARD_TIMEOUT_MS`   |
-| Orchestrator → daemon      | `GET /health` on `HEALTH_PORT`                              | None                                                                                | `200` while the daemon works, `503` when it is stuck | —                      |
+| Direction                  | Request                                                     | Body                                                                                                          | Expected answer                                      | Time limit                         |
+| -------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- | ---------------------------------- |
+| Daemon → screening service | `POST` to `SCREENING_URL`, `Content-Type: application/json` | At most `SCREENING_BATCH_SIZE` anchors of a cycle with work, as [Screening service](#screening-service) shows | `200` with one result per anchor                     | `SCREENING_TIMEOUT_MS` per request |
+| Daemon → event receiver    | `POST` to `EVENTS_URL`, `Content-Type: application/json`    | One event record, as [Events and liveness](#events-and-liveness) describes                                    | Any; the daemon ignores the answer                   | `FORWARD_TIMEOUT_MS`               |
+| Orchestrator → daemon      | `GET /health` on `HEALTH_PORT`                              | None                                                                                                          | `200` while the daemon works, `503` when it is stuck | —                                  |
 
 ## Screening service
 
-For a cycle with work, the daemon posts every anchor of the cycle in one request:
+For a cycle with work, the daemon posts the anchors of the cycle in requests of at most `SCREENING_BATCH_SIZE`, one request at a time:
 
 ```json
 {
@@ -155,32 +158,33 @@ The service answers with status 200 and one result per anchor, in request order,
 }
 ```
 
-- `judged` carries both report decisions. `incomplete` means the service cannot decide yet: the cycle stops before any report, and the next cycle asks again. `evidenceReference` is optional; when present it is a nonempty, non-secret pointer to the service's evidence.
-- Another status code, a result left out or out of order, an unknown shape, or no answer within `SCREENING_TIMEOUT_MS` fails the cycle, and the next cycle asks again. The SDK itself stops a screening that outlasts `SCREENING_TIMEOUT_MS` by ten seconds, a backstop behind that abort.
-- Anchors of one transaction arrive in the same request, so the service can resolve the payer once per transaction; it still answers every anchor.
-- The same anchors arrive again in later requests: after `incomplete`, after a failed cycle, and in observe mode, where coverage does not advance. A service that calls a vendor keeps the vendor's answers, such as the payer of a transaction by `blockHash` and `transactionHash` and the screening of an address, so a repeated request does not repeat the calls. It keeps only answers: after a vendor timeout or error the anchor stays `incomplete` and is asked about again.
-- A large first cycle may not fit in `SCREENING_TIMEOUT_MS`. Answer `incomplete` for the anchors that are not done, keep working on them, and the next cycle collects them.
+- `judged` carries both report decisions. `incomplete` means the service cannot decide yet: the cycle sends the reports the complete answers require and no heartbeat, and the next cycle asks again about that anchor. `evidenceReference` is optional; when present it is a nonempty, non-secret pointer to the service's evidence.
+- Another status code, a result left out or out of order, an unknown shape, or no answer within `SCREENING_TIMEOUT_MS` leaves the anchors of that request incomplete, recorded as `screening-batch` with the cause, and the other requests of the cycle go on. Requests stop when `SCREENING_BUDGET_MS` runs out; the anchors not asked about wait for the next cycle. The SDK itself stops a screening that outlasts the budget by ten seconds, a backstop behind that limit.
+- The anchors of one transaction may arrive in different requests; the service answers every anchor.
+- The daemon keeps the judged answers of its last screening in memory and asks only about the other anchors, so an anchor arrives again after `incomplete`, after a restart of the daemon, and in observe mode after a complete cycle, where coverage does not advance. The service needs no cache of its own; one that calls a vendor may still keep the vendor's answers, such as the payer of a transaction by `blockHash` and `transactionHash`, against those repeats. After a vendor timeout or error the anchor stays `incomplete` and is asked about again.
+- A large first cycle may not fit in `SCREENING_BUDGET_MS`. The daemon then collects the rest over the next cycles, each cycle's reports already sent; answering `incomplete` for an anchor the service has not finished within `SCREENING_TIMEOUT_MS` has the same effect.
 
 ## Events and liveness
 
 The daemon prints every SDK event as one line of JSON on standard output, except successful RPC requests, and posts every event, those included, to `EVENTS_URL` in a request of its own. A record is one JSON object whose `event` field names it. Amounts are decimal strings, an error is `{ "name", "message" }`, and every URL in any text is replaced by `[url]`, because an RPC error names its endpoint, whose path or query may hold a key.
 
-| Event                                       | Meaning                                                                                                                                                                 |
-| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cycle.started`                             | A cycle began.                                                                                                                                                          |
-| `cycle.planned`                             | The report block and the discovery window were chosen, or nothing is due.                                                                                               |
-| `cycle.discovered`                          | The candidate positions were found.                                                                                                                                     |
-| `cycle.reconstructed`                       | The work set was built: its positions and anchors.                                                                                                                      |
-| `cycle.screened`                            | The screening service judged every anchor; the record lists the required suspect and flag reports.                                                                      |
-| `cycle.finished`                            | The cycle ended; `outcome.kind` is `attested`, `observed`, `nothing-due` or `stale`.                                                                                    |
-| `cycle.failed`                              | The cycle failed with an `error`, for example an RPC failure or an `incomplete` screening result.                                                                       |
-| `report.started`, `report.confirmed`        | A suspect report, flag report or heartbeat was sent, and later confirmed at full depth.                                                                                 |
-| `transaction.*`                             | The steps of one transaction's delivery: `preparation`, `signing`, `broadcast`, `included` (the first inclusion, not a confirmation), `replaced`, `retry` and `failed`. |
-| `nonce.cleared`                             | A pending transaction of the signer was awaited or cancelled before a signal cycle.                                                                                     |
-| `rpc.requestStarted`, `rpc.requestFinished` | One RPC request, with its method and timing; `rpcIndex` is the endpoint's position in `RPC_URLS`.                                                                       |
-| `rpc.answersDiffer`                         | Providers returned different logs for one read under `RPC_LOG_QUORUM`.                                                                                                  |
-| `cycle-not-started`                         | The daemon's own record: clearing pending nonces failed with `error`, so the cycle did not start.                                                                       |
-| `restart-budget-exhausted`                  | The daemon's own record: a stale plan was rebuilt `restarts` times, the last time for `reason`.                                                                         |
+| Event                                       | Meaning                                                                                                                                                                     |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cycle.started`                             | A cycle began.                                                                                                                                                              |
+| `cycle.planned`                             | The report block and the discovery window were chosen, or nothing is due.                                                                                                   |
+| `cycle.discovered`                          | The candidate positions were found.                                                                                                                                         |
+| `cycle.reconstructed`                       | The work set was built: its positions and anchors.                                                                                                                          |
+| `cycle.screened`                            | The screening service judged every anchor; the record lists the required suspect and flag reports.                                                                          |
+| `cycle.finished`                            | The cycle ended; `outcome.kind` is `attested`, `observed`, `nothing-due`, `stale` or `incomplete`, the last with the anchors still without a complete answer.               |
+| `cycle.failed`                              | The cycle failed with an `error`, for example an RPC failure or a malformed screening result.                                                                               |
+| `report.started`, `report.confirmed`        | A suspect report, flag report or heartbeat was sent, and later confirmed at full depth.                                                                                     |
+| `transaction.*`                             | The steps of one transaction's delivery: `preparation`, `signing`, `broadcast`, `included` (the first inclusion, not a confirmation), `replaced`, `retry` and `failed`.     |
+| `nonce.cleared`                             | A pending transaction of the signer was awaited or cancelled before a signal cycle.                                                                                         |
+| `rpc.requestStarted`, `rpc.requestFinished` | One RPC request, with its method and timing; `rpcIndex` is the endpoint's position in `RPC_URLS`.                                                                           |
+| `rpc.answersDiffer`                         | Providers returned different logs for one read under `RPC_LOG_QUORUM`.                                                                                                      |
+| `screening-batch`                           | The daemon's own record: one request to the screening service, with its `anchors`, the `judged` and `incomplete` among them, and the `error` when it gave no usable answer. |
+| `cycle-not-started`                         | The daemon's own record: clearing pending nonces failed with `error`, so the cycle did not start.                                                                           |
+| `restart-budget-exhausted`                  | The daemon's own record: a stale plan was rebuilt `restarts` times, the last time for `reason`.                                                                             |
 
 The fields of the SDK events are defined by `SdkEvent` in [`src/events.ts`](../src/events.ts). An error that ends the process is printed to standard error as `{"event":"daemon.failed","error":…}`, with exit code 1. The compose file rotates the log: Docker keeps at most five files of 50 MB.
 
@@ -198,4 +202,4 @@ The fields of the SDK events are defined by `SdkEvent` in [`src/events.ts`](../s
 npm run test:daemon
 ```
 
-The tests cover the screening contract and each response it refuses, records without URLs, event forwarding, an observe cycle over a scripted node with a scripted screening service and receiver, an RPC failure that reaches the log and the receiver without its endpoint, nonce clearing before every signal cycle, the replan of a stale plan within its budget from the stale attempt's work, and the refusal to start without a screening service.
+The tests cover the screening contract, its batches and each response that leaves a request incomplete, records without URLs, event forwarding, an observe cycle over a scripted node with a scripted screening service and receiver, an RPC failure that reaches the log and the receiver without its endpoint, nonce clearing before every signal cycle, the replan of a stale plan within its budget from the stale attempt's work, the work an incomplete or failed cycle hands to the next one, and the refusal to start without a screening service.

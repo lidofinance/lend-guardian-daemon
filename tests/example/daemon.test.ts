@@ -32,9 +32,7 @@ const DUE: Script = {
 
 test('the example never submits or advances coverage when screening is unconfigured', async () => {
   const { guardian, sent } = guardianOver(DUE, { screening: new UnconfiguredScreening() });
-  await assert.rejects(cycle(guardian, null), {
-    reason: 'screening-result-incomplete',
-  });
+  assert.equal(await cycle(guardian, null), null);
   assert.deepEqual(sent.calls, []);
 });
 
@@ -154,7 +152,7 @@ test('default observe leaves requested screening incomplete and stops before sub
   assert.equal(child.error, undefined);
   assert.equal(child.status, 0, child.stderr);
   assert.match(child.stdout, /reconstructed 1 supply anchors/);
-  assert.match(child.stdout, /screening-result-incomplete/);
+  assert.match(child.stdout, /^incomplete: 1 anchors without a complete answer; no heartbeat$/m);
   assert.doesNotMatch(child.stdout, /attested block|observed:/);
 });
 

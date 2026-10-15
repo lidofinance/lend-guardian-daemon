@@ -2,6 +2,8 @@
 // are plain data; workloads.ts turns one into a synthetic chain and SDK calls. A preset varies one
 // dimension at a time around a baseline rather than taking the full Cartesian product.
 
+import { DEFAULT_SCREENING_BATCH_SIZE } from '../daemon/screening.ts';
+
 export type Decision = 'clean' | 'suspect' | 'flag' | 'both';
 
 export interface DiscoveryScenario {
@@ -86,7 +88,8 @@ export type CycleProfile =
   | 'reorg-before-heartbeat'
   | 'lost-confirmation'
   | 'restart-after-stale'
-  | 'steady-state';
+  | 'steady-state'
+  | 'slow-screening';
 
 export interface CycleScenario {
   readonly family: 'cycle';
@@ -104,6 +107,10 @@ export interface CycleScenario {
    * before the report block and covers every earlier supply.
    */
   readonly freshSupplies: number;
+  /** `slow-screening` only: chain time the screening service spends on one transaction. */
+  readonly transactionScreeningMs: number;
+  /** `slow-screening` only: transactions the screening service judges at once. */
+  readonly screeningConcurrency: number;
 }
 
 export interface LivenessScenario {
@@ -170,6 +177,13 @@ export interface DaemonScenario {
   readonly positions: number;
   /** Delay before the receiver answers each post. */
   readonly receiverLatencyMs: number;
+  /** Anchors in one request to the screening service, the daemon's `SCREENING_BATCH_SIZE`. */
+  readonly screeningBatchSize: number;
+  /**
+   * Anchors of one request the screening service judges, from the first; it answers `incomplete` for
+   * the rest, which the daemon asks about again in its next cycle. The baseline judges a whole request.
+   */
+  readonly judgedPerRequest: number;
 }
 
 /**
@@ -299,6 +313,8 @@ const CYCLE: CycleScenario = {
   providerLatencyMs: 0,
   rpcLatencyMs: 0,
   freshSupplies: 0,
+  transactionScreeningMs: 0,
+  screeningConcurrency: 1,
 };
 
 const LIVENESS: LivenessScenario = {
@@ -330,6 +346,8 @@ const DAEMON: DaemonScenario = {
   runner: 'daemon',
   positions: 1_000,
   receiverLatencyMs: 0,
+  screeningBatchSize: DEFAULT_SCREENING_BATCH_SIZE,
+  judgedPerRequest: DEFAULT_SCREENING_BATCH_SIZE,
 };
 
 const GRIEFING: GriefingScenario = {
@@ -430,6 +448,7 @@ function fullCycle(): CycleScenario[] {
     { ...CYCLE, profile: 'restart-after-stale', positions: 200, decision: 'both' },
     { ...CYCLE, profile: 'steady-state', positions: 5_000 },
     { ...CYCLE, profile: 'steady-state', positions: 5_000, freshSupplies: 10 },
+    { ...CYCLE, profile: 'slow-screening', decision: 'suspect', transactionScreeningMs: 2_000 },
   ];
 }
 
@@ -471,7 +490,13 @@ function fullTransport(): TransportScenario[] {
 }
 
 function fullDaemon(): DaemonScenario[] {
-  return [{ ...DAEMON, runner: 'sdk' }, DAEMON, { ...DAEMON, receiverLatencyMs: 1_000 }];
+  return [
+    { ...DAEMON, runner: 'sdk' },
+    DAEMON,
+    { ...DAEMON, receiverLatencyMs: 1_000 },
+    // A service that judges a fifth of the one request a cycle posts: the cycles ask about the rest until none is left.
+    { ...DAEMON, positions: 5_000, screeningBatchSize: 5_000, judgedPerRequest: 1_000 },
+  ];
 }
 
 /**
@@ -502,6 +527,17 @@ function stressGriefing(): GriefingScenario[] {
       maxOperations: scenario.attack === 'candidate-flood' ? 4_500_000 : 5_000_000,
       maxAttackCostEth: Number.POSITIVE_INFINITY,
     }));
+}
+
+/**
+ * The daemon's cycles over 5,000 due positions against screening services of limited throughput, until
+ * one attests: hours of chain time, and minutes of real time for the slowest service.
+ */
+function stressSlowScreening(): CycleScenario[] {
+  const scenario: CycleScenario = { ...CYCLE, profile: 'slow-screening', positions: 5_000, decision: 'suspect' };
+  return [2_000, 5_000].flatMap((transactionScreeningMs) =>
+    [1, 10].map((screeningConcurrency) => ({ ...scenario, transactionScreeningMs, screeningConcurrency })),
+  );
 }
 
 function fullAnvil(): AnvilScenario[] {
@@ -535,6 +571,7 @@ function smokeParameters(): ScenarioParameters[] {
     { ...CYCLE, profile: 'restart-after-stale', positions: 60, decision: 'both' },
     { ...CYCLE, profile: 'steady-state', positions: 100 },
     { ...CYCLE, profile: 'steady-state', positions: 100, freshSupplies: 5 },
+    { ...CYCLE, profile: 'slow-screening', positions: 50, decision: 'suspect', transactionScreeningMs: 20_000 },
     { ...LIVENESS, maxTargets: 5_000 },
     { ...LIVENESS, maxTargets: 5_000, restarts: 5 },
     { ...TRANSPORT, requests: 20 },
@@ -545,6 +582,7 @@ function smokeParameters(): ScenarioParameters[] {
     { ...TRANSPORT, condition: 'observe-cycle', positions: 50 },
     { ...DAEMON, runner: 'sdk', positions: 50 },
     { ...DAEMON, positions: 50 },
+    { ...DAEMON, positions: 50, judgedPerRequest: 10 },
     { ...GRIEFING, maxOperations: 2_000 },
     { ...GRIEFING, attack: 'candidate-flood', spreadBlocks: 50_400, maxOperations: 500 },
     { ...GRIEFING, attack: 'report-flood', spreadBlocks: 50_400, maxOperations: 300 },
@@ -609,7 +647,8 @@ export function presetNamed(name: string): Preset {
     return { name, warmup: 2, repeat: 5, scenarios: scenariosOf(parameters, 1) };
   }
   if (name === 'stress') {
-    return { name, warmup: 0, repeat: 1, scenarios: scenariosOf(stressGriefing(), 1) };
+    const parameters = [...stressGriefing(), ...stressSlowScreening()];
+    return { name, warmup: 0, repeat: 1, scenarios: scenariosOf(parameters, 1) };
   }
   throw new RangeError(`Unknown preset ${name}; use smoke, full or stress`);
 }

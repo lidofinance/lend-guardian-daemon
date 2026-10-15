@@ -154,7 +154,8 @@ export interface ScreeningTargets {
 /**
  * What the screening phase established. What was asked and what was withheld are kept apart
  * because they answer different questions: what a provider judged, and what this Guardian had
- * already decided.
+ * already decided. An anchor without a complete answer stays in `incomplete`: the reports the
+ * complete answers require can be sent, the heartbeat cannot.
  */
 export class Screened {
   /** Every anchor sent to the provider, in request order, with its result. */
@@ -165,6 +166,9 @@ export class Screened {
   readonly suspects: readonly SignalTarget[];
 
   readonly flags: readonly SignalTarget[];
+
+  /** The anchors without a complete answer, which a later attempt asks about again. */
+  readonly incomplete: readonly SupplyAnchor[];
 
   readonly #work: Work;
 
@@ -178,6 +182,9 @@ export class Screened {
     this.skipped = frozenCopy(screening.skipped);
     this.suspects = frozenCopy(reports.suspects);
     this.flags = frozenCopy(reports.flags);
+    this.incomplete = Object.freeze(
+      this.results.filter((entry) => entry.result.status === 'incomplete').map((entry) => entry.anchor),
+    );
     Object.freeze(this);
   }
 
@@ -194,7 +201,7 @@ export class Screened {
     return this.#work;
   }
 
-  /** Every requested anchor needs its own complete answer before any reports can be submitted. */
+  /** Every requested anchor needs its own answer, complete or not, before any reports can be submitted. */
   static #screenedAnchors(anchors: readonly SupplyAnchor[], answers: readonly unknown[]): ScreenedAnchor[] {
     if (answers.length !== anchors.length) {
       throw new GuardianStop('screening-result-missing');
@@ -214,15 +221,9 @@ export class Screened {
       throw new GuardianStop('screening-result-malformed');
     }
     const status = answer.status;
-    const hasEvidence = 'evidenceReference' in answer;
-    const evidenceReference = hasEvidence ? answer.evidenceReference : undefined;
-    if (evidenceReference !== undefined && evidenceReference !== null) {
-      if (typeof evidenceReference !== 'string' || evidenceReference.length === 0) {
-        throw new GuardianStop('screening-result-malformed');
-      }
-    }
+    const evidence = Screened.#evidence(answer);
     if (status === 'incomplete') {
-      throw new GuardianStop('screening-result-incomplete');
+      return { status, ...evidence };
     }
     if (status !== 'judged') {
       throw new GuardianStop('screening-result-malformed');
@@ -232,10 +233,28 @@ export class Screened {
     if (typeof requiresSuspect !== 'boolean' || typeof requiresFlag !== 'boolean') {
       throw new GuardianStop('screening-result-malformed');
     }
-    return { status, requiresSuspect, requiresFlag, ...(hasEvidence ? { evidenceReference } : {}) };
+    return { status, requiresSuspect, requiresFlag, ...evidence };
   }
 
-  /** Consume positional decisions once; repeated prefix slicing would be quadratic in target count. */
+  /** The evidence reference as the answer gives it, read once; an answer without the field adds none. */
+  static #evidence(answer: Record<string, unknown>): { readonly evidenceReference?: string | null | undefined } {
+    if (!('evidenceReference' in answer)) {
+      return {};
+    }
+    const evidenceReference = answer.evidenceReference;
+    if (evidenceReference === undefined || evidenceReference === null) {
+      return { evidenceReference };
+    }
+    if (typeof evidenceReference !== 'string' || evidenceReference.length === 0) {
+      throw new GuardianStop('screening-result-malformed');
+    }
+    return { evidenceReference };
+  }
+
+  /**
+   * Consume the decisions once, in work order; repeated prefix slicing would be quadratic in target
+   * count. An incomplete answer requires nothing: its target may still be reported for another anchor.
+   */
   static #reportTargets(pending: readonly PendingTarget[], screened: readonly ScreenedAnchor[]) {
     const decisions = screened.values();
     const suspects = new Set<SignalTarget>();
@@ -243,8 +262,11 @@ export class Screened {
     for (const entry of pending) {
       for (let remaining = entry.anchors.length; remaining > 0; remaining -= 1) {
         const decision = decisions.next().value;
-        if (decision?.result.status !== 'judged') {
+        if (decision === undefined) {
           throw new GuardianStop('screening-result-missing');
+        }
+        if (decision.result.status !== 'judged') {
+          continue;
         }
         if (decision.result.requiresSuspect) {
           suspects.add(entry.target);
@@ -290,5 +312,18 @@ export interface Observed {
   readonly screened: Screened;
 }
 
+/**
+ * Screening is not complete. The reports the complete answers require were sent and confirmed, or
+ * observed; the heartbeat waits until a later attempt has a complete answer for every anchor.
+ */
+export interface Incomplete {
+  readonly kind: 'incomplete';
+  readonly previousHeartbeatBlock: BlockRef | null;
+  /** The anchors without a complete answer, which the next attempt asks about again. */
+  readonly incomplete: readonly SupplyAnchor[];
+  /** Set by `Guardian.cycle`: the work this attempt reconstructed, for the next attempt's `earlierWork`. */
+  readonly work?: Work;
+}
+
 /** Every expected result of one Guardian cycle; infrastructure and invariant failures throw. */
-export type CycleOutcome = Attested | NothingDue | Observed | Stale;
+export type CycleOutcome = Attested | NothingDue | Observed | Stale | Incomplete;

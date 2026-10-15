@@ -12,13 +12,29 @@ import * as env from '../example/env.ts';
 import type { Mode } from '../example/env.ts';
 import { createViemRpcTransport, ViemRpcClient } from '../src/chain/viem-client.ts';
 import { Guardian } from '../src/core/index.ts';
-import type { Address, BlockRef, CycleOutcome, EventHandler, SdkEvent, StaleReason, Work } from '../src/core/index.ts';
-import { HttpScreening, MAX_SCREENING_TIMEOUT_MS } from './screening.ts';
+import type {
+  Address,
+  BlockRef,
+  CycleOutcome,
+  EventHandler,
+  SdkEvent,
+  Stale,
+  StaleReason,
+  Work,
+} from '../src/core/index.ts';
+import {
+  DEFAULT_SCREENING_BATCH_SIZE,
+  DEFAULT_SCREENING_BUDGET_MS,
+  HttpScreening,
+  MAX_SCREENING_TIMEOUT_MS,
+} from './screening.ts';
+import type { ScreeningBatchEvent } from './screening.ts';
 
 /** What the daemon reports of its own, beside the SDK's events and by the same path. */
 type RunnerEvent =
   | { readonly event: 'cycle-not-started'; readonly error: unknown }
-  | { readonly event: 'restart-budget-exhausted'; readonly restarts: number; readonly reason: StaleReason };
+  | { readonly event: 'restart-budget-exhausted'; readonly restarts: number; readonly reason: StaleReason }
+  | ScreeningBatchEvent;
 
 type DaemonEvent = SdkEvent | RunnerEvent;
 
@@ -27,6 +43,10 @@ const SLOT_SECONDS = 12;
 
 /** The longest delay Node's timers accept, in milliseconds. */
 const MAX_TIMER_MS = 2_147_483_647;
+
+// The SDK stops a screening that outlasts the budget by this margin. The adapter's last request ends by
+// the budget, so the bound catches only a screening that never settles.
+const SCREENING_SETTLE_MARGIN_MS = 10_000;
 
 /** A setting's value while its environment variable is unset, and the range a set value must fall in. */
 interface Setting {
@@ -76,19 +96,18 @@ const SETTINGS = {
   REPLACEMENT_TIMEOUT_MS: { default: 36_000, min: 1, max: MAX_TIMER_MS },
   SEND_ATTEMPTS: { default: 5, min: 1 },
   GAS_HEADROOM_BPS: { default: 2_000, min: 0 },
-  // The screening service, the event receiver and the liveness endpoint.
+  // The screening service: anchors per request, the wait for one request and for the whole screening.
+  SCREENING_BATCH_SIZE: { default: DEFAULT_SCREENING_BATCH_SIZE, min: 1 },
   SCREENING_TIMEOUT_MS: { default: MAX_SCREENING_TIMEOUT_MS, min: 1, max: MAX_SCREENING_TIMEOUT_MS },
-  // A receiver that has not answered by then loses the event; see README.md, Limitations.
+  SCREENING_BUDGET_MS: { default: DEFAULT_SCREENING_BUDGET_MS, min: 1, max: MAX_TIMER_MS - SCREENING_SETTLE_MARGIN_MS },
+  // The event receiver and the liveness endpoint. A receiver that has not answered by then loses the
+  // event; see README.md, Limitations.
   FORWARD_TIMEOUT_MS: { default: 5_000, min: 1, max: MAX_TIMER_MS },
   HEALTH_PORT: { default: 8_080, min: 1, max: 65_535 },
   HEALTH_WINDOW_MS: { default: 10 * 60_000, min: 1 },
 } satisfies Record<string, Setting>;
 
 const DEFAULT_RPC_USER_AGENT = 'guardian-daemon';
-
-// The SDK stops a screening that outlasts the service timeout by this margin. The adapter aborts first, so
-// its own error reports, and the bound catches only a screening that never settles.
-const SCREENING_SETTLE_MARGIN_MS = 10_000;
 
 /** Any URL, which may carry an endpoint's credentials in its path or query. */
 const URL_PATTERN = /https?:\/\/[^\s"'<>]+/g;
@@ -116,10 +135,10 @@ async function main(): Promise<void> {
     .listen(setting('HEALTH_PORT'))
     .unref();
 
-  let previousHeartbeatBlock: BlockRef | null = null;
+  let start: CycleStart = { previousHeartbeatBlock: null };
   while (true) {
     const startedAt = Date.now();
-    previousHeartbeatBlock = await runCycle({ guardian, mode, maxRestarts, onEvent }, previousHeartbeatBlock);
+    start = await runCycle({ guardian, mode, maxRestarts, onEvent }, start);
     await sleep(Math.max(0, startedAt + cycleIntervalMs - Date.now()));
   }
 }
@@ -132,7 +151,7 @@ function setting(name: keyof typeof SETTINGS): number {
 
 /**
  * The liveness window. A working daemon reports no event for at most the pause between cycles or
- * the wait for screening, so a shorter window would report a working daemon as stuck.
+ * the wait for one screening request, so a shorter window would report a working daemon as stuck.
  */
 function healthWindow(cycleIntervalMs: number): number {
   const healthWindowMs = setting('HEALTH_WINDOW_MS');
@@ -142,14 +161,22 @@ function healthWindow(cycleIntervalMs: number): number {
   return healthWindowMs;
 }
 
+/** Where a cycle starts from: the heartbeat hint, and the work an earlier attempt handed on. */
+export interface CycleStart {
+  readonly previousHeartbeatBlock: BlockRef | null;
+  readonly earlierWork?: Work | undefined;
+}
+
 /**
- * One scheduled [scan cycle](../docs/guardian-specification.md#scan-cycle) and the hint for the next:
- * the coverage its completed call confirmed, or the hint it started from. In signal mode it first
- * clears the signer's pending nonces, so no transaction of an earlier cycle or process blocks this one;
- * the signer must have no other writer. A stale plan is rebuilt at once, up to the budget, and the
- * new attempt reuses the work the stale one reconstructed where it still holds. A
+ * One scheduled [scan cycle](../docs/guardian-specification.md#scan-cycle) and where the next one
+ * starts: the coverage its completed call confirmed, or the hint it started from, with the work to
+ * reuse. In signal mode it first clears the signer's pending nonces, so no transaction of an earlier
+ * cycle or process blocks this one; the signer must have no other writer. A stale plan is rebuilt at
+ * once, up to the budget, and the new attempt reuses the work the stale one reconstructed where it
+ * still holds. An incomplete screening ends the cycle instead: its work goes to the next scheduled
+ * cycle, which gives the service time, and the screening adapter keeps the judged answers. A
  * [failed call](../docs/guardian-specification.md#failure-handling) ends the cycle, which the SDK has
- * already reported as `cycle.failed`.
+ * already reported as `cycle.failed`, with the work it was given.
  */
 export async function runCycle(
   deps: {
@@ -158,36 +185,47 @@ export async function runCycle(
     readonly maxRestarts: number;
     readonly onEvent: (event: RunnerEvent) => void;
   },
-  previousHeartbeatBlock: BlockRef | null,
-): Promise<BlockRef | null> {
+  start: CycleStart,
+): Promise<CycleStart> {
   if (deps.mode === 'signal') {
     try {
       await deps.guardian.clearPendingNonces();
     } catch (error) {
       deps.onEvent({ event: 'cycle-not-started', error });
-      return previousHeartbeatBlock;
+      return start;
     }
   }
   let restarts = 0;
-  let earlierWork: Work | undefined;
+  let earlierWork = start.earlierWork;
   while (true) {
     let outcome: CycleOutcome;
     try {
-      outcome = await deps.guardian.cycle(previousHeartbeatBlock, earlierWork);
+      outcome = await deps.guardian.cycle(start.previousHeartbeatBlock, earlierWork);
     } catch {
-      // The SDK reported the failure as `cycle.failed`; the next cycle starts from the same hint.
-      return previousHeartbeatBlock;
+      // The SDK reported the failure as `cycle.failed`; the next cycle starts from the same hint and work.
+      return {
+        previousHeartbeatBlock: start.previousHeartbeatBlock,
+        ...(earlierWork === undefined ? {} : { earlierWork }),
+      };
     }
     if (outcome.kind !== 'stale') {
-      return outcome.previousHeartbeatBlock;
+      return startAfter(outcome);
     }
     if (restarts === deps.maxRestarts) {
       deps.onEvent({ event: 'restart-budget-exhausted', restarts, reason: outcome.reason });
-      return previousHeartbeatBlock;
+      return { previousHeartbeatBlock: start.previousHeartbeatBlock, earlierWork: outcome.work };
     }
     restarts += 1;
     earlierWork = outcome.work;
   }
+}
+
+/** Where the next scheduled cycle starts after a completed call: its hint, with the work an incomplete one hands on. */
+function startAfter(outcome: Exclude<CycleOutcome, Stale>): CycleStart {
+  if (outcome.kind === 'incomplete') {
+    return { previousHeartbeatBlock: outcome.previousHeartbeatBlock, earlierWork: outcome.work };
+  }
+  return { previousHeartbeatBlock: outcome.previousHeartbeatBlock };
 }
 
 /** Print the event as a JSON line and send it on; a successful RPC request is only sent. */
@@ -255,7 +293,7 @@ function readUrl(name: string): string {
 }
 
 /** The Guardian with the configured policy over the configured deployment, nodes and screening service. */
-function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
+function createGuardian(mode: Mode, onEvent: (event: DaemonEvent) => void): Guardian {
   const chain = env.chain('CHAIN_ID');
   const guardian = env.address('GUARDIAN');
   const client = createClient(mode, chain, guardian, onEvent);
@@ -277,7 +315,12 @@ function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
       },
     },
     guardian,
-    screening: new HttpScreening(readUrl('SCREENING_URL'), setting('SCREENING_TIMEOUT_MS')),
+    screening: new HttpScreening(readUrl('SCREENING_URL'), {
+      batchSize: setting('SCREENING_BATCH_SIZE'),
+      timeoutMs: setting('SCREENING_TIMEOUT_MS'),
+      budgetMs: setting('SCREENING_BUDGET_MS'),
+      onEvent,
+    }),
     reportBlockLag: setting('REPORT_BLOCK_LAG'),
     flaggerReadConcurrency: setting('FLAGGER_READ_CONCURRENCY'),
     historyReadConcurrency: setting('HISTORY_READ_CONCURRENCY'),
@@ -288,7 +331,7 @@ function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
     idleHeartbeatInterval: setting('IDLE_HEARTBEAT_INTERVAL_SECONDS'),
     heartbeatReserveBlocks: setting('HEARTBEAT_RESERVE_BLOCKS'),
     txConfirmationBlocks: setting('TRANSACTION_CONFIRMATION_BLOCKS'),
-    screeningTimeoutMs: setting('SCREENING_TIMEOUT_MS') + SCREENING_SETTLE_MARGIN_MS,
+    screeningTimeoutMs: setting('SCREENING_BUDGET_MS') + SCREENING_SETTLE_MARGIN_MS,
   });
 }
 

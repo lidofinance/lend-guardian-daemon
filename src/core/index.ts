@@ -7,6 +7,7 @@ export type {
   BlockRange,
   CycleOutcome,
   Discovered,
+  Incomplete,
   NothingDue,
   NothingDueReason,
   Observed,

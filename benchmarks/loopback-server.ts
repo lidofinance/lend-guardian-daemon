@@ -24,6 +24,8 @@ const BYTES_PER_KILOBYTE = 1_024;
 
 const CLEAN: ScreeningResult = { status: 'judged', requiresSuspect: false, requiresFlag: false };
 
+const INCOMPLETE: ScreeningResult = { status: 'incomplete' };
+
 type Handler = (request: IncomingMessage, response: ServerResponse) => Promise<void>;
 
 /** One JSON-RPC call as the server reads it. */
@@ -70,6 +72,8 @@ function cycleChain(positions: number): SyntheticChain {
       providerLatencyMs: 0,
       rpcLatencyMs: 0,
       freshSupplies: 0,
+      transactionScreeningMs: 0,
+      screeningConcurrency: 1,
     },
     new VirtualClock({ slotSeconds: SLOT_SECONDS, realTimeScale: 0 }),
   );
@@ -81,7 +85,7 @@ function cycleChain(positions: number): SyntheticChain {
  * Any message from the parent asks for the services' counters.
  */
 async function serveDaemon(parameters: DaemonScenario): Promise<string[]> {
-  const services = new DaemonServices(parameters.receiverLatencyMs);
+  const services = new DaemonServices(parameters);
   process.on('message', () => {
     process.send?.(services.totals());
   });
@@ -92,11 +96,18 @@ async function serveDaemon(parameters: DaemonScenario): Promise<string[]> {
 }
 
 /**
- * The daemon's screening service, which judges every anchor clean and repeats its id, and its event
- * receiver, which answers each post after the scenario's delay. Both count what they receive.
+ * The daemon's screening service, which judges the first `judgedPerRequest` anchors of a request clean,
+ * answers incomplete for the rest and repeats every id, and its event receiver, which answers each post
+ * after the scenario's delay. Both count what they receive.
  */
 class DaemonServices {
   readonly #receiverLatencyMs: number;
+
+  readonly #judgedPerRequest: number;
+
+  #screeningRequests = 0;
+
+  #screeningAnchors = 0;
 
   #screeningRequestBytes = 0;
 
@@ -110,8 +121,9 @@ class DaemonServices {
 
   #maxPostsInFlight = 0;
 
-  constructor(receiverLatencyMs: number) {
-    this.#receiverLatencyMs = receiverLatencyMs;
+  constructor(parameters: DaemonScenario) {
+    this.#receiverLatencyMs = parameters.receiverLatencyMs;
+    this.#judgedPerRequest = parameters.judgedPerRequest;
   }
 
   readonly screen = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -122,7 +134,10 @@ class DaemonServices {
     const ids = Array.isArray(anchors)
       ? anchors.map((anchor: unknown) => (isRecord(anchor) ? anchor.id : undefined))
       : [];
-    sendJson(response, { results: ids.map((id: unknown) => ({ id, ...CLEAN })) });
+    this.#screeningRequests += 1;
+    this.#screeningAnchors += ids.length;
+    const results = ids.map((id: unknown, index) => ({ id, ...(index < this.#judgedPerRequest ? CLEAN : INCOMPLETE) }));
+    sendJson(response, { results });
   };
 
   readonly receive = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -142,6 +157,8 @@ class DaemonServices {
 
   totals(): Record<string, number> {
     return {
+      screeningRequests: this.#screeningRequests,
+      screeningAnchors: this.#screeningAnchors,
       screeningRequestKb: this.#screeningRequestBytes / BYTES_PER_KILOBYTE,
       eventPosts: this.#posts,
       eventKb: this.#postBytes / BYTES_PER_KILOBYTE,
