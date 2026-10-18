@@ -24,6 +24,16 @@ const FIRST_ID = `${padHex('0xb1', { size: 32 })}:${padHex('0xa1', { size: 32 })
 
 const SECOND_ID = `${padHex('0xb1', { size: 32 })}:${padHex('0xa1', { size: 32 })}:5`;
 
+/** A supply in another transaction, for a third borrower. */
+const THIRD: SupplyAnchor = {
+  ...FIRST,
+  transactionHash: padHex('0xa3', { size: 32 }),
+  logIndex: 0,
+  borrower: '0x00000000000000000000000000000000000000f0',
+};
+
+const THIRD_ID = `${padHex('0xb1', { size: 32 })}:${padHex('0xa3', { size: 32 })}:0`;
+
 const REQUEST: ScreeningRequest = {
   chainId: 1,
   reportBlock: { number: 100, hash: padHex('0x64', { size: 32 }), timestamp: 1_700_000_000 },
@@ -199,6 +209,34 @@ test('an observer that throws changes neither the judged answers nor the incompl
   assert.deepEqual(results, [judged(FIRST_ID), { status: 'incomplete' }]);
 });
 
+test('an observer whose promise rejects changes neither the answers nor leaves the rejection unhandled', async (context) => {
+  serveEach(context, (ids, request) =>
+    request === 1 ? Response.json({ results: ids.map(judged) }) : Response.json({}, { status: 503 }),
+  );
+  const unhandled: unknown[] = [];
+  const recordUnhandled = (reason: unknown): void => {
+    unhandled.push(reason);
+  };
+  const screening = new HttpScreening(SCREENING_URL, {
+    batchSize: 1,
+    onEvent: () => Promise.reject(new Error('observer failure')),
+  });
+
+  process.on('unhandledRejection', recordUnhandled);
+  try {
+    const results = await screening.screen(REQUEST);
+    // Node reports an unhandled rejection once the microtasks after it have run.
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+    assert.deepEqual(results, [judged(FIRST_ID), { status: 'incomplete' }]);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', recordUnhandled);
+  }
+});
+
 test('a request that outlasts timeoutMs leaves its anchors incomplete, reported with the timeout', async (context) => {
   context.mock.method(
     globalThis,
@@ -268,4 +306,77 @@ test('the budget running out leaves the remaining anchors incomplete without a r
   assert.deepEqual(requests, []);
   assert.deepEqual(results, [{ status: 'incomplete' }, { status: 'incomplete' }]);
   assert.deepEqual(events, []);
+});
+
+/** Let the event loop turn until `condition` holds, or stop after a hundred turns. */
+async function waitUntil(condition: () => boolean): Promise<void> {
+  let turns = 0;
+  while (!condition() && turns < 100) {
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    turns += 1;
+  }
+}
+
+test('up to concurrency requests are open at once, and the next batch is posted as soon as one of them ends', async (context) => {
+  const open: { readonly ids: string[]; readonly answer: () => void }[] = [];
+  context.mock.method(globalThis, 'fetch', (_url: string, init: RequestInit) => {
+    assert.ok(typeof init.body === 'string');
+    const ids = askedIds(init.body);
+    return new Promise<Response>((resolve) => {
+      open.push({
+        ids,
+        answer: () => {
+          resolve(Response.json({ results: ids.map(judged) }));
+        },
+      });
+    });
+  });
+  const screening = new HttpScreening(SCREENING_URL, { batchSize: 1, concurrency: 2 });
+
+  const screened = screening.screen({ ...REQUEST, anchors: [FIRST, SECOND, THIRD] });
+  await waitUntil(() => open.length > 2);
+  assert.deepEqual(
+    open.map((request) => request.ids),
+    [[FIRST_ID], [SECOND_ID]],
+  );
+  open[1]?.answer();
+  await waitUntil(() => open.length > 2);
+  assert.deepEqual(
+    open.map((request) => request.ids),
+    [[FIRST_ID], [SECOND_ID], [THIRD_ID]],
+  );
+  open[0]?.answer();
+  open[2]?.answer();
+
+  assert.deepEqual(await screened, [judged(FIRST_ID), judged(SECOND_ID), judged(THIRD_ID)]);
+});
+
+test('the budget ends every request open at once', async (context) => {
+  context.mock.method(
+    globalThis,
+    'fetch',
+    (_url: string, init: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => {
+          reject(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+        });
+      }),
+  );
+  const events: ScreeningBatchEvent[] = [];
+  const screening = new HttpScreening(SCREENING_URL, {
+    batchSize: 1,
+    concurrency: 2,
+    budgetMs: 20,
+    onEvent: (event) => events.push(event),
+  });
+
+  const results = await screening.screen(REQUEST);
+
+  assert.deepEqual(results, [{ status: 'incomplete' }, { status: 'incomplete' }]);
+  assert.deepEqual(
+    events.map((event) => (event.error instanceof Error ? event.error.name : 'no error')),
+    ['TimeoutError', 'TimeoutError'],
+  );
 });

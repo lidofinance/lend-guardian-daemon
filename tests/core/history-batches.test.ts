@@ -38,7 +38,7 @@ function marketAt(index: number, markets: number): MarketId {
 }
 
 /** One position in each of `count` markets. */
-function positionsFor(count: number): PositionKey[] {
+function buildPositions(count: number): PositionKey[] {
   return Array.from({ length: count }, (_unused, index) => ({
     controller: CONTROLLER,
     marketId: marketAt(index, count),
@@ -191,7 +191,7 @@ const PHASES: Readonly<Record<string, (guardian: Guardian, count: number) => Pro
     return discovered.all().map((position) => position.borrower);
   },
   reconstruction: async (guardian, count) => {
-    const candidates = positionsFor(count).map((position, index) => ({
+    const candidates = buildPositions(count).map((position, index) => ({
       position,
       newestEvent: { blockNumber: 100_000 + index, logIndex: 4, blockHash: blockAt(100_000 + index).hash },
     }));

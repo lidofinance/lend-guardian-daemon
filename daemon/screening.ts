@@ -1,5 +1,6 @@
 // Screening over HTTP: the daemon posts the anchors of a cycle to the operator's screening service in
-// batches, reads one result per anchor and keeps the judged ones for the next cycle. README.md in this
+// batches, up to a set number at once, reads one result per anchor and keeps the judged ones for the
+// next cycle. README.md in this
 // directory defines the request and response.
 
 import type { ScreeningProvider, ScreeningRequest, ScreeningResult, SupplyAnchor } from '../src/core/index.ts';
@@ -12,6 +13,9 @@ export const MAX_SCREENING_TIMEOUT_MS = 290_000;
 
 /** Anchors in one request unless `batchSize` says otherwise: about half a megabyte of JSON. */
 export const DEFAULT_SCREENING_BATCH_SIZE = 1_000;
+
+/** Requests open at once unless `concurrency` says otherwise: one at a time. */
+export const DEFAULT_SCREENING_CONCURRENCY = 1;
 
 /** The wait for the whole screening unless `budgetMs` says otherwise. */
 export const DEFAULT_SCREENING_BUDGET_MS = 20 * 60_000;
@@ -29,12 +33,17 @@ export interface ScreeningBatchEvent {
 export interface HttpScreeningOptions {
   /** Anchors in one request. */
   readonly batchSize?: number;
+  /** Requests open at once. */
+  readonly concurrency?: number;
   /** The wait for one request's answer. */
   readonly timeoutMs?: number;
   /** The wait for the whole screening; the anchors not asked about by then are incomplete. */
   readonly budgetMs?: number;
-  /** Receives one event per request to the service; an error it throws does not change the screening. */
-  readonly onEvent?: (event: ScreeningBatchEvent) => void;
+  /**
+   * Receives one event per request to the service; an error it throws or a promise it rejects does not
+   * change the screening.
+   */
+  readonly onEvent?: (event: ScreeningBatchEvent) => unknown;
 }
 
 const INCOMPLETE: ScreeningResult = { status: 'incomplete' };
@@ -44,11 +53,13 @@ export class HttpScreening implements ScreeningProvider {
 
   readonly #batchSize: number;
 
+  readonly #concurrency: number;
+
   readonly #timeoutMs: number;
 
   readonly #budgetMs: number;
 
-  readonly #onEvent: ((event: ScreeningBatchEvent) => void) | undefined;
+  readonly #onEvent: ((event: ScreeningBatchEvent) => unknown) | undefined;
 
   /** The judged answers of the last screening, by anchor id: what the next cycle need not ask about again. */
   #judged: ReadonlyMap<string, ScreeningResult> = new Map();
@@ -56,6 +67,7 @@ export class HttpScreening implements ScreeningProvider {
   constructor(url: string, options: HttpScreeningOptions = {}) {
     this.#url = url;
     this.#batchSize = options.batchSize ?? DEFAULT_SCREENING_BATCH_SIZE;
+    this.#concurrency = options.concurrency ?? DEFAULT_SCREENING_CONCURRENCY;
     this.#timeoutMs = options.timeoutMs ?? MAX_SCREENING_TIMEOUT_MS;
     this.#budgetMs = options.budgetMs ?? DEFAULT_SCREENING_BUDGET_MS;
     this.#onEvent = options.onEvent;
@@ -63,8 +75,8 @@ export class HttpScreening implements ScreeningProvider {
 
   /**
    * Answer every anchor of the request, in request order: from the judged answers of the last
-   * screening where it has one, and from the service for the rest, posted in batches, one request at
-   * a time. A request that fails, answers in a shape the daemon cannot act on or outlasts its wait
+   * screening where it has one, and from the service for the rest, posted in batches, up to
+   * `concurrency` requests at once. A request that fails, answers in a shape the daemon cannot act on or outlasts its wait
    * leaves its anchors incomplete, reported with the cause; so does the budget running out, without a
    * request. The judged answers are kept for the next cycle, so a service without state of its own is
    * asked about an anchor until it has answered. Only the answers for this request's anchors stay: an
@@ -76,7 +88,7 @@ export class HttpScreening implements ScreeningProvider {
     const results: ScreeningResult[] = [];
     const judged = new Map<string, ScreeningResult>();
     for (const anchor of request.anchors) {
-      const answer = answerFor(answers, anchor);
+      const answer = readAnswer(answers, anchor);
       results.push(answer);
       if (answer.status === 'judged') {
         judged.set(identifyAnchor(anchor), answer);
@@ -86,21 +98,35 @@ export class HttpScreening implements ScreeningProvider {
     return results;
   }
 
-  /** The service's answer for each anchor, by anchor id, from requests of at most `batchSize` within the budget. */
+  /**
+   * The service's answer for each anchor, by anchor id, from requests of at most `batchSize`, up to
+   * `concurrency` of them open at once, within the budget.
+   */
   async #askInBatches(request: ScreeningRequest): Promise<Map<string, ScreeningResult>> {
     const deadline = Date.now() + this.#budgetMs;
-    const answers = new Map<string, ScreeningResult>();
+    const waiting: (readonly SupplyAnchor[])[] = [];
     for (let from = 0; from < request.anchors.length; from += this.#batchSize) {
-      const anchors = request.anchors.slice(from, from + this.#batchSize);
-      const remainingMs = deadline - Date.now();
-      const batch =
-        remainingMs > 0
-          ? await this.#ask({ ...request, anchors }, Math.min(this.#timeoutMs, remainingMs))
-          : incompleteFor(anchors);
-      for (const [id, answer] of batch) {
-        answers.set(id, answer);
-      }
+      waiting.push(request.anchors.slice(from, from + this.#batchSize));
     }
+    const answers = new Map<string, ScreeningResult>();
+    // Each worker takes the next batch as soon as its request ends, so a slow request holds only its own worker.
+    const work = async (): Promise<void> => {
+      while (true) {
+        const anchors = waiting.shift();
+        if (anchors === undefined) {
+          return;
+        }
+        const remainingMs = deadline - Date.now();
+        const batch =
+          remainingMs > 0
+            ? await this.#ask({ ...request, anchors }, Math.min(this.#timeoutMs, remainingMs))
+            : markIncomplete(anchors);
+        for (const [id, answer] of batch) {
+          answers.set(id, answer);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(this.#concurrency, waiting.length) }, work));
     return answers;
   }
 
@@ -113,19 +139,21 @@ export class HttpScreening implements ScreeningProvider {
     } catch (error) {
       // Incompleteness returned explicitly: the cause goes to the event, and the next cycle asks again.
       this.#emit({ event: 'screening-batch', anchors, judged: 0, incomplete: anchors, error });
-      return incompleteFor(request.anchors);
+      return markIncomplete(request.anchors);
     }
     const judged = [...results.values()].filter((result) => result.status === 'judged').length;
     this.#emit({ event: 'screening-batch', anchors, judged, incomplete: anchors - judged });
     return results;
   }
 
-  /** Report the event; an observer's failure must not change the screening it observes. */
+  /** Report the event; an observer's failure, thrown or rejected, must not change the screening it observes. */
   #emit(event: ScreeningBatchEvent): void {
     try {
-      this.#onEvent?.(event);
+      void Promise.resolve(this.#onEvent?.(event)).catch(() => {
+        // An asynchronous observer failure is lost; the answers stand.
+      });
     } catch {
-      // The event is lost; the answers stand.
+      // A synchronous observer failure is lost; the answers stand.
     }
   }
 }
@@ -136,12 +164,12 @@ function identifyAnchor(anchor: SupplyAnchor): string {
 }
 
 /** An incomplete answer for each anchor, by anchor id. */
-function incompleteFor(anchors: readonly SupplyAnchor[]): Map<string, ScreeningResult> {
+function markIncomplete(anchors: readonly SupplyAnchor[]): Map<string, ScreeningResult> {
   return new Map(anchors.map((anchor) => [identifyAnchor(anchor), INCOMPLETE]));
 }
 
 /** The answer for the anchor; every anchor of a screening has one, kept or fresh. */
-function answerFor(answers: ReadonlyMap<string, ScreeningResult>, anchor: SupplyAnchor): ScreeningResult {
+function readAnswer(answers: ReadonlyMap<string, ScreeningResult>, anchor: SupplyAnchor): ScreeningResult {
   const answer = answers.get(identifyAnchor(anchor));
   if (answer === undefined) {
     throw new Error(`Screening has no answer for anchor ${identifyAnchor(anchor)}`);

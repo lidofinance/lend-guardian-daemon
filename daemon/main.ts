@@ -25,6 +25,7 @@ import type {
 import {
   DEFAULT_SCREENING_BATCH_SIZE,
   DEFAULT_SCREENING_BUDGET_MS,
+  DEFAULT_SCREENING_CONCURRENCY,
   HttpScreening,
   MAX_SCREENING_TIMEOUT_MS,
 } from './screening.ts';
@@ -96,8 +97,10 @@ const SETTINGS = {
   REPLACEMENT_TIMEOUT_MS: { default: 36_000, min: 1, max: MAX_TIMER_MS },
   SEND_ATTEMPTS: { default: 5, min: 1 },
   GAS_HEADROOM_BPS: { default: 2_000, min: 0 },
-  // The screening service: anchors per request, the wait for one request and for the whole screening.
+  // The screening service: anchors per request, requests at once, the wait for one request and for the
+  // whole screening.
   SCREENING_BATCH_SIZE: { default: DEFAULT_SCREENING_BATCH_SIZE, min: 1 },
+  SCREENING_CONCURRENCY: { default: DEFAULT_SCREENING_CONCURRENCY, min: 1 },
   SCREENING_TIMEOUT_MS: { default: MAX_SCREENING_TIMEOUT_MS, min: 1, max: MAX_SCREENING_TIMEOUT_MS },
   SCREENING_BUDGET_MS: { default: DEFAULT_SCREENING_BUDGET_MS, min: 1, max: MAX_TIMER_MS - SCREENING_SETTLE_MARGIN_MS },
   // The event receiver and the liveness endpoint. A receiver that has not answered by then loses the
@@ -317,6 +320,7 @@ function createGuardian(mode: Mode, onEvent: (event: DaemonEvent) => void): Guar
     guardian,
     screening: new HttpScreening(readUrl('SCREENING_URL'), {
       batchSize: setting('SCREENING_BATCH_SIZE'),
+      concurrency: setting('SCREENING_CONCURRENCY'),
       timeoutMs: setting('SCREENING_TIMEOUT_MS'),
       budgetMs: setting('SCREENING_BUDGET_MS'),
       onEvent,

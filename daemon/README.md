@@ -99,6 +99,7 @@ Every setting is optional and keeps its default while unset; a set value must be
 | `SEND_ATTEMPTS`                   | 5                      | Preparations of one transaction, replacements included.                                                                                                             |
 | `GAS_HEADROOM_BPS`                | 2000, a fifth          | Gas added to the node's estimate, in basis points: a report costs more when other guardians report the same accounts first.                                         |
 | `SCREENING_BATCH_SIZE`            | 1000                   | Anchors in one request to the screening service.                                                                                                                    |
+| `SCREENING_CONCURRENCY`           | 1                      | Requests to the screening service open at once; raise it only for a service that handles several requests at once.                                                  |
 | `SCREENING_TIMEOUT_MS`            | 290000                 | Wait for one request's answer; at most 290000, because Node's fetch waits at most 300 seconds for response headers.                                                 |
 | `SCREENING_BUDGET_MS`             | 1200000, 20 minutes    | Wait for the whole screening of a cycle; the anchors not asked about by then stay incomplete until the next cycle.                                                  |
 | `FORWARD_TIMEOUT_MS`              | 5000                   | Wait for the receiver before a post is abandoned.                                                                                                                   |
@@ -112,7 +113,7 @@ These requirements come from measurements of a pre-release version. Later versio
 - **Resources: 2 vCPU, 4 GB of memory and 1 GB of disk.** The daemon keeps no state, so it needs no persistent volume; the disk holds the image and rotated logs. Set `NODE_OPTIONS=--max-old-space-size=3072` so that Node's heap can use three quarters of the container's memory; by default it takes about half.
 - **Why this margin.** A first cycle over 1,000 to 5,000 positions peaks near 420 MB of memory and keeps at most about 1.5 CPUs busy. A receiver that answers each post in one second keeps thousands of posts open and raises the memory to about 620 MB. The daemon image measured the cycles in a container with these resources against local nodes; the receiver figure comes from [the benchmark suite](../benchmarks/) on a laptop and is indicative. [The benchmark results](../benchmarks/RESULTS.md) list both. Under normal conditions these resources are enough in every scenario.
 - **RPC endpoints of a paid provider or your own node.** Each endpoint serves `eth_getLogs` with address and topic filters over ranges of up to `MAX_LOG_BLOCK_RANGE` blocks, back to the core's deployment block, and up to eight concurrent requests. A provider may refuse a range that holds too many logs; the daemon reads it again in halves. A first cycle sends about five log reads and one call per position, and a cycle after a heartbeat about a hundred requests. In signal mode the reports and the heartbeat must follow within about 49 minutes of the report block, so a first cycle must read all its positions well within that time. A shared provider can take seconds for a log read, most of all for one that finds nothing; with many positions, use a faster node or raise `HISTORY_READ_CONCURRENCY` within the provider's rate limit.
-- **Screening service.** A request carries at most `SCREENING_BATCH_SIZE` anchors, about 0.5 KB each, and must be answered within `SCREENING_TIMEOUT_MS`. The daemon keeps a complete answer until the heartbeat, so it asks about an anchor again only after an `incomplete` or after a restart; the service needs no state of its own.
+- **Screening service.** A request carries at most `SCREENING_BATCH_SIZE` anchors, about 0.5 KB each, and must be answered within `SCREENING_TIMEOUT_MS`. The service must accept up to `SCREENING_CONCURRENCY` requests at once. The daemon keeps a complete answer until the heartbeat, so it asks about an anchor again only after an `incomplete` or after a restart; the service needs no state of its own.
 - **Event receiver.** It must answer each post at once; the largest event lists every anchor, about 0.45 KB each. See [Limitations](#limitations).
 
 ## HTTP interfaces
@@ -127,7 +128,7 @@ The daemon calls two services of yours and serves one endpoint. It sends request
 
 ## Screening service
 
-For a cycle with work, the daemon posts the anchors of the cycle in requests of at most `SCREENING_BATCH_SIZE`, one request at a time:
+For a cycle with work, the daemon posts the anchors of the cycle in requests of at most `SCREENING_BATCH_SIZE`, with up to `SCREENING_CONCURRENCY` requests open at once, one by default:
 
 ```json
 {
