@@ -402,6 +402,8 @@ export class Guardian {
   /**
    * Explicit recovery for a dedicated signer before a fresh signal cycle. This is runner policy,
    * not a scan phase: an old transaction or our cancellation must consume each pending nonce.
+   * Each decision reports the counts it was made by: equal counts mean the answering node sees no
+   * pending transaction, which the SDK cannot verify.
    */
   async clearPendingNonces(): Promise<void> {
     if (this.#setup.mode === 'observe') {
@@ -423,11 +425,13 @@ export class Guardian {
       await this.#requireChain();
       while (true) {
         this.#requireClearingTime(deadline);
-        const nonce = await this.#pendingNonce(signer);
-        if (nonce === undefined) {
+        const latest = await this.#rpc.getTransactionCount(signer, 'latest');
+        const pending = await this.#rpc.getTransactionCount(signer, 'pending');
+        emitEvent(this.#setup.onEvent, { event: 'nonce.checked', context, latest, pending });
+        if (pending <= latest) {
           return;
         }
-        await this.#clearNonce(client, { signer, nonce, context, deadline });
+        await this.#clearNonce(client, { signer, nonce: latest, context, deadline });
       }
     } catch (error) {
       emitEvent(this.#setup.onEvent, { event: 'transaction.failed', context, stage: 'nonce-clearing', error });
@@ -435,12 +439,6 @@ export class Guardian {
     } finally {
       this.#isWriting = false;
     }
-  }
-
-  async #pendingNonce(signer: Address): Promise<number | undefined> {
-    const nonce = await this.#rpc.getTransactionCount(signer, 'latest');
-    const pending = await this.#rpc.getTransactionCount(signer, 'pending');
-    return pending > nonce ? nonce : undefined;
   }
 
   async #clearNonce(
@@ -459,13 +457,15 @@ export class Guardian {
     while (true) {
       this.#requireClearingTime(deadline);
       if ((await client.getTransactionCount(signer, 'latest')) <= nonce) {
-        if (attempt >= policy.sendAttempts) {
-          throw new Error('Nonce clearing exhausted sendAttempts');
-        }
         attempt += 1;
         previous = await this.#prepareCancellation(client, { signer, nonce }, previous, { attempt, context });
         this.#requireClearingTime(deadline);
-        await this.#broadcastCancellation(client, previous, { attempt, context });
+        const acknowledged = await this.#broadcastCancellation(client, previous, { attempt, context });
+        if (!acknowledged) {
+          // The node did not take this price: the next cancellation is repriced at once, until the node
+          // accepts one or the fee would exceed maxFeePerGas.
+          continue;
+        }
       }
       const waitUntil = Math.min(deadline, Date.now() + policy.replacementTimeoutMs);
       const block = await this.#waitForNonce(signer, nonce, waitUntil);
@@ -518,24 +518,27 @@ export class Guardian {
     return prepared;
   }
 
+  /** Whether the node acknowledged the cancellation; a broadcast it did not is reported and repriced. */
   async #broadcastCancellation(
     client: RpcClient,
     transaction: PreparedTransaction,
     options: TransactionAttempt,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await client.broadcastTransaction(transaction, options);
+      return true;
     } catch (error) {
       if (!(error instanceof BroadcastFailure)) {
         throw error;
       }
-      // The chain state decides whether an uncertain broadcast consumed the nonce or needs replacement.
+      // Whether an earlier cancellation consumed the nonce, the chain state in the clearing loop decides.
       emitEvent(this.#setup.onEvent, {
         event: 'transaction.retry',
         ...options,
         nonce: transaction.nonce,
         error: error.cause,
       });
+      return false;
     }
   }
 

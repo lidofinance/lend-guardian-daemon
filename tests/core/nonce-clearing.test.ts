@@ -43,7 +43,6 @@ interface NonceOverrides {
   readonly sendTimeoutMs?: number;
   readonly replacementFeeBumpBps?: number;
   readonly replacementTimeoutMs?: number;
-  readonly sendAttempts?: number;
   readonly estimatedMaxFeePerGas?: bigint;
   readonly estimatedPriorityFeePerGas?: bigint;
   readonly mode?: 'observe' | 'signal';
@@ -68,7 +67,7 @@ function nonceClient(
       sendTimeoutMs: overrides.sendTimeoutMs ?? SEND_TIMEOUT_MS,
       replacementFeeBumpBps: overrides.replacementFeeBumpBps ?? 1_250,
       replacementTimeoutMs: overrides.replacementTimeoutMs ?? 1,
-      sendAttempts: overrides.sendAttempts ?? 3,
+      sendAttempts: 3,
     },
     getChainId: () => Promise.resolve(overrides.chainId ?? 1),
     getTransactionCount: (_address: Address, at: 'latest' | 'pending' | number) =>
@@ -142,6 +141,10 @@ test('does not write when the signer has no pending nonce', async () => {
   await fixture.guardian.clearPendingNonces();
   assert.equal(fixture.prepared.length, 0);
   assert.equal(fixture.broadcasts.length, 0);
+  assert.deepEqual(
+    fixture.events.filter((event) => event.event === 'nonce.checked').map((event) => [event.latest, event.pending]),
+    [[7, 7]],
+  );
 });
 
 test('clears one pending nonce with a zero-value self-transfer and confirms it', async () => {
@@ -159,6 +162,13 @@ test('clears one pending nonce with a zero-value self-transfer and confirms it',
     maxPriorityFeePerGas: 8n,
   });
   assert.equal(fixture.broadcasts.length, 1);
+  assert.deepEqual(
+    fixture.events.filter((event) => event.event === 'nonce.checked').map((event) => [event.latest, event.pending]),
+    [
+      [7, 8],
+      [8, 8],
+    ],
+  );
   assert.deepEqual(
     fixture.events
       .filter((event) => event.event === 'nonce.cleared')
@@ -221,15 +231,51 @@ test('stops before broadcast when a cancellation exceeds the fee cap', async () 
   assert.equal(failed.stage, 'nonce-clearing');
 });
 
-test('bounds repeated indeterminate broadcasts by sendAttempts', async () => {
+test('reprices a rejected cancellation at once until the node accepts one', async () => {
+  // The stuck transaction's fee: the node rejects a cancellation priced at or below it.
+  const stuckMaxFeePerGas = 22n;
   const fixture = recoveryFixture({
     pending: 8,
-    sendAttempts: 2,
-    broadcast: () => Promise.reject(new BroadcastFailure(new Error('arbitrary provider response'))),
+    replacementTimeoutMs: 60_000,
+    broadcast: ({ transaction, state }) => {
+      if (transaction.maxFeePerGas <= stuckMaxFeePerGas) {
+        return Promise.reject(new BroadcastFailure(new Error('replacement transaction underpriced')));
+      }
+      state.latest = 8;
+      return Promise.resolve();
+    },
   });
+  const startedAt = performance.now();
 
-  await assert.rejects(fixture.guardian.clearPendingNonces(), /exhausted sendAttempts/);
-  assert.equal(fixture.broadcasts.length, 2);
+  await fixture.guardian.clearPendingNonces();
+  assert.ok(performance.now() - startedAt < 5_000, 'rejections are repriced without the replacement interval');
+  assert.deepEqual(
+    fixture.broadcasts.map(({ transaction }) => transaction.maxFeePerGas),
+    [16n, 19n, 22n, 25n],
+  );
+  assert.equal(fixture.events.filter((event) => event.event === 'transaction.retry').length, 3);
+  assert.deepEqual(
+    fixture.events.filter((event) => event.event === 'nonce.cleared').map((event) => event.nonce),
+    [7],
+  );
+});
+
+test('climbs to the fee cap when the node rejects every cancellation, then stops', async () => {
+  const fixture = recoveryFixture({
+    pending: 8,
+    replacementTimeoutMs: 60_000,
+    broadcast: () => Promise.reject(new BroadcastFailure(new Error('replacement transaction underpriced'))),
+  });
+  const startedAt = performance.now();
+
+  await assert.rejects(fixture.guardian.clearPendingNonces(), /replacement fee exceeds maxFeePerGas/);
+  assert.ok(performance.now() - startedAt < 5_000, 'rejections are repriced without the replacement interval');
+  // Each step adds 12.5% and one wei; the next step, 106, would exceed the cap of 100 and is not sent.
+  assert.deepEqual(
+    fixture.broadcasts.map(({ transaction }) => transaction.maxFeePerGas),
+    [16n, 19n, 22n, 25n, 29n, 33n, 38n, 43n, 49n, 56n, 64n, 73n, 83n, 94n],
+  );
+  assert.equal(fixture.events.filter((event) => event.event === 'transaction.retry').length, 14);
 });
 
 test('propagates failures outside the raw broadcast boundary without retrying', async () => {
