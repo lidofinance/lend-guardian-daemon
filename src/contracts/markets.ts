@@ -188,8 +188,8 @@ export class Markets {
 
   /**
    * Reconstruct the uncovered contributors for every candidate position under Appendix C,
-   * `concurrency` positions at a time. A position of `reusableWork` that its controller logged no event
-   * for after that work's report block keeps its anchors instead.
+   * `concurrency` positions at a time. A position of `reusableWork` keeps its anchors instead when the
+   * newest event that discovery read for it is not after that work's report block: nothing changed it since.
    */
   async reconstructWork(
     plan: ScanPlan,
@@ -197,16 +197,17 @@ export class Markets {
     concurrency: number,
     reusableWork?: Work,
   ): Promise<ReadonlyMap<PositionKey, readonly SupplyAnchor[]>> {
-    const unchangedAnchors =
-      reusableWork === undefined
-        ? new Map<string, readonly SupplyAnchor[]>()
-        : await this.#findUnchangedAnchors(reusableWork, plan.discoveryRange.to.number, concurrency);
-    const walks = await mapConcurrently(concurrency, candidates, async (candidate) => ({
-      position: candidate.position,
-      anchors:
-        unchangedAnchors.get(`${candidate.position.controller}:${candidate.position.borrower}`) ??
-        (await this.#reconstructPosition(plan, candidate)),
-    }));
+    const reusableAnchors = new Map<string, readonly SupplyAnchor[]>();
+    for (const [position, anchors] of reusableWork?.entries() ?? []) {
+      reusableAnchors.set(`${position.controller}:${position.borrower}`, anchors);
+    }
+    const walks = await mapConcurrently(concurrency, candidates, async (candidate) => {
+      const isUnchanged =
+        reusableWork !== undefined && candidate.newestEvent.blockNumber <= reusableWork.reportBlock.number;
+      const key = `${candidate.position.controller}:${candidate.position.borrower}`;
+      const anchors = isUnchanged ? reusableAnchors.get(key) : undefined;
+      return { position: candidate.position, anchors: anchors ?? (await this.#reconstructPosition(plan, candidate)) };
+    });
     const byPosition = new Map<PositionKey, readonly SupplyAnchor[]>();
     for (const { position, anchors } of walks) {
       if (anchors.length > 0) {
@@ -380,33 +381,6 @@ export class Markets {
     if (unpairedSupplies.size > 0) {
       throw new GuardianStop('supply-without-controller-event');
     }
-  }
-
-  /**
-   * The anchors of `reusableWork`'s positions, by controller and borrower, less those whose controller
-   * logged an event for them after that work's report block, through `reportBlockNumber`.
-   */
-  async #findUnchangedAnchors(
-    reusableWork: Work,
-    reportBlockNumber: number,
-    concurrency: number,
-  ): Promise<Map<string, readonly SupplyAnchor[]>> {
-    const unchangedAnchors = new Map<string, readonly SupplyAnchor[]>();
-    const controllers = new Set<Address>();
-    for (const [position, anchors] of reusableWork.entries()) {
-      unchangedAnchors.set(`${position.controller}:${position.borrower}`, anchors);
-      controllers.add(position.controller);
-    }
-    const blocksToRead = { fromBlock: reusableWork.reportBlock.number + 1, toBlock: reportBlockNumber };
-    await mapConcurrently(concurrency, [...controllers], async (controller) => {
-      const eventFilter = { address: controller, topics: [LIFECYCLE_TOPICS], ...blocksToRead };
-      for await (const eventLogs of this.#rpc.logBatches(eventFilter, 'forward')) {
-        for (const event of decodeLogs(MARKET_CONTROLLER_ABI, eventLogs)) {
-          unchangedAnchors.delete(`${lower(event.address)}:${lower(event.args.borrower)}`);
-        }
-      }
-    });
-    return unchangedAnchors;
   }
 
   /** Read the candidates' controllers' lifecycle events in `blocksToRead`, a piece at a time, and apply them. */
