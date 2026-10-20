@@ -59,7 +59,12 @@ const SELECTOR = {
   marketController: '0x961496be',
   guardianSignals: '0x0700873b',
   getFlaggedBy: '0x576fa8ba',
+  getSuspectedBy: '0x3075b592',
+  getSuspectWindow: '0x266e6067',
 };
+
+/** How long a suspect stays active unless the script says otherwise. */
+const WEEK = 7 * 24 * 60 * 60;
 
 /** A `Heartbeat` of this Guardian: the block it reported, and where the event itself was logged. */
 interface Heartbeat {
@@ -87,10 +92,16 @@ export interface Lot {
   readonly position: Position;
   /** The assets of the `SupplyCollateral` at `logIndex + 1`, or absent when there is none. */
   readonly supplied?: bigint;
-  /** The borrower the controller event names, or `BORROWER`, whom every supply is on behalf of. */
+  /** The borrower the controller event names, or `BORROWER`. */
   readonly borrower?: Address;
-  /** The block hash the lot's receipt names, or the hash of the block its logs sit in. */
-  readonly receiptBlockHash?: Bytes32;
+  /** The block hash the node gives the lot's controller log and receipt, or the hash of the lot's block. */
+  readonly controllerBlockHash?: Bytes32;
+}
+
+/** One Guardian's suspect on the borrower, as the registry reports it. */
+export interface SuspectRecord {
+  readonly guardian: Address;
+  readonly reportedAt: number;
 }
 
 /** A report transaction as the node recorded it. */
@@ -109,16 +120,9 @@ interface LogQuery {
   readonly topics: readonly unknown[];
 }
 
-/** One `eth_getLogs` the core sent for a single block by its hash. */
-interface BlockLogQuery {
-  readonly address: string;
-  readonly blockHash: string;
-}
-
 /** What the node records of the queries it was sent. */
 interface Queries {
   readonly ranges: LogQuery[];
-  readonly blocks: BlockLogQuery[];
 }
 
 /** A node's own cap on a query's results, and how it words the refusal. */
@@ -150,6 +154,10 @@ export interface Script {
   readonly lots?: readonly Lot[];
   /** Guardians this deployment reports as having flagged the borrower. */
   readonly flaggedBy?: readonly Address[];
+  /** Guardians this deployment reports as having suspected the borrower, and when. */
+  readonly suspectedBy?: readonly SuspectRecord[];
+  /** How long a suspect stays active, or a week. */
+  readonly suspectWindow?: number;
   /** The report transactions the node holds a receipt for. */
   readonly receipts?: readonly Receipt[];
 
@@ -157,6 +165,8 @@ export interface Script {
   readonly logsTooLargeOver?: number;
   /** A controller log query over more blocks than `over` is refused by the node, as it words it. */
   readonly logsCapped?: LogsCap;
+  /** The head of the replica that answers history walks, which lack every event after it. */
+  readonly walksLagBehind?: number;
   /**
    * The log queries whose answers arrive broken: indexed arguments and data cut off. `supply` breaks
    * every supply query, `pairedSupply` only the one-block query phase C sends for an activation.
@@ -208,10 +218,9 @@ export interface FakeNode {
   readonly sent: Sent;
   setReceipt(hash: TxHash, receipt: Receipt | null): void;
   setHeartbeatTimestamp(timestamp: number): void;
+  setSuspectedBy(entries: readonly SuspectRecord[]): void;
   readonly transport: (method: string, params: readonly unknown[]) => Promise<unknown>;
   readonly logQueries: LogQuery[];
-  /** The one-block queries by hash, in the order they were sent. */
-  readonly blockLogQueries: BlockLogQuery[];
   /** Moves the chain on, which is how a test reaches the checks a cycle makes against a fresh head. */
   advanceTo(head: number): void;
   /** Reports a head whose hash is not the canonical block at its number. */
@@ -221,7 +230,7 @@ export interface FakeNode {
 }
 
 export function fakeNode(script: Script): FakeNode {
-  const queries: Queries = { ranges: [], blocks: [] };
+  const queries: Queries = { ranges: [] };
   const state: NodeState = {
     ...script,
     isHeadForked: false,
@@ -244,8 +253,10 @@ export function fakeNode(script: Script): FakeNode {
     setHeartbeatTimestamp: (timestamp) => {
       Object.assign(state, { heartbeatTimestamp: timestamp });
     },
+    setSuspectedBy: (entries) => {
+      Object.assign(state, { suspectedBy: entries });
+    },
     logQueries: queries.ranges,
-    blockLogQueries: queries.blocks,
     advanceTo: (head) => {
       state.head = head;
     },
@@ -331,6 +342,10 @@ function callAnswer(script: Script, params: readonly unknown[]): unknown {
   if (data.startsWith(SELECTOR.getFlaggedBy)) {
     return encodeAbiParameters([{ type: 'address[]' }], [[...(script.flaggedBy ?? [])]]);
   }
+  const suspects = suspectAnswer(script, data);
+  if (suspects !== undefined) {
+    return suspects;
+  }
   if (data.startsWith(SELECTOR.guardianSignals)) {
     return padHex(script.controllerRegistry ?? REGISTRY, { size: 32 });
   }
@@ -344,6 +359,21 @@ function callAnswer(script: Script, params: readonly unknown[]): unknown {
   throw new Error(`the script has no answer for the call ${data.slice(0, 10)}`);
 }
 
+/** The registry's suspect reads, or undefined for another call. */
+function suspectAnswer(script: Script, data: string): unknown {
+  if (data.startsWith(SELECTOR.getSuspectedBy)) {
+    const entries = script.suspectedBy ?? [];
+    return encodeAbiParameters(
+      [{ type: 'address[]' }, { type: 'uint40[]' }],
+      [entries.map((entry) => entry.guardian), entries.map((entry) => entry.reportedAt)],
+    );
+  }
+  if (data.startsWith(SELECTOR.getSuspectWindow)) {
+    return padHex(numberToHex(script.suspectWindow ?? WEEK), { size: 32 });
+  }
+  return undefined;
+}
+
 function isWithin(value: number, from: number, to: number): boolean {
   const atOrAfter = value >= from;
   return atOrAfter ? value <= to : false;
@@ -351,11 +381,6 @@ function isWithin(value: number, from: number, to: number): boolean {
 
 function logAnswer(script: Script, params: readonly unknown[], queries: Queries): unknown {
   const filter = params[0];
-  if (isRecord(filter) && typeof filter.blockHash === 'string') {
-    queries.blocks.push({ address: text(filter, 'address'), blockHash: filter.blockHash });
-    return logsOfBlock(script, filter.blockHash);
-  }
-
   const from = Number(BigInt(text(filter, 'fromBlock')));
   const to = Number(BigInt(text(filter, 'toBlock')));
   const topics = list(filter, 'topics');
@@ -375,23 +400,14 @@ function logAnswer(script: Script, params: readonly unknown[], queries: Queries)
   }
   queries.ranges.push({ address: text(filter, 'address'), fromBlock: from, toBlock: to, topics });
 
-  const logs = selectedLogs(script, kind, from, to);
+  const logs = selectedLogs(script, kind, from, to).filter((log) => isServedToWalk(script, log, topics));
   return isBroken(script, kind, from === to) ? logs.map(undecodable) : logs;
 }
 
-/**
- * The controller's logs of one block, by hash: each lot's lifecycle log is served under the block
- * its receipt names, so a lot whose receipt names another block is not found in its supply's.
- */
-function logsOfBlock(script: Script, blockHash: string): LogRecord[] {
-  const lifecycle = lifecycleLogs(script);
-
-  return (script.lots ?? []).flatMap((lot, index) => {
-    const servedUnder = lot.receiptBlockHash ?? blockAt(lot.blockNumber).hash;
-    const record = lifecycle[index];
-
-    return servedUnder === blockHash && record !== undefined ? [record] : [];
-  });
+/** A walk names the borrower in a topic; a lagging replica answers it without the newest events. */
+function isServedToWalk(script: Script, log: LogRecord, topics: readonly unknown[]): boolean {
+  const isWalk = topics.length > 1 && script.walksLagBehind !== undefined;
+  return !isWalk || Number(BigInt(text(log, 'blockNumber'))) <= (script.walksLagBehind ?? 0);
 }
 
 function isBroken(script: Script, kind: LogKind, isOneBlock: boolean): boolean {
@@ -461,6 +477,7 @@ function lifecycleLogs(script: Script): LogRecord[] {
   return (script.lots ?? []).map((lot) =>
     logShape({
       blockNumber: lot.blockNumber,
+      blockHash: lot.controllerBlockHash,
       logIndex: lot.logIndex,
       transactionHash: txOf(lot),
       topics: [TOPIC[lot.kind], padHex(lot.borrower ?? BORROWER, { size: 32 })],
@@ -504,7 +521,7 @@ function receiptAnswer(script: NodeState, params: readonly unknown[]): unknown {
   const supply = supplyLogs(script).filter((log) => text(log, 'transactionHash') === hash);
   const lifecycle = lifecycleLogs(script).filter((log) => text(log, 'transactionHash') === hash);
   return {
-    blockHash: lot.receiptBlockHash ?? blockAt(lot.blockNumber).hash,
+    blockHash: lot.controllerBlockHash ?? blockAt(lot.blockNumber).hash,
     blockNumber: numberToHex(lot.blockNumber),
     transactionHash: hash,
     status: '0x1',
@@ -533,6 +550,8 @@ function heartbeatLog(entry: Heartbeat): LogRecord {
 /** Where a log sits and what it carries. The transaction index is zero unless a fixture orders by it. */
 interface LogFields {
   readonly blockNumber: number;
+  /** The hash the log names, or the hash of the block at its number. */
+  readonly blockHash?: Bytes32 | undefined;
   readonly transactionIndex?: number;
   readonly logIndex: number;
   readonly transactionHash: string;
@@ -549,7 +568,7 @@ function logShape(fields: LogFields): LogRecord {
     topics: fields.topics,
     data: fields.data,
     blockNumber: numberToHex(fields.blockNumber),
-    blockHash: blockAt(fields.blockNumber).hash,
+    blockHash: fields.blockHash ?? blockAt(fields.blockNumber).hash,
     transactionHash: fields.transactionHash,
     transactionIndex: numberToHex(fields.transactionIndex ?? 0),
     logIndex: numberToHex(fields.logIndex),

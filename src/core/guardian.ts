@@ -30,6 +30,7 @@ import { coverageDigest } from './digest.ts';
 import type { CoverageBounds } from './digest.ts';
 import type { ScreeningProvider } from './screening-provider.ts';
 import { GuardianStop } from './stop.ts';
+import { mapConcurrently } from '../common/concurrency.ts';
 import { requireDefined, requireInteger } from '../common/validation.ts';
 import { frozenCopy } from '../common/immutable.ts';
 import type { Address, BlockRef, Bytes32, ContractDeployment, MarketId } from '../common/types.ts';
@@ -54,8 +55,10 @@ interface GuardianConfig {
   readonly screening: ScreeningProvider;
   /** Distance from the observed head to the report block. Defaults to 2. */
   readonly reportBlockLag?: number;
-  /** Maximum concurrent flagger reads. Defaults to 8. */
-  readonly flaggerReadConcurrency?: number;
+  /** Registry reads of the targets kept open at once, such as their flags and recorded suspects. Defaults to 8. */
+  readonly readConcurrency?: number;
+  /** Maximum markets or controllers read at once in discovery, or candidate positions reconstructed. Defaults to 1. */
+  readonly historyReadConcurrency?: number;
   /** Confirmations between report batches, capped at txConfirmationBlocks. Defaults to 2. */
   readonly interBatchConfirmationBlocks?: number;
   /** Interval between shared report-confirmation checks. Defaults to one network slot. */
@@ -94,7 +97,9 @@ const BLOCKHASH_LOOKBACK = 256;
 
 const DEFAULT_REPORT_BLOCK_LAG = 2;
 
-const DEFAULT_FLAGGER_READ_CONCURRENCY = 8;
+const DEFAULT_READ_CONCURRENCY = 8;
+
+const DEFAULT_HISTORY_READ_CONCURRENCY = 1;
 
 const DEFAULT_INTER_BATCH_CONFIRMATION_BLOCKS = 2;
 
@@ -108,7 +113,11 @@ type GuardianState = GuardianConfig &
   Required<
     Pick<
       GuardianConfig,
-      'reportBlockLag' | 'flaggerReadConcurrency' | 'interBatchConfirmationBlocks' | 'confirmationPollIntervalMs'
+      | 'reportBlockLag'
+      | 'readConcurrency'
+      | 'historyReadConcurrency'
+      | 'interBatchConfirmationBlocks'
+      | 'confirmationPollIntervalMs'
     >
   > &
   (
@@ -159,8 +168,10 @@ export class Guardian {
   /**
    * Run one complete [scan cycle](../../docs/guardian-specification.md#scan-cycle). The caller owns
    * scheduling and recovery between calls; observe mode returns the screened result without writes.
+   * A plan that can no longer be attested once the work is reconstructed is stale before screening.
+   * Pass a stale outcome's `work` as `earlierWork` to the next attempt, which reuses what it reconstructed.
    */
-  async cycle(previousHeartbeatBlock?: BlockRef | null): Promise<CycleOutcome> {
+  async cycle(previousHeartbeatBlock?: BlockRef | null, earlierWork?: Work): Promise<CycleOutcome> {
     if (this.#activeCycle !== undefined) {
       throw new Error('another cycle is in progress');
     }
@@ -173,14 +184,7 @@ export class Guardian {
       if (planned.kind === 'nothing-due') {
         const outcome = frozenCopy(planned);
         emitEvent(this.#setup.onEvent, { event: 'cycle.planned', ...context, result: outcome });
-        emitEvent(this.#setup.onEvent, {
-          event: 'cycle.finished',
-          ...context,
-          startedAt,
-          finishedAt: Date.now(),
-          outcome,
-        });
-        return outcome;
+        return this.#finishCycle(context, startedAt, outcome);
       }
       const plan = planned;
       emitEvent(this.#setup.onEvent, { event: 'cycle.planned', ...context, result: plan });
@@ -192,7 +196,7 @@ export class Guardian {
         reportBlock: plan.discoveryRange.to,
         positions: discovered.all(),
       });
-      const work = await this.reconstructWork(discovered);
+      const work = await this.reconstructWork(discovered, earlierWork);
       emitEvent(this.#setup.onEvent, {
         event: 'cycle.reconstructed',
         ...context,
@@ -200,6 +204,14 @@ export class Guardian {
         positions: work.positions,
         anchors: work.all(),
       });
+      // An SDK safeguard with no step in the appendix: the plan check phase 5 makes before its first
+      // report runs here as well, so a plan that aged out, lost its report block or its stored
+      // heartbeat during reconstruction ends the attempt before screening, with the stale outcome the
+      // later check would return and the work for the next attempt.
+      const staleReason = await this.#planInvalidationReason(work);
+      if (staleReason !== null) {
+        return this.#finishCycle(context, startedAt, Object.freeze({ kind: 'stale', reason: staleReason, work }));
+      }
       const screened = await this.screenWork(work);
       emitEvent(this.#setup.onEvent, {
         event: 'cycle.screened',
@@ -217,15 +229,8 @@ export class Guardian {
               previousHeartbeatBlock: frozenCopy(work.previousHeartbeatBlock),
               screened,
             })
-          : frozenCopy(await this.signalAndHeartbeat(screened));
-      emitEvent(this.#setup.onEvent, {
-        event: 'cycle.finished',
-        ...context,
-        startedAt,
-        finishedAt: Date.now(),
-        outcome,
-      });
-      return outcome;
+          : attachWorkToStale(frozenCopy(await this.signalAndHeartbeat(screened)), work);
+      return this.#finishCycle(context, startedAt, outcome);
     } catch (error) {
       emitEvent(this.#setup.onEvent, {
         event: 'cycle.failed',
@@ -238,6 +243,12 @@ export class Guardian {
     } finally {
       this.#activeCycle = undefined;
     }
+  }
+
+  /** Report the outcome and hand it to the caller. */
+  #finishCycle(context: CycleContext, startedAt: number, outcome: CycleOutcome): CycleOutcome {
+    emitEvent(this.#setup.onEvent, { event: 'cycle.finished', ...context, startedAt, finishedAt: Date.now(), outcome });
+    return outcome;
   }
 
   /**
@@ -274,19 +285,43 @@ export class Guardian {
   async discoverCandidatePositions(plan: ScanPlan): Promise<Discovered> {
     const markets = new Markets(this.#rpc, this.#setup.deployment.lidoLend);
     await this.#requireCanonicalBlock(plan.discoveryRange.to);
-    const positions = await markets.discoverCandidatePositions(plan, this.#setup.deployment.guardianSignals.address);
+    const candidates = await markets.discoverCandidatePositions(
+      plan,
+      this.#setup.deployment.guardianSignals.address,
+      this.#setup.historyReadConcurrency,
+    );
     await this.#requireCanonicalBlock(plan.discoveryRange.to);
-    return new Discovered(plan, positions);
+    return new Discovered(plan, candidates);
   }
 
   /**
    * Rebuild the contributing supplies: [scan phase 3](../../docs/guardian-specification.md#scan-cycle)
    * and [Appendix C](../../docs/guardian-specification.md#c-reconstruct-the-contributors).
+   *
+   * A position of `earlierWork`, such as a stale attempt's, keeps its anchors when that work was
+   * reconstructed from the plan's previous heartbeat at a report block that is still canonical, and the
+   * newest lifecycle event that discovery read for the position is not after that block. That block's hash
+   * fixes the history below it, and every change of a lot is such an event, so a walk would find the same
+   * anchors: the work is the one a full reconstruction finds, and a retry walks only what changed. The
+   * decision rests on the events discovery read, not on another read that a lagging endpoint could answer
+   * without them.
+   *
+   * The report block is checked canonical before and after the walks, as around discovery, so an
+   * endpoint that moved to another branch meanwhile stops the attempt instead of feeding it a history.
    */
-  async reconstructWork(discovered: Discovered): Promise<Work> {
+  async reconstructWork(discovered: Discovered, earlierWork?: Work): Promise<Work> {
     const plan = discovered.plan();
     const markets = new Markets(this.#rpc, this.#setup.deployment.lidoLend);
-    const byPosition = await markets.reconstructWork(plan, discovered.all());
+    const reusableWork =
+      earlierWork !== undefined && (await this.#canReuse(earlierWork, plan)) ? earlierWork : undefined;
+    await this.#requireCanonicalBlock(plan.discoveryRange.to);
+    const byPosition = await markets.reconstructWork(
+      plan,
+      discovered.candidates(),
+      this.#setup.historyReadConcurrency,
+      reusableWork,
+    );
+    await this.#requireCanonicalBlock(plan.discoveryRange.to);
     return new Work(plan, byPosition);
   }
 
@@ -338,7 +373,8 @@ export class Guardian {
       // commits the same set, and a malformed input stops the attempt before the first report.
       const digest = coverageDigest(work.all(), this.#coverageDigestBounds(work));
 
-      const reported = await this.#submitRequiredSignals(screened, reportConfirmationTimeoutMs);
+      const recorded = await this.#recordedSuspects(work, screened.suspects);
+      const reported = await this.#submitRequiredSignals(screened, recorded, reportConfirmationTimeoutMs);
       if ('kind' in reported) {
         return reported;
       }
@@ -348,6 +384,10 @@ export class Guardian {
         return { kind: 'stale', reason: staleReason };
       }
       if (!(await this.#areAllReportsConfirmed(reported))) {
+        return { kind: 'stale', reason: 'report-no-longer-confirmed' };
+      }
+      const stillRecorded = await this.#recordedSuspects(work, [...recorded.keys()]);
+      if (stillRecorded.size !== recorded.size) {
         return { kind: 'stale', reason: 'report-no-longer-confirmed' };
       }
 
@@ -598,11 +638,28 @@ export class Guardian {
       kind: 'plan',
       previousHeartbeatBlock: previousHeartbeatEvidence.previousHeartbeatBlock,
       heartbeatTimestampAtStart: previousHeartbeatEvidence.heartbeatTimestampAtStart,
+      reportsSince: await this.#reportsSince(previousHeartbeatEvidence, lookbackAnchorNumber),
       discoveryRange: {
         from: await this.#rpc.getBlock(firstEventBlock),
         to: reportBlock,
       },
     });
+  }
+
+  /**
+   * From when this Guardian's own reports count for the current coverage: after the block that
+   * included the previous heartbeat, or after joining for a Guardian without one. A stored heartbeat
+   * without a reusable block leaves that unknown, so no recorded report counts.
+   */
+  async #reportsSince(evidence: PreviousHeartbeatEvidence, lookbackAnchorNumber: number): Promise<number | null> {
+    if (evidence.previousHeartbeatBlock !== null) {
+      return evidence.previousHeartbeatIncludedAt;
+    }
+    if (evidence.heartbeatTimestampAtStart !== 0) {
+      return null;
+    }
+    const joined = await this.#rpc.getBlock(lookbackAnchorNumber);
+    return joined.timestamp;
   }
 
   /**
@@ -628,6 +685,24 @@ export class Guardian {
     return membershipBlock;
   }
 
+  /**
+   * Whether `earlierWork` was reconstructed from the plan's previous heartbeat at a report block that is
+   * still canonical and not after the plan's. That block's hash commits to every block below it.
+   */
+  async #canReuse(earlierWork: Work, plan: ScanPlan): Promise<boolean> {
+    const earlierHeartbeat = earlierWork.previousHeartbeatBlock;
+    const currentHeartbeat = plan.previousHeartbeatBlock;
+    const isSameCoverage =
+      earlierHeartbeat === null || currentHeartbeat === null
+        ? earlierHeartbeat === currentHeartbeat
+        : earlierHeartbeat.hash === currentHeartbeat.hash;
+    if (!isSameCoverage || earlierWork.reportBlock.number > plan.discoveryRange.to.number) {
+      return false;
+    }
+    const seen = await this.#rpc.getBlock(earlierWork.reportBlock.number);
+    return seen.hash === earlierWork.reportBlock.hash;
+  }
+
   async #requireCanonicalBlock(block: BlockRef): Promise<void> {
     const seen = await this.#rpc.getBlock(block.number);
     if (seen.hash !== block.hash) {
@@ -638,31 +713,28 @@ export class Guardian {
   // ─── Screening: who is asked about, and what the answers require.
 
   /**
-   * Separate own-flagged targets from those needing provider screening at the report block.
-   * Bounded batches preserve target order; a failed read prevents screening and further batches.
+   * Separate own-flagged targets from those needing provider screening at the report block, in the
+   * order of the work. The flagger reads run `readConcurrency` at once; a failed read prevents screening.
    */
   async #screeningTargets(work: Work): Promise<ScreeningTargets> {
-    const entries = [...work.entries()];
+    const flagged = await mapConcurrently(
+      this.#setup.readConcurrency,
+      [...work.entries()],
+      async ([position, anchors]) => ({
+        target: { marketId: position.marketId, borrower: position.borrower },
+        anchors,
+        flaggedBy: await this.#registry.flaggedBy(position, work.reportBlock.hash),
+      }),
+    );
     const pending: PendingTarget[] = [];
     const skipped: SkippedTarget[] = [];
-    const { flaggerReadConcurrency } = this.#setup;
-    for (let from = 0; from < entries.length; from += flaggerReadConcurrency) {
-      const batch = entries.slice(from, from + flaggerReadConcurrency);
-      const flagged = await Promise.all(
-        batch.map(async ([position, anchors]) => ({
-          target: { marketId: position.marketId, borrower: position.borrower },
-          anchors,
-          flaggedBy: await this.#registry.flaggedBy(position, work.reportBlock.hash),
-        })),
-      );
-      for (const target of flagged) {
-        const hasOwnFlag = target.flaggedBy.some((flagger) => isAddressEqual(flagger, this.#setup.guardian));
-        if (hasOwnFlag) {
-          skipped.push(target);
-          continue;
-        }
-        pending.push({ target: target.target, anchors: target.anchors });
+    for (const target of flagged) {
+      const hasOwnFlag = target.flaggedBy.some((flagger) => isAddressEqual(flagger, this.#setup.guardian));
+      if (hasOwnFlag) {
+        skipped.push(target);
+        continue;
       }
+      pending.push({ target: target.target, anchors: target.anchors });
     }
     return { pending, skipped };
   }
@@ -684,15 +756,23 @@ export class Guardian {
     return idle >= this.#setup.idleHeartbeatInterval;
   }
 
-  /** Reports are grouped by kind and market; all targets in a group share one registry call. */
+  /**
+   * Reports are grouped by kind and market; all targets in a group share one registry call. A
+   * suspect this Guardian already recorded for this coverage is kept, not sent again.
+   */
   async #submitRequiredSignals(
     screened: Screened,
+    recorded: ReadonlyMap<SignalTarget, number>,
     reportConfirmationTimeoutMs: number,
   ): Promise<readonly ReceiptRef[] | Stale> {
     const work = screened.work();
+    const cycle = this.#activeCycle === undefined ? {} : this.#activeCycle;
+    for (const [target, recordedAt] of recorded) {
+      emitEvent(this.#setup.onEvent, { event: 'report.skipped', ...cycle, method: 'suspect', target, recordedAt });
+    }
     const reports: ReceiptRef[] = [];
     const groups = [
-      { kind: 'suspect', targets: screened.suspects },
+      { kind: 'suspect', targets: screened.suspects.filter((target) => !recorded.has(target)) },
       { kind: 'flag', targets: screened.flags },
     ] as const;
     for (const group of groups) {
@@ -858,6 +938,40 @@ export class Guardian {
     return null;
   }
 
+  /**
+   * This Guardian's recorded suspects among the targets, by when they were recorded. The
+   * [specification](../../docs/guardian-specification.md#scan-cycle) lets a repeated attempt keep a
+   * suspect recorded since the previous heartbeat. The SDK counts one only when it was recorded after
+   * the block that included that heartbeat, or after joining, has `txConfirmationBlocks`
+   * confirmations and is inside `suspectWindow`, and asks again right before the heartbeat, so the
+   * heartbeat never relies on a shallow or expired report. Nothing counts while `reportsSince` is unknown.
+   */
+  async #recordedSuspects(work: Work, targets: readonly SignalTarget[]): Promise<ReadonlyMap<SignalTarget, number>> {
+    const recorded = new Map<SignalTarget, number>();
+    if (work.reportsSince === null || targets.length === 0) {
+      return recorded;
+    }
+    const head = await this.#rpc.getBlock();
+    // The newest block with `txConfirmationBlocks` confirmations, or the genesis of a shorter chain.
+    const confirmed = await this.#rpc.getBlock(Math.max(head.number - this.#setup.txConfirmationBlocks + 1, 0));
+    const window = await this.#registry.suspectWindow(head.hash);
+    const records = await mapConcurrently(this.#setup.readConcurrency, targets, async (target) => ({
+      target,
+      recordedAt: await this.#registry.suspectRecordedAt(target, head.hash),
+    }));
+    for (const { target, recordedAt } of records) {
+      if (recordedAt === null || recordedAt <= work.reportsSince) {
+        continue;
+      }
+      const isConfirmed = recordedAt <= confirmed.timestamp;
+      const isInsideWindow = recordedAt + window >= head.timestamp;
+      if (isConfirmed && isInsideWindow) {
+        recorded.set(target, recordedAt);
+      }
+    }
+    return recorded;
+  }
+
   /** Reread every receipt immediately before committing coverage. */
   async #areAllReportsConfirmed(receipts: readonly ReceiptRef[]): Promise<boolean> {
     const head = await this.#rpc.getBlock();
@@ -898,7 +1012,8 @@ function validateSetup(setup: GuardianState): void {
   requireInteger('idleHeartbeatInterval', setup.idleHeartbeatInterval, { min: 1 });
   requireInteger('txConfirmationBlocks', setup.txConfirmationBlocks, { min: 1 });
   requireInteger('reportBlockLag', setup.reportBlockLag, { min: 1, max: BLOCKHASH_LOOKBACK - 1 });
-  requireInteger('flaggerReadConcurrency', setup.flaggerReadConcurrency, { min: 1 });
+  requireInteger('readConcurrency', setup.readConcurrency, { min: 1 });
+  requireInteger('historyReadConcurrency', setup.historyReadConcurrency, { min: 1 });
   requireInteger('interBatchConfirmationBlocks', setup.interBatchConfirmationBlocks, { min: 1 });
   requireInteger('confirmationPollIntervalMs', setup.confirmationPollIntervalMs, { min: 1, max: 2_147_483_647 });
   requireInteger('heartbeatReserveBlocks', setup.heartbeatReserveBlocks, {
@@ -916,6 +1031,11 @@ function validateSetup(setup: GuardianState): void {
       max: 2_147_483_647,
     });
   }
+}
+
+/** A stale result carries the attempt's work to the next attempt. */
+function attachWorkToStale(result: Attested | Stale | NothingDue, work: Work): Attested | Stale | NothingDue {
+  return result.kind === 'stale' ? Object.freeze({ ...result, work }) : result;
 }
 
 /** viem caches its verdict by the text of a value, so only a string may reach it. */
@@ -937,7 +1057,8 @@ function snapshotSetup(setup: GuardianSetup): GuardianState {
   }
   const {
     reportBlockLag = DEFAULT_REPORT_BLOCK_LAG,
-    flaggerReadConcurrency = DEFAULT_FLAGGER_READ_CONCURRENCY,
+    readConcurrency = DEFAULT_READ_CONCURRENCY,
+    historyReadConcurrency = DEFAULT_HISTORY_READ_CONCURRENCY,
     interBatchConfirmationBlocks = DEFAULT_INTER_BATCH_CONFIRMATION_BLOCKS,
     confirmationPollIntervalMs = setup.deployment.slotSeconds * MILLISECONDS_PER_SECOND,
   } = setup;
@@ -946,7 +1067,8 @@ function snapshotSetup(setup: GuardianSetup): GuardianState {
     guardian: setup.guardian,
     screening: setup.screening,
     reportBlockLag,
-    flaggerReadConcurrency,
+    readConcurrency,
+    historyReadConcurrency,
     interBatchConfirmationBlocks,
     confirmationPollIntervalMs,
     idleHeartbeatInterval: setup.idleHeartbeatInterval,

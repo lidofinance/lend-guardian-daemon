@@ -149,6 +149,14 @@ export type SdkEvent =
       readonly transactionHash: TxHash;
       readonly receiptStatus: 'success';
       readonly receiptBlockHash: Bytes32;
+    }
+  | {
+      /** A suspect this Guardian recorded since the previous heartbeat, kept instead of sent again. */
+      readonly event: 'report.skipped';
+      readonly cycleId?: string;
+      readonly method: 'suspect';
+      readonly target: SignalTarget;
+      readonly recordedAt: number;
     };
 
 /**

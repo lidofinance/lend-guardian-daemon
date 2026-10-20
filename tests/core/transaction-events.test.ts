@@ -185,6 +185,7 @@ function batches(size = 1, useFixedReceipt = false) {
         kind: 'plan',
         previousHeartbeatBlock: null,
         heartbeatTimestampAtStart: 0,
+        reportsSince: null,
         discoveryRange: { from: reportBlock, to: reportBlock },
       },
       new Map(),

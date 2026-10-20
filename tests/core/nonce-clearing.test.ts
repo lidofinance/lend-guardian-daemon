@@ -119,7 +119,7 @@ function recoveryFixture(overrides: NonceOverrides = {}) {
     guardian: GUARDIAN,
     screening: { screen: () => Promise.resolve([]) },
     reportBlockLag: 2,
-    flaggerReadConcurrency: 8,
+    readConcurrency: 8,
     interBatchConfirmationBlocks: 2,
     confirmationPollIntervalMs: 1,
     idleHeartbeatInterval: 3_600,

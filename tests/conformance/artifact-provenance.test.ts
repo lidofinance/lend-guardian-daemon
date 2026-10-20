@@ -13,7 +13,7 @@ import type { ArtifactName } from './fixtures/anvil.ts';
 
 const ARTIFACT_HASHES: Readonly<Record<ArtifactName, { readonly sha256: string; readonly bytecodeSha256: string }>> = {
   'GuardianSignals.json': {
-    sha256: '4ba561ef0a1d7dd38db1c0a7f8b7cf7fd58f21b9ed73847ad604209618da2950',
+    sha256: '463ac0712f98397977b9ccfdd9c81d6baf43ef43909f79706dc1159506c32970',
     bytecodeSha256: '0304f4faa89addfbd8b7a2c7da4d34b5e2f42a652087adc4262a2f7e0304a88c',
   },
   'OssifiableProxy.json': {

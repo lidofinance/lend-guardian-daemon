@@ -89,6 +89,7 @@ test('an orphaned first report stops Guardian before its second batch or heartbe
       kind: 'plan',
       previousHeartbeatBlock: null,
       heartbeatTimestampAtStart: 0,
+      reportsSince: null,
       discoveryRange: { from: reportBlock, to: reportBlock },
     },
     new Map(),
