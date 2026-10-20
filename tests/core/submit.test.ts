@@ -5,6 +5,7 @@ import { SEND_TIMEOUT_MS, signingClient } from './client.ts';
 import test from 'node:test';
 import * as core from '../../src/core/index.ts';
 import { coverageDigest } from '../../src/core/digest.ts';
+import { setImmediate } from 'node:timers/promises';
 import { encodeFunctionData } from 'viem';
 import { GUARDIAN_SIGNALS_ABI } from '../../abi/GuardianSignals.abi.ts';
 import type { ScreeningResult } from '../../src/core/screening-provider.ts';
@@ -16,6 +17,8 @@ import { guardianOver, IDLE_HEARTBEAT_SECONDS } from './setup.ts';
 
 const HEAD = 200_000;
 const REPORT = HEAD - 2;
+/** The block the fake node includes the first sent transaction in. */
+const INCLUDED = HEAD + 1;
 const TARGET = { marketId: MARKET, borrower: BORROWER };
 const LOT: Lot = {
   kind: 'activating',
@@ -146,7 +149,7 @@ for (const kind of ['missing', 'reverted', 'relocated', 'orphaned', 'wrong-trans
         node.setReceipt(hash, null);
         return;
       }
-      const number = kind === 'relocated' ? HEAD - 21 : HEAD - 20;
+      const number = kind === 'relocated' ? INCLUDED - 1 : INCLUDED;
       node.setReceipt(hash, {
         transactionHash: kind === 'wrong-transaction' ? blockAt(123).hash : hash,
         blockNumber: number,
@@ -334,10 +337,12 @@ test('rechecks the plan while waiting for all report confirmations', { timeout: 
     if (method === 'eth_sendRawTransaction') {
       const transaction = node.sent.transactions[0];
       assert.ok(transaction !== undefined);
+      // Two confirmations, short of full depth.
+      node.advanceTo(INCLUDED + 1);
       node.setReceipt(transaction.hash, {
         transactionHash: transaction.hash,
-        blockNumber: HEAD - 1,
-        blockHash: blockAt(HEAD - 1).hash,
+        blockNumber: INCLUDED,
+        blockHash: blockAt(INCLUDED).hash,
         status: 'success',
       });
     }
@@ -352,9 +357,7 @@ test('rechecks the plan while waiting for all report confirmations', { timeout: 
   const submitting = built.guardian.signalAndHeartbeat(built.screened);
   assert.equal(await Promise.race([waiting.then(() => 'waiting'), submitting.then(() => 'finished')]), 'waiting');
   // Let the real full-depth wait start before changing the head; the next slot must recheck the plan.
-  await new Promise<void>((resolve) => {
-    setImmediate(resolve);
-  });
+  await setImmediate();
   assert.deepEqual(built.sent.calls, ['flags']);
   built.node.advanceTo(REPORT + 250);
   assert.deepEqual(await submitting, { kind: 'stale', reason: 'report-block-aged-out' });
@@ -496,10 +499,11 @@ test('shared report confirmation stops when the client delivery budget ends', { 
         const transaction = node.sent.transactions[0];
         assert.ok(transaction !== undefined);
         // Deep enough for the batch, and one block short of every deeper requirement.
+        node.advanceTo(INCLUDED);
         node.setReceipt(transaction.hash, {
           transactionHash: transaction.hash,
-          blockNumber: HEAD,
-          blockHash: blockAt(HEAD).hash,
+          blockNumber: INCLUDED,
+          blockHash: blockAt(INCLUDED).hash,
           status: 'success',
         });
       }
@@ -778,11 +782,28 @@ test('a client that answers the flag batch with the suspect receipt stops the at
 /** A client that answers every send with the receipt of its first, as a broken adapter might. */
 function repeatingClient(client: core.RpcClient): core.RpcClient {
   const first: { receipt?: core.ReceiptRef } = {};
-  const send: core.RpcClient['send'] = async (transaction, options) => {
+  return withSend(client, async (transaction, options) => {
     const receipt = await client.send(transaction, options);
     first.receipt ??= receipt;
     return first.receipt;
-  };
+  });
+}
+
+/**
+ * A client that answers every send with the receipt of the same call in `block`, as an adapter that
+ * returns the receipt of an earlier identical call might: the node then holds the call in that block.
+ */
+function earlierReceiptClient(client: core.RpcClient, node: FakeNode, block: core.BlockRef): core.RpcClient {
+  return withSend(client, async (transaction, options) => {
+    const { transactionHash } = await client.send(transaction, options);
+    const earlier = { transactionHash, blockNumber: block.number, blockHash: block.hash };
+    node.setReceipt(transactionHash, { ...earlier, status: 'success' });
+    return earlier;
+  });
+}
+
+/** `client` with another `send`; every other member is the client's own. */
+function withSend(client: core.RpcClient, send: core.RpcClient['send']): core.RpcClient {
   return new Proxy(client, {
     get: (target, property): unknown => {
       if (property === 'send') {
@@ -793,3 +814,122 @@ function repeatingClient(client: core.RpcClient): core.RpcClient {
     },
   });
 }
+
+// ── A receipt the heartbeat relies on must come from this attempt, and its reread must not outlive the attempt.
+
+const FLAG: ScreeningResult = { status: 'judged', requiresSuspect: false, requiresFlag: true };
+
+/** The previous heartbeat reported block 150,000; a deposit after it is due by the report block. */
+const DEPOSIT_AFTER_HEARTBEAT: Script = {
+  head: HEAD,
+  guardianAddedAt: 1_000,
+  heartbeatTimestamp: blockAt(150_000).timestamp,
+  heartbeats: [{ blockNumber: 150_000, timestamp: blockAt(150_000).timestamp, includedAt: 150_003 }],
+  lots: [
+    {
+      kind: 'activating',
+      blockNumber: HEAD - 50,
+      logIndex: 4,
+      amount: 5n,
+      position: { dust: 0n, activating: 5n, activatingStart: blockAt(HEAD - 50).timestamp, activatingDelay: 60 },
+      supplied: 5n,
+    },
+  ],
+  // This Guardian suspected the borrower in block 100,000, before the previous heartbeat.
+  suspectedBy: ownSuspect(blockAt(100_000).timestamp),
+};
+
+for (const report of ['suspect', 'flag'] as const) {
+  test(`a ${report} receipt of an identical call from before the report block stops the attempt before heartbeat`, async () => {
+    const node = fakeNode(DEPOSIT_AFTER_HEARTBEAT);
+    const result: ScreeningResult = {
+      status: 'judged',
+      requiresSuspect: report === 'suspect',
+      requiresFlag: report === 'flag',
+    };
+    const { guardian } = guardianOver(DEPOSIT_AFTER_HEARTBEAT, {
+      client: earlierReceiptClient(signingClient([{ node: node.transport }]), node, blockAt(100_000)),
+      screening: { screen: (request) => Promise.resolve(request.anchors.map(() => result)) },
+    });
+
+    await assert.rejects(guardian.cycle(), stopsWith('report-receipt-foreign'));
+
+    assert.deepEqual(node.sent.calls, [report === 'suspect' ? 'suspects' : 'flags']);
+  });
+}
+
+test('a failed reread of a report stops the attempt with no read left open', async () => {
+  const node = fakeNode(ONE_DUE);
+  let release = (): void => undefined;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let open = 0;
+  let receiptReads = 0;
+  let isRereading = false;
+  const transport: NodeRequest = async (method, params) => {
+    open += 1;
+    try {
+      if (method === 'eth_getTransactionReceipt' && params[0] === node.sent.transactions[0]?.hash) {
+        receiptReads += 1;
+        // The client reads the receipt three times; the fourth read is the Guardian's reread.
+        if (receiptReads === 4) {
+          isRereading = true;
+          await setImmediate();
+          throw Object.assign(new Error('receipt reread failed'), { code: -32602 });
+        }
+      }
+      if (isRereading) {
+        // A read that starts beside the failed one stays open until the test ends.
+        await released;
+      }
+      return await node.transport(method, params);
+    } finally {
+      open -= 1;
+    }
+  };
+  const { guardian } = guardianOver(ONE_DUE, {
+    endpoints: [{ node: transport }],
+    screening: { screen: (request) => Promise.resolve(request.anchors.map(() => FLAG)) },
+  });
+
+  await assert.rejects(guardian.cycle(), /receipt reread failed/);
+
+  assert.equal(open, 0);
+  assert.deepEqual(node.sent.calls, ['flags']);
+  release();
+});
+
+test('the reread of the reports keeps at most readConcurrency reads open', async () => {
+  const node = fakeNode(ONE_DUE);
+  let open = 0;
+  let most = 0;
+  let isRereading = false;
+  const transport: NodeRequest = async (method, params) => {
+    // Only the reread asks for transactions by hash; the heartbeat ends the measurement.
+    isRereading ||= method === 'eth_getTransactionByHash';
+    open += 1;
+    most = isRereading ? Math.max(most, open) : most;
+    await setImmediate();
+    open -= 1;
+    return node.transport(method, params);
+  };
+  const both: ScreeningResult = { status: 'judged', requiresSuspect: true, requiresFlag: true };
+  const { guardian } = guardianOver(ONE_DUE, {
+    readConcurrency: 2,
+    endpoints: [{ node: transport }],
+    screening: { screen: (request) => Promise.resolve(request.anchors.map(() => both)) },
+    onEvent: (event) => {
+      if (event.event === 'report.started' && event.context.method === 'heartbeat') {
+        isRereading = false;
+      }
+    },
+  });
+
+  const outcome = await guardian.cycle();
+
+  assert.equal(outcome.kind, 'attested');
+  assert.deepEqual(node.sent.calls, ['suspects', 'flags', 'heartbeat']);
+  // The reread before the heartbeat checks both reports at once, each with one read open at a time.
+  assert.equal(most, 2);
+});

@@ -648,10 +648,14 @@ async function recordTransaction(script: NodeState, raw: unknown): Promise<TxHas
     nonce: transaction.nonce ?? 0,
     chainId: transaction.chainId ?? 0,
   });
+  // The transaction lands after the head, so after the report block as on a real chain, and the head
+  // moves twenty blocks on, deep enough for every depth the tests ask for.
+  const includedAt = script.head + 1;
+  script.head = includedAt + 20;
   script.submitted.set(hash, {
     transactionHash: hash,
-    blockNumber: script.head - 20,
-    blockHash: blockAt(script.head - 20).hash,
+    blockNumber: includedAt,
+    blockHash: blockAt(includedAt).hash,
     status: 'success',
   });
   return hash;

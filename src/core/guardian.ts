@@ -389,7 +389,7 @@ export class Guardian {
       if (staleReason !== null) {
         return { kind: 'stale', reason: staleReason };
       }
-      if (!(await this.#areAllReportsConfirmed(reported))) {
+      if (!(await this.#areAllReportsConfirmed(work, reported))) {
         return { kind: 'stale', reason: 'report-no-longer-confirmed' };
       }
       const stillRecorded = await this.#recordedSuspects(work, [...recorded.keys()]);
@@ -848,7 +848,7 @@ export class Guardian {
         ({ receipt }) => head.number - receipt.blockNumber + 1 >= this.#setup.txConfirmationBlocks,
       );
       if (deepEnough) {
-        return (await this.#areAllReportsConfirmed(reports))
+        return (await this.#areAllReportsConfirmed(work, reports))
           ? null
           : { kind: 'stale', reason: 'report-no-longer-confirmed' };
       }
@@ -872,7 +872,7 @@ export class Guardian {
       context,
     });
     const heartbeat = receipt.transactionHash;
-    if (!(await this.#isReportConfirmed({ context, receipt }, await this.#rpc.getBlock()))) {
+    if (!(await this.#isReportConfirmed({ context, receipt }, work.reportBlock, await this.#rpc.getBlock()))) {
       throw new Error(`Heartbeat ${heartbeat} is no longer confirmed`);
     }
     this.#emitConfirmedReport(context, receipt);
@@ -970,25 +970,29 @@ export class Guardian {
     return recorded;
   }
 
-  /** Reread every receipt immediately before committing coverage. */
-  async #areAllReportsConfirmed(reports: readonly SentReport[]): Promise<boolean> {
+  /** Reread every receipt immediately before committing coverage, `readConcurrency` reports at once. */
+  async #areAllReportsConfirmed(work: Work, reports: readonly SentReport[]): Promise<boolean> {
     const head = await this.#rpc.getBlock();
-    for (const report of reports) {
-      if (!(await this.#isReportConfirmed(report, head))) {
-        return false;
-      }
-    }
-    return true;
+    const confirmed = await mapConcurrently(this.#setup.readConcurrency, reports, (report) =>
+      this.#isReportConfirmed(report, work.reportBlock, head),
+    );
+    return confirmed.every(Boolean);
   }
 
   /**
    * Whether a report is still confirmed and is the report that was sent. The receipt and the
    * transaction behind it are read again through the client's plain reads rather than its verdict,
    * so a client that confirms the wrong transaction cannot pass the heartbeat gate: the transaction
-   * must be this Guardian's signer calling the registry with the report's own calldata, and anything
-   * else is a broken client rather than chain state, which stops the attempt.
+   * must be this Guardian's signer calling the registry with the report's own calldata, in a block
+   * after the report block, since the attempt sends only after choosing that block and an identical
+   * call from an earlier coverage names the same signer, registry and calldata. Anything else is a
+   * broken client rather than chain state, which stops the attempt. The reads run one after another,
+   * so `readConcurrency` bounds the reads open at once and none outlives a failed one.
    */
-  async #isReportConfirmed({ context, receipt }: SentReport, head: BlockRef): Promise<boolean> {
+  async #isReportConfirmed({ context, receipt }: SentReport, reportBlock: BlockRef, head: BlockRef): Promise<boolean> {
+    if (receipt.blockNumber <= reportBlock.number) {
+      throw new GuardianStop('report-receipt-foreign');
+    }
     const landed = await this.#rpc.getReceipt(receipt.transactionHash);
     if (landed?.status !== 'success') {
       return false;
