@@ -375,7 +375,7 @@ test('the RPC client validates the range limit before any request', () => {
 
 for (const field of [
   'reportBlockLag',
-  'flaggerReadConcurrency',
+  'readConcurrency',
   'historyReadConcurrency',
   'interBatchConfirmationBlocks',
   'confirmationPollIntervalMs',

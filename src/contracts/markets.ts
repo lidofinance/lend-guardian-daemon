@@ -22,6 +22,7 @@ import type { PositionKey, SupplyAnchor } from '../core/types.ts';
 import { GuardianStop } from '../core/stop.ts';
 import { lower } from '../common/types.ts';
 import type { Address, BlockRef, Bytes32, ContractDeployment, MarketId, TxHash } from '../common/types.ts';
+import { mapConcurrently } from '../common/concurrency.ts';
 
 /**
  * Where a log sits. Reconstruction walks lifecycle events strictly backwards, so it sorts them by the
@@ -190,7 +191,7 @@ export class Markets {
       reusableWork === undefined
         ? new Map<string, readonly SupplyAnchor[]>()
         : await this.#findUnchangedAnchors(reusableWork, plan.discoveryRange.to.number, concurrency);
-    const walks = await readInBatches(positions, concurrency, async (position) => ({
+    const walks = await mapConcurrently(concurrency, positions, async (position) => ({
       position,
       anchors:
         unchangedAnchors.get(`${position.controller}:${position.borrower}`) ??
@@ -316,7 +317,7 @@ export class Markets {
     at: Bytes32,
     concurrency: number,
   ): Promise<TargetSupply[]> {
-    const controllers = await readInBatches(supplies, concurrency, (supply) =>
+    const controllers = await mapConcurrently(concurrency, supplies, (supply) =>
       this.#findTargetController(supply.marketId, targetRegistry, at),
     );
     return supplies.flatMap((supply, index) => {
@@ -358,7 +359,7 @@ export class Markets {
       ...targetSupplies.map((target) => target.controller),
       ...candidates.listControllers(),
     ]);
-    await readInBatches([...controllers], concurrency, async (controller) => {
+    await mapConcurrently(concurrency, [...controllers], async (controller) => {
       const eventFilter = { address: controller, topics: [LIFECYCLE_TOPICS], ...blocksToRead };
       for await (const eventLogs of this.#rpc.logBatches(eventFilter, 'forward')) {
         const events = decodeLogs(MARKET_CONTROLLER_ABI, eventLogs);
@@ -387,7 +388,7 @@ export class Markets {
       controllers.add(position.controller);
     }
     const blocksToRead = { fromBlock: reusableWork.reportBlock.number + 1, toBlock: reportBlockNumber };
-    await readInBatches([...controllers], concurrency, async (controller) => {
+    await mapConcurrently(concurrency, [...controllers], async (controller) => {
       const eventFilter = { address: controller, topics: [LIFECYCLE_TOPICS], ...blocksToRead };
       for await (const eventLogs of this.#rpc.logBatches(eventFilter, 'forward')) {
         for (const event of decodeLogs(MARKET_CONTROLLER_ABI, eventLogs)) {
@@ -404,7 +405,7 @@ export class Markets {
     blocksToRead: { readonly fromBlock: number; readonly toBlock: number },
     concurrency: number,
   ): Promise<void> {
-    await readInBatches(candidates.listControllers(), concurrency, async (controller) => {
+    await mapConcurrently(concurrency, candidates.listControllers(), async (controller) => {
       const eventFilter = { address: controller, topics: [LIFECYCLE_TOPICS], ...blocksToRead };
       for await (const eventLogs of this.#rpc.logBatches(eventFilter, 'forward')) {
         candidates.applyEvents(decodeLogs(MARKET_CONTROLLER_ABI, eventLogs));
@@ -700,26 +701,4 @@ class CandidatePositions {
   list(): Candidate[] {
     return [...this.#candidatesById.values()];
   }
-}
-
-/**
- * Read `items` `concurrency` at a time, in their order. Every read of a batch settles before the first
- * failure in item order ends the call, so no read outlives it.
- */
-async function readInBatches<Item, Result>(
-  items: readonly Item[],
-  concurrency: number,
-  read: (item: Item) => Promise<Result>,
-): Promise<Result[]> {
-  const results: Result[] = [];
-  for (let from = 0; from < items.length; from += concurrency) {
-    const batch = await Promise.allSettled(items.slice(from, from + concurrency).map(read));
-    for (const outcome of batch) {
-      if (outcome.status === 'rejected') {
-        throw outcome.reason;
-      }
-      results.push(outcome.value);
-    }
-  }
-  return results;
 }

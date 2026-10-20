@@ -30,6 +30,7 @@ import { coverageDigest } from './digest.ts';
 import type { CoverageBounds } from './digest.ts';
 import type { ScreeningProvider } from './screening-provider.ts';
 import { GuardianStop } from './stop.ts';
+import { mapConcurrently } from '../common/concurrency.ts';
 import { requireDefined, requireInteger } from '../common/validation.ts';
 import { frozenCopy } from '../common/immutable.ts';
 import type { Address, BlockRef, Bytes32, ContractDeployment, MarketId } from '../common/types.ts';
@@ -54,8 +55,8 @@ interface GuardianConfig {
   readonly screening: ScreeningProvider;
   /** Distance from the observed head to the report block. Defaults to 2. */
   readonly reportBlockLag?: number;
-  /** Maximum concurrent flagger reads. Defaults to 8. */
-  readonly flaggerReadConcurrency?: number;
+  /** Registry reads of the targets kept open at once, such as their flags and recorded suspects. Defaults to 8. */
+  readonly readConcurrency?: number;
   /** Maximum markets or controllers read at once in discovery, or candidate positions reconstructed. Defaults to 1. */
   readonly historyReadConcurrency?: number;
   /** Confirmations between report batches, capped at txConfirmationBlocks. Defaults to 2. */
@@ -96,7 +97,7 @@ const BLOCKHASH_LOOKBACK = 256;
 
 const DEFAULT_REPORT_BLOCK_LAG = 2;
 
-const DEFAULT_FLAGGER_READ_CONCURRENCY = 8;
+const DEFAULT_READ_CONCURRENCY = 8;
 
 const DEFAULT_HISTORY_READ_CONCURRENCY = 1;
 
@@ -113,7 +114,7 @@ type GuardianState = GuardianConfig &
     Pick<
       GuardianConfig,
       | 'reportBlockLag'
-      | 'flaggerReadConcurrency'
+      | 'readConcurrency'
       | 'historyReadConcurrency'
       | 'interBatchConfirmationBlocks'
       | 'confirmationPollIntervalMs'
@@ -702,31 +703,28 @@ export class Guardian {
   // ─── Screening: who is asked about, and what the answers require.
 
   /**
-   * Separate own-flagged targets from those needing provider screening at the report block.
-   * Bounded batches preserve target order; a failed read prevents screening and further batches.
+   * Separate own-flagged targets from those needing provider screening at the report block, in the
+   * order of the work. The flagger reads run `readConcurrency` at once; a failed read prevents screening.
    */
   async #screeningTargets(work: Work): Promise<ScreeningTargets> {
-    const entries = [...work.entries()];
+    const flagged = await mapConcurrently(
+      this.#setup.readConcurrency,
+      [...work.entries()],
+      async ([position, anchors]) => ({
+        target: { marketId: position.marketId, borrower: position.borrower },
+        anchors,
+        flaggedBy: await this.#registry.flaggedBy(position, work.reportBlock.hash),
+      }),
+    );
     const pending: PendingTarget[] = [];
     const skipped: SkippedTarget[] = [];
-    const { flaggerReadConcurrency } = this.#setup;
-    for (let from = 0; from < entries.length; from += flaggerReadConcurrency) {
-      const batch = entries.slice(from, from + flaggerReadConcurrency);
-      const flagged = await Promise.all(
-        batch.map(async ([position, anchors]) => ({
-          target: { marketId: position.marketId, borrower: position.borrower },
-          anchors,
-          flaggedBy: await this.#registry.flaggedBy(position, work.reportBlock.hash),
-        })),
-      );
-      for (const target of flagged) {
-        const hasOwnFlag = target.flaggedBy.some((flagger) => isAddressEqual(flagger, this.#setup.guardian));
-        if (hasOwnFlag) {
-          skipped.push(target);
-          continue;
-        }
-        pending.push({ target: target.target, anchors: target.anchors });
+    for (const target of flagged) {
+      const hasOwnFlag = target.flaggedBy.some((flagger) => isAddressEqual(flagger, this.#setup.guardian));
+      if (hasOwnFlag) {
+        skipped.push(target);
+        continue;
       }
+      pending.push({ target: target.target, anchors: target.anchors });
     }
     return { pending, skipped };
   }
@@ -947,8 +945,11 @@ export class Guardian {
     // The newest block with `txConfirmationBlocks` confirmations, or the genesis of a shorter chain.
     const confirmed = await this.#rpc.getBlock(Math.max(head.number - this.#setup.txConfirmationBlocks + 1, 0));
     const window = await this.#registry.suspectWindow(head.hash);
-    for (const target of targets) {
-      const recordedAt = await this.#registry.suspectRecordedAt(target, head.hash);
+    const records = await mapConcurrently(this.#setup.readConcurrency, targets, async (target) => ({
+      target,
+      recordedAt: await this.#registry.suspectRecordedAt(target, head.hash),
+    }));
+    for (const { target, recordedAt } of records) {
       if (recordedAt === null || recordedAt <= work.reportsSince) {
         continue;
       }
@@ -1001,7 +1002,7 @@ function validateSetup(setup: GuardianState): void {
   requireInteger('idleHeartbeatInterval', setup.idleHeartbeatInterval, { min: 1 });
   requireInteger('txConfirmationBlocks', setup.txConfirmationBlocks, { min: 1 });
   requireInteger('reportBlockLag', setup.reportBlockLag, { min: 1, max: BLOCKHASH_LOOKBACK - 1 });
-  requireInteger('flaggerReadConcurrency', setup.flaggerReadConcurrency, { min: 1 });
+  requireInteger('readConcurrency', setup.readConcurrency, { min: 1 });
   requireInteger('historyReadConcurrency', setup.historyReadConcurrency, { min: 1 });
   requireInteger('interBatchConfirmationBlocks', setup.interBatchConfirmationBlocks, { min: 1 });
   requireInteger('confirmationPollIntervalMs', setup.confirmationPollIntervalMs, { min: 1, max: 2_147_483_647 });
@@ -1046,7 +1047,7 @@ function snapshotSetup(setup: GuardianSetup): GuardianState {
   }
   const {
     reportBlockLag = DEFAULT_REPORT_BLOCK_LAG,
-    flaggerReadConcurrency = DEFAULT_FLAGGER_READ_CONCURRENCY,
+    readConcurrency = DEFAULT_READ_CONCURRENCY,
     historyReadConcurrency = DEFAULT_HISTORY_READ_CONCURRENCY,
     interBatchConfirmationBlocks = DEFAULT_INTER_BATCH_CONFIRMATION_BLOCKS,
     confirmationPollIntervalMs = setup.deployment.slotSeconds * MILLISECONDS_PER_SECOND,
@@ -1056,7 +1057,7 @@ function snapshotSetup(setup: GuardianSetup): GuardianState {
     guardian: setup.guardian,
     screening: setup.screening,
     reportBlockLag,
-    flaggerReadConcurrency,
+    readConcurrency,
     historyReadConcurrency,
     interBatchConfirmationBlocks,
     confirmationPollIntervalMs,

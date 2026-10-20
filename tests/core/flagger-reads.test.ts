@@ -1,7 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setImmediate } from 'node:timers/promises';
-import { decodeFunctionData, encodeAbiParameters, isHex, numberToHex, padHex } from 'viem';
+import {
+  decodeFunctionData,
+  encodeAbiParameters,
+  getAbiItem,
+  isHex,
+  numberToHex,
+  padHex,
+  toFunctionSelector,
+} from 'viem';
 import { GUARDIAN_SIGNALS_ABI } from '../../abi/GuardianSignals.abi.ts';
 import { Work } from '../../src/core/outcomes.ts';
 import type { PositionKey } from '../../src/core/types.ts';
@@ -11,14 +19,16 @@ import type { ScreeningRequest } from '../../src/core/screening-provider.ts';
 import type { SignalTarget } from '../../src/core/types.ts';
 import type { Address } from '../../src/common/types.ts';
 import { lower } from '../../src/common/types.ts';
-import { blockAt, BORROWER, CONTROLLER, CORE, GUARDIAN, REGISTRY } from './fake-node.ts';
+import { isRecord } from '../../src/common/validation.ts';
+import { blockAt, BORROWER, CONTROLLER, CORE, fakeNode, GUARDIAN, REGISTRY } from './fake-node.ts';
 import { guardianOver } from './setup.ts';
 
 const HEAD = 200_000;
 const OTHER_GUARDIAN: Address = '0x0000000000000000000000000000000000000001';
+const GET_SUSPECTED_BY = toFunctionSelector(getAbiItem({ abi: GUARDIAN_SIGNALS_ABI, name: 'getSuspectedBy' }));
 
 /** Distinct targets exercise several flagger batches without relying on discovery fixtures. */
-function workFor(count: number): Work {
+function workFor(count: number, reportsSince: number | null = null): Work {
   const entries = Array.from({ length: count }, (_unused, index): [PositionKey, SupplyAnchor[]] => {
     const marketId = padHex(numberToHex(index + 1), { size: 32 });
     const target = { controller: CONTROLLER, marketId, borrower: BORROWER };
@@ -37,7 +47,7 @@ function workFor(count: number): Work {
       kind: 'plan',
       previousHeartbeatBlock: null,
       heartbeatTimestampAtStart: 0,
-      reportsSince: null,
+      reportsSince,
       discoveryRange: { from: blockAt(99_600), to: blockAt(HEAD - 2) },
     },
     new Map(entries),
@@ -228,13 +238,13 @@ test('empty work performs no flagger reads or provider calls', async () => {
 });
 
 for (const limit of [1, 3]) {
-  test(`configured concurrency limits flagger batches to ${limit} while retaining every source`, async () => {
+  test(`readConcurrency limits flagger reads to ${limit} at once while retaining every source`, async () => {
     const node = controlledNode();
     const work = workFor(7);
     const { guardian } = guardianOver(
       { head: HEAD },
       {
-        flaggerReadConcurrency: limit,
+        readConcurrency: limit,
         endpoints: [{ node: node.transport }],
       },
     );
@@ -253,3 +263,50 @@ for (const limit of [1, 3]) {
     );
   });
 }
+
+test('recorded suspect reads stay within readConcurrency and cover every target', async () => {
+  const joined = 1_000;
+  const node = fakeNode({
+    head: HEAD,
+    guardianAddedAt: joined,
+    suspectedBy: [{ guardian: GUARDIAN, reportedAt: blockAt(HEAD - 100).timestamp }],
+  });
+  let open = 0;
+  let most = 0;
+  let reads = 0;
+  const counting: NodeRequest = async (method, params) => {
+    const call = params[0];
+    const data = isRecord(call) ? String(call.data) : '';
+    if (!data.startsWith(GET_SUSPECTED_BY)) {
+      return node.transport(method, params);
+    }
+    reads += 1;
+    open += 1;
+    most = Math.max(most, open);
+    await setImmediate();
+    open -= 1;
+    return node.transport(method, params);
+  };
+  const { guardian } = guardianOver(
+    { head: HEAD },
+    {
+      readConcurrency: 3,
+      endpoints: [{ node: counting }],
+      screening: {
+        screen: (request) =>
+          Promise.resolve(
+            request.anchors.map(() => ({ status: 'judged', requiresSuspect: true, requiresFlag: false })),
+          ),
+      },
+    },
+  );
+
+  const outcome = await guardian.signalAndHeartbeat(await guardian.screenWork(workFor(7, joined)));
+
+  assert.equal(outcome.kind, 'attested');
+  // Every suspect was recorded, so none is sent again; the targets are read before the reports and again
+  // before the heartbeat.
+  assert.deepEqual(node.sent.calls, ['heartbeat']);
+  assert.equal(reads, 14);
+  assert.equal(most, 3);
+});
