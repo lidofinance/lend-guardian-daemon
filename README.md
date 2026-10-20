@@ -52,7 +52,13 @@ if ('previousHeartbeatBlock' in outcome) {
 }
 ```
 
-`cycle` emits typed phase and terminal events through the same `onEvent` handler as RPC, transaction and report events. Missing, malformed or incomplete screening results stop the attempt before submission. In signal mode the SDK submits required suspect reports, then flag reports, verifies their canonical confirmations and finally submits and confirms the heartbeat. RPC and provider failures propagate to the application.
+An attempt has a fixed budget: its heartbeat must be sent while the report block is at most `256 - heartbeatReserveBlocks` blocks behind the head, 248 blocks or just under 50 minutes with the example's reserve of eight blocks and 12-second slots. Discovery starts 50,400 blocks, at least seven days, before the previous heartbeat block, or before the `GuardianAdded` block when no heartbeat can be reused, and reads through the report block, so the first cycle, and the first cycle after downtime, covers everything since. Run the application without gaps from the moment the Guardian is added, and watch the time from `cycle.started` to `cycle.finished` against the budget; a stale outcome with `report-block-aged-out` is an attempt that did not fit.
+
+After reconstruction the SDK checks the plan again. A plan that can no longer be attested ends the attempt as stale before screening, so a slow attempt costs no screening.
+
+A stale outcome carries the attempt's `work`. Pass it to the next attempt as the second argument of `cycle`: a position whose controller logged nothing for it since keeps the anchors that attempt reconstructed, so a retry walks only what changed.
+
+`cycle` emits typed phase and terminal events through the same `onEvent` handler as RPC, transaction and report events. Missing, malformed or incomplete screening results stop the attempt before submission. In signal mode the SDK submits required suspect reports, then flag reports, verifies their canonical confirmations and finally submits and confirms the heartbeat. A suspect this Guardian recorded since the previous heartbeat, with at least `txConfirmationBlocks` confirmations and inside `suspectWindow`, is kept instead of sent again, reported as `report.skipped` and reread before the heartbeat. RPC and provider failures propagate to the application.
 
 For viem, create one reusable transport, use it to configure the public and wallet clients, and pass those clients to `ViemRpcClient`. Applications using another library may implement the exported `RpcProvider` reads and `RpcClient` preparation, broadcast and bounded-delivery methods directly. In signal mode `Guardian` requires the client's `transactionPolicy.sendTimeoutMs` to be an integer number of milliseconds that covers at least `txConfirmationBlocks + 1` slots and does not exceed 2,147,483,647, rejects any other value at construction and applies the same budget to its shared report-confirmation wait. `Guardian.clearPendingNonces()` is an explicit signal-mode recovery operation for a reconciled dedicated signer; it is not run automatically by `cycle`. The reference implementation for both modes is in [`example/daemon.ts`](example/daemon.ts).
 
@@ -111,7 +117,7 @@ Tests use scripted nodes and isolated local Anvil processes; they make no extern
 - [`abi/`](abi/): minimal ABI fragments used by the SDK.
 - [`example/`](example/README.md): reference Guardian application.
 - [`tests/`](tests/): core, example and contract-conformance tests.
-- [`docs/guardian-specification.md`](docs/guardian-specification.md): Guardian specification 0.2.0.
+- [`docs/guardian-specification.md`](docs/guardian-specification.md): Guardian specification 0.3.0.
 
 ## License
 

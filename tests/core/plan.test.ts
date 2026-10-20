@@ -421,3 +421,32 @@ test('a canonical hint narrows the search by its header, whatever timestamp it c
   assert.deepEqual(planned.previousHeartbeatBlock, covered);
   assert.deepEqual(registryQueries, [[hinted.number, HEAD]]);
 });
+
+test('a reusable heartbeat makes own reports count from after the block that included it', async () => {
+  const covered = blockAt(180_000);
+  const { planned } = await planOver({
+    head: HEAD,
+    heartbeatTimestamp: covered.timestamp,
+    heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp, includedAt: 180_005 }],
+  });
+  assert.ok(planned.kind === 'plan');
+  assert.equal(planned.reportsSince, blockAt(180_005).timestamp);
+});
+
+test('a Guardian without a heartbeat counts own reports from after the block it joined in', async () => {
+  const { planned } = await planOver(JOINED);
+  assert.ok(planned.kind === 'plan');
+  assert.equal(planned.reportsSince, blockAt(150_000).timestamp);
+});
+
+test('a stored heartbeat without a reusable block leaves own reports uncounted', async () => {
+  const covered = blockAt(180_000);
+  const { planned } = await planOver({
+    head: HEAD,
+    heartbeatTimestamp: covered.timestamp + 1,
+    heartbeats: [{ blockNumber: covered.number, timestamp: covered.timestamp }],
+    guardianAddedAt: 150_000,
+  });
+  assert.ok(planned.kind === 'plan');
+  assert.equal(planned.reportsSince, null);
+});

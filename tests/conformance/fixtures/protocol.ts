@@ -70,6 +70,7 @@ export interface ProtocolFixture {
   readonly primaryMarket: MarketFixture;
   createMarket(): Promise<MarketFixture>;
   setDelegate(): Promise<TransactionReceipt>;
+  setSuspectWindow(seconds: number): Promise<TransactionReceipt>;
   removeAndReaddGuardian(): Promise<TransactionReceipt>;
   suspect(marketId: Hex, borrowers: readonly Address[]): Promise<TransactionReceipt>;
   flag(marketId: Hex, borrowers: readonly Address[]): Promise<TransactionReceipt>;
@@ -150,6 +151,8 @@ async function deployProtocol(anvil: AnvilFixture): Promise<ProtocolFixture> {
     createMarketFixture(anvil, write, deploy, core, coreArtifact.abi, admin.address, guardianSignals);
   const primaryMarket = await createMarket();
   const setDelegate = () => write(guardianSignals, guardianArtifact.abi, 'setDelegate', [delegate.address]);
+  const setSuspectWindow = (seconds: number) =>
+    write(guardianSignals, guardianArtifact.abi, 'setSuspectWindow', [BigInt(seconds)]);
   const suspect = (marketId: Hex, borrowers: readonly Address[]) =>
     writeSignal(guardianSignals, guardianArtifact.abi, 'suspect', [marketId, admin.address, borrowers]);
   const flag = (marketId: Hex, borrowers: readonly Address[]) =>
@@ -182,6 +185,7 @@ async function deployProtocol(anvil: AnvilFixture): Promise<ProtocolFixture> {
     primaryMarket,
     createMarket,
     setDelegate,
+    setSuspectWindow,
     removeAndReaddGuardian,
     suspect,
     flag,
