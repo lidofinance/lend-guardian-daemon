@@ -18,7 +18,7 @@ import type { LogPosition } from '../chain/log-order.ts';
 import type { RpcProvider } from '../chain/rpc.ts';
 import { decodeLogs } from './decode-logs.ts';
 import type { ScanPlan, Work } from '../core/outcomes.ts';
-import type { PositionKey, SupplyAnchor } from '../core/types.ts';
+import type { DiscoveredPosition, LifecycleEventRef, PositionKey, SupplyAnchor } from '../core/types.ts';
 import { GuardianStop } from '../core/stop.ts';
 import { lower } from '../common/types.ts';
 import type { Address, BlockRef, Bytes32, ContractDeployment, MarketId, TxHash } from '../common/types.ts';
@@ -62,10 +62,11 @@ interface SupplyLog {
   readonly logIndex: number;
 }
 
-/** A `CollateralActivating` that classified a supply: the timer it set, and where it was logged. */
+/** A `CollateralActivating` that classified a supply: the timer it set, and the log itself. */
 interface Activation {
   readonly position: Position;
   readonly blockNumber: number;
+  readonly log: LifecycleLog;
 }
 
 type LifecycleEventStream = AsyncGenerator<LifecycleEvent>;
@@ -89,10 +90,10 @@ interface TargetSupply {
   readonly controller: Address;
 }
 
-/** A position whose activation is due and requires coverage, and the position its latest event left. */
+/** A position whose activation is due and requires coverage, with the newest event read for it so far. */
 interface Candidate {
   readonly key: PositionKey;
-  readonly latestPosition: Position;
+  readonly newestEvent: LifecycleLog;
 }
 
 const LIFECYCLE_TOPICS = [
@@ -138,7 +139,7 @@ export class Markets {
     plan: ScanPlan,
     targetRegistry: Address,
     concurrency: number,
-  ): Promise<PositionKey[]> {
+  ): Promise<DiscoveredPosition[]> {
     const window = plan.discoveryRange;
     const candidates = new CandidatePositions();
     // Controller events are read without gaps, so no event of a candidate is missed.
@@ -172,31 +173,41 @@ export class Markets {
     // or extended since is discarded here without a history walk; the work stays the same.
     return candidates
       .list()
-      .filter((candidate) => this.#isBaseActivationDeadlineReached(candidate.latestPosition, window.to.timestamp))
-      .map((candidate) => candidate.key);
+      .filter((candidate) =>
+        this.#isBaseActivationDeadlineReached(candidate.newestEvent.args.position, window.to.timestamp),
+      )
+      .map(({ key, newestEvent }) => ({
+        position: key,
+        newestEvent: {
+          blockNumber: Number(newestEvent.blockNumber),
+          logIndex: newestEvent.logIndex,
+          blockHash: newestEvent.blockHash,
+        },
+      }));
   }
 
   /**
    * Reconstruct the uncovered contributors for every candidate position under Appendix C,
-   * `concurrency` positions at a time. A position of `reusableWork` that its controller logged no event
-   * for after that work's report block keeps its anchors instead.
+   * `concurrency` positions at a time. A position of `reusableWork` keeps its anchors instead when the
+   * newest event that discovery read for it is not after that work's report block: nothing changed it since.
    */
   async reconstructWork(
     plan: ScanPlan,
-    positions: readonly PositionKey[],
+    candidates: readonly DiscoveredPosition[],
     concurrency: number,
     reusableWork?: Work,
   ): Promise<ReadonlyMap<PositionKey, readonly SupplyAnchor[]>> {
-    const unchangedAnchors =
-      reusableWork === undefined
-        ? new Map<string, readonly SupplyAnchor[]>()
-        : await this.#findUnchangedAnchors(reusableWork, plan.discoveryRange.to.number, concurrency);
-    const walks = await mapConcurrently(concurrency, positions, async (position) => ({
-      position,
-      anchors:
-        unchangedAnchors.get(`${position.controller}:${position.borrower}`) ??
-        (await this.#reconstructPosition(plan, position)),
-    }));
+    const reusableAnchors = new Map<string, readonly SupplyAnchor[]>();
+    for (const [position, anchors] of reusableWork?.entries() ?? []) {
+      reusableAnchors.set(`${position.controller}:${position.borrower}`, anchors);
+    }
+    const walks = await mapConcurrently(concurrency, candidates, async (candidate) => {
+      const isUnchanged =
+        reusableWork !== undefined && candidate.newestEvent.blockNumber <= reusableWork.reportBlock.number;
+      const key = `${candidate.position.controller}:${candidate.position.borrower}`;
+      const anchors = isUnchanged ? reusableAnchors.get(key) : undefined;
+      return { position: candidate.position, anchors: anchors ?? (await this.#reconstructPosition(plan, candidate)) };
+    });
     const byPosition = new Map<PositionKey, readonly SupplyAnchor[]>();
     for (const { position, anchors } of walks) {
       if (anchors.length > 0) {
@@ -372,33 +383,6 @@ export class Markets {
     }
   }
 
-  /**
-   * The anchors of `reusableWork`'s positions, by controller and borrower, less those whose controller
-   * logged an event for them after that work's report block, through `reportBlockNumber`.
-   */
-  async #findUnchangedAnchors(
-    reusableWork: Work,
-    reportBlockNumber: number,
-    concurrency: number,
-  ): Promise<Map<string, readonly SupplyAnchor[]>> {
-    const unchangedAnchors = new Map<string, readonly SupplyAnchor[]>();
-    const controllers = new Set<Address>();
-    for (const [position, anchors] of reusableWork.entries()) {
-      unchangedAnchors.set(`${position.controller}:${position.borrower}`, anchors);
-      controllers.add(position.controller);
-    }
-    const blocksToRead = { fromBlock: reusableWork.reportBlock.number + 1, toBlock: reportBlockNumber };
-    await mapConcurrently(concurrency, [...controllers], async (controller) => {
-      const eventFilter = { address: controller, topics: [LIFECYCLE_TOPICS], ...blocksToRead };
-      for await (const eventLogs of this.#rpc.logBatches(eventFilter, 'forward')) {
-        for (const event of decodeLogs(MARKET_CONTROLLER_ABI, eventLogs)) {
-          unchangedAnchors.delete(`${lower(event.address)}:${lower(event.args.borrower)}`);
-        }
-      }
-    });
-    return unchangedAnchors;
-  }
-
   /** Read the candidates' controllers' lifecycle events in `blocksToRead`, a piece at a time, and apply them. */
   async #applyCandidateEvents(
     candidates: CandidatePositions,
@@ -450,7 +434,7 @@ export class Markets {
       if (!this.#requiresCurrentCoverage(plan.previousHeartbeatBlock, activation.blockNumber, deadline)) {
         continue;
       }
-      candidates.add({ controller, marketId: supply.marketId, borrower: supply.borrower }, activation.position);
+      candidates.add({ controller, marketId: supply.marketId, borrower: supply.borrower }, activation);
     }
   }
 
@@ -466,14 +450,12 @@ export class Markets {
     );
   }
 
-  async #reconstructPosition(plan: ScanPlan, position: PositionKey): Promise<SupplyAnchor[]> {
+  async #reconstructPosition(plan: ScanPlan, candidate: DiscoveredPosition): Promise<SupplyAnchor[]> {
+    const { position } = candidate;
     const events = this.lifecycleBack(position, plan.discoveryRange.to);
     const activationBlockByAnchor = new Map<string, AnchorActivation>();
     let positionAtPreviousHeartbeat: Position | null = null;
-    let current = await this.#readOlderLifecycleEvent(events);
-    if (current === null) {
-      throw new GuardianStop('position-without-history');
-    }
+    let current: LifecycleEvent | null = await this.#readNewestLifecycleEvent(events, candidate.newestEvent);
     if (!this.#isBaseActivationDeadlineReached(current.position, plan.discoveryRange.to.timestamp)) {
       return [];
     }
@@ -551,6 +533,30 @@ export class Markets {
       .map((contributor) => contributor.anchor);
   }
 
+  /**
+   * The first event of a walk, which must be the newest event discovery read for the position through
+   * the same report block, and must sit in the canonical block at its number. A walk whose first event
+   * differs, or came from a branch the chain does not hold, read another history, so no decision is
+   * taken from it.
+   */
+  async #readNewestLifecycleEvent(
+    events: LifecycleEventStream,
+    newestEvent: LifecycleEventRef,
+  ): Promise<LifecycleEvent> {
+    const newest = await this.#readOlderLifecycleEvent(events);
+    if (newest === null) {
+      throw new GuardianStop('position-without-history');
+    }
+    if (!isSameEvent(newest.at, newestEvent)) {
+      throw new GuardianStop('position-history-broken');
+    }
+    const canonical = await this.#rpc.getBlock(Number(newest.at.blockNumber));
+    if (canonical.hash !== newest.at.blockHash) {
+      throw new GuardianStop('log-not-canonical');
+    }
+    return newest;
+  }
+
   async #readOlderLifecycleEvent(events: LifecycleEventStream): Promise<LifecycleEvent | null> {
     const next = await events.next();
     return next.done === true ? null : next.value;
@@ -607,7 +613,7 @@ export class Markets {
     if (log.eventName !== 'CollateralActivating') {
       return null;
     }
-    return { position: log.args.position, blockNumber: Number(log.blockNumber) };
+    return { position: log.args.position, blockNumber: Number(log.blockNumber), log };
   }
 
   #supplyOf(log: SupplyCollateralLog): SupplyLog {
@@ -659,11 +665,11 @@ export class Markets {
 class CandidatePositions {
   readonly #candidatesById = new Map<string, Candidate>();
 
-  /** Add a position with the position its activation left; a position already added keeps its record. */
-  add(key: PositionKey, position: Position): void {
+  /** Add a position with the activation that made it due; a position already added keeps its record. */
+  add(key: PositionKey, activation: Activation): void {
     const id = `${key.controller}:${key.marketId}:${key.borrower}`;
     if (!this.#candidatesById.has(id)) {
-      this.#candidatesById.set(id, { key, latestPosition: position });
+      this.#candidatesById.set(id, { key, newestEvent: activation.log });
     }
   }
 
@@ -688,7 +694,7 @@ class CandidatePositions {
       if (newest.args.position.activating === 0n) {
         this.#candidatesById.delete(id);
       } else {
-        this.#candidatesById.set(id, { key: candidate.key, latestPosition: newest.args.position });
+        this.#candidatesById.set(id, { key: candidate.key, newestEvent: newest });
       }
     }
   }
@@ -701,4 +707,8 @@ class CandidatePositions {
   list(): Candidate[] {
     return [...this.#candidatesById.values()];
   }
+}
+
+function isSameEvent(at: LogRef, ref: LifecycleEventRef): boolean {
+  return Number(at.blockNumber) === ref.blockNumber && at.logIndex === ref.logIndex && at.blockHash === ref.blockHash;
 }

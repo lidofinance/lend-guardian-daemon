@@ -3,10 +3,13 @@
 // finds. Work from another coverage, or over a report block that left the chain, is walked again.
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { numberToHex } from 'viem';
 import { BaseRpcProvider } from '../../src/core/index.ts';
 import type { CycleOutcome, Observed, ScreeningResult } from '../../src/core/index.ts';
 import { Work } from '../../src/core/outcomes.ts';
+import { isRecord } from '../../src/common/validation.ts';
 import { rpcRequest } from './client.ts';
+import type { NodeRequest } from './client.ts';
 import { blockAt, CONTROLLER, CORE, fakeNode } from './fake-node.ts';
 import type { Lot, Script } from './fake-node.ts';
 import { guardianOver } from './setup.ts';
@@ -107,6 +110,43 @@ test('a top-up after the earlier work is walked again and finds what a full reco
   ]);
   assert.deepEqual(anchorsFound(outcome), anchorsFound(await fullReconstruction(script)));
   assert.notDeepEqual(walkReadsSince(), []);
+});
+
+test('a top-up that discovery saw is walked even when an endpoint lacks it in a later controller read', async () => {
+  const started = lot(100_000, 5n);
+  const topUp: Lot = {
+    kind: 'activating',
+    blockNumber: HEAD + 100,
+    logIndex: 4,
+    amount: 3n,
+    position: { dust: 0n, activating: 8n, activatingStart: started.position.activatingStart, activatingDelay: DAY },
+    supplied: 3n,
+  };
+  const script: Script = { head: HEAD, guardianAddedAt: JOINED, lots: [started, topUp] };
+  const node = fakeNode(script);
+  // The first cycle reports at its head less the default lag of two blocks.
+  const earlierReportBlock = HEAD - 2;
+  // A lagging endpoint answers the controller's events after the earlier report block without the top-up,
+  // which a separate read for reuse would have taken as a position that nothing changed.
+  const lagging: NodeRequest = (method, params) => {
+    const [filter] = params;
+    const isReadSinceEarlierWork =
+      method === 'eth_getLogs' && isRecord(filter) && filter.fromBlock === numberToHex(earlierReportBlock + 1);
+    return isReadSinceEarlierWork ? Promise.resolve([]) : node.transport(method, params);
+  };
+  const client = new BaseRpcProvider({ request: rpcRequest(lagging), maxLogBlockRange: 10_000 });
+  const { guardian } = guardianOver(script, { mode: 'observe', client });
+  const earlierWork = observed(await guardian.cycle()).screened.work();
+  assert.equal(earlierWork.reportBlock.number, earlierReportBlock);
+  node.advanceTo(NEXT_HEAD);
+
+  const outcome = await guardian.cycle(null, earlierWork);
+
+  assert.deepEqual(anchorsFound(outcome), [
+    [100_000, 5],
+    [HEAD + 100, 5],
+  ]);
+  assert.deepEqual(anchorsFound(outcome), anchorsFound(await fullReconstruction(script)));
 });
 
 test('a lot that comes due after the earlier work is walked', async () => {

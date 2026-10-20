@@ -23,6 +23,8 @@ export type StopReason =
   | 'log-undecodable'
   /** The head a submission is measured from is not the block the nodes hold at its number. */
   | 'head-not-canonical'
+  /** A log a walk read sits in a block that is not the canonical block at its number: a branch the chain does not hold. */
+  | 'log-not-canonical'
   /** A candidate position has no controller history at all, which cannot be. */
   | 'position-without-history'
   /** The controller's events for a position do not compose into the position they record. */

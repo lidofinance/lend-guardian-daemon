@@ -67,6 +67,7 @@ test('supply classification accepts the adjacent controller event in the same tr
   assert.deepEqual(markets.activationBefore(SUPPLY, CONTROLLER, classifications([CLASSIFICATION])), {
     blockNumber: BLOCK.number,
     position: { dust: 0n, activating: 5n, activatingStart: BLOCK.timestamp, activatingDelay: 60 },
+    log: classifications([CLASSIFICATION])[0],
   });
 });
 
@@ -209,7 +210,9 @@ test("each piece of supplies reads its controller's events from the first unread
     [CLASSIFICATION, { ...CLASSIFICATION, ...later }],
   );
   const markets = new Markets(provider, { address: CORE, deploymentBlock: 1_000 });
-  assert.deepEqual(await markets.discoverCandidatePositions(PLAN, REGISTRY, 8), [POSITION]);
+  assert.deepEqual(await markets.discoverCandidatePositions(PLAN, REGISTRY, 8), [
+    { position: POSITION, newestEvent: { blockNumber: 100_500, logIndex: 4, blockHash: blockAt(100_500).hash } },
+  ]);
   const topics = [
     [
       toEventSelector(getAbiItem({ abi: MARKET_CONTROLLER_ABI, name: 'CollateralDusted' })),

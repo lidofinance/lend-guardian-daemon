@@ -285,13 +285,13 @@ export class Guardian {
   async discoverCandidatePositions(plan: ScanPlan): Promise<Discovered> {
     const markets = new Markets(this.#rpc, this.#setup.deployment.lidoLend);
     await this.#requireCanonicalBlock(plan.discoveryRange.to);
-    const positions = await markets.discoverCandidatePositions(
+    const candidates = await markets.discoverCandidatePositions(
       plan,
       this.#setup.deployment.guardianSignals.address,
       this.#setup.historyReadConcurrency,
     );
     await this.#requireCanonicalBlock(plan.discoveryRange.to);
-    return new Discovered(plan, positions);
+    return new Discovered(plan, candidates);
   }
 
   /**
@@ -300,21 +300,28 @@ export class Guardian {
    *
    * A position of `earlierWork`, such as a stale attempt's, keeps its anchors when that work was
    * reconstructed from the plan's previous heartbeat at a report block that is still canonical, and the
-   * position's controller logged no lifecycle event for it since. That block's hash fixes the history
-   * below it, and every change of a lot is such an event, so a walk would find the same anchors: the work
-   * is the one a full reconstruction finds, and a retry walks only what changed.
+   * newest lifecycle event that discovery read for the position is not after that block. That block's hash
+   * fixes the history below it, and every change of a lot is such an event, so a walk would find the same
+   * anchors: the work is the one a full reconstruction finds, and a retry walks only what changed. The
+   * decision rests on the events discovery read, not on another read that a lagging endpoint could answer
+   * without them.
+   *
+   * The report block is checked canonical before and after the walks, as around discovery, so an
+   * endpoint that moved to another branch meanwhile stops the attempt instead of feeding it a history.
    */
   async reconstructWork(discovered: Discovered, earlierWork?: Work): Promise<Work> {
     const plan = discovered.plan();
     const markets = new Markets(this.#rpc, this.#setup.deployment.lidoLend);
     const reusableWork =
       earlierWork !== undefined && (await this.#canReuse(earlierWork, plan)) ? earlierWork : undefined;
+    await this.#requireCanonicalBlock(plan.discoveryRange.to);
     const byPosition = await markets.reconstructWork(
       plan,
-      discovered.all(),
+      discovered.candidates(),
       this.#setup.historyReadConcurrency,
       reusableWork,
     );
+    await this.#requireCanonicalBlock(plan.discoveryRange.to);
     return new Work(plan, byPosition);
   }
 
