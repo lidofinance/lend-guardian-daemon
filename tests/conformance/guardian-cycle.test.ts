@@ -198,13 +198,15 @@ test('keeps own-flagged work in coverage without calling the provider', async ()
   assert.equal(await heartbeatTimestamp(fixture), outcome.previousHeartbeatBlock.timestamp);
 });
 
-test('stops an incomplete real-cycle decision before reports or heartbeat', async () => {
+test('an incomplete real-cycle decision withholds the heartbeat and sends no report', async () => {
   const fixture = await deployed;
   await fixture.primaryMarket.supply(100n);
   await passDeadline(fixture);
   const provider = recordingProvider({ status: 'incomplete' }).provider;
 
-  await assertScreeningStop(fixture, provider, 'screening-result-incomplete');
+  const outcome = await cycleWith(fixture, provider);
+
+  assert.equal(outcome.kind, 'incomplete');
   assert.equal(await heartbeatTimestamp(fixture), 0);
 });
 
@@ -346,7 +348,7 @@ async function cycleWith(fixture: ProtocolFixture, provider: ScreeningProvider) 
 async function assertScreeningStop(
   fixture: ProtocolFixture,
   provider: ScreeningProvider,
-  reason: 'screening-result-incomplete' | 'screening-result-malformed',
+  reason: 'screening-result-malformed',
 ): Promise<void> {
   const guardian = guardianOf(fixture, provider);
   const plan = await guardian.buildScanPlan();

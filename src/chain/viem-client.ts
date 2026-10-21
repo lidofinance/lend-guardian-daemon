@@ -4,7 +4,7 @@ import type { Account, Chain, PublicClient, TransactionReceipt as ViemReceipt, T
 import { emitEvent } from '../events.ts';
 import type { EventHandler, TransactionContext, TransactionStage } from '../events.ts';
 import { frozenCopy } from '../common/immutable.ts';
-import { rejectAfter } from '../common/timeout.ts';
+import { wait } from '../common/timeout.ts';
 import { BaseRpcProvider } from './base-rpc-provider.ts';
 import { GuardianStop } from '../core/stop.ts';
 import { BroadcastFailure, ReceiptReverted, replacementFee } from './rpc.ts';
@@ -257,7 +257,9 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
     const remainingMs = Math.max(deadline - Date.now(), 0);
     const signed = await Promise.race([
       walletClient.signTransaction({ ...prepared, type: 'eip1559' }),
-      rejectAfter(remainingMs, new DeliveryLimit('signing-timeout')),
+      wait(remainingMs).then(() => {
+        throw new DeliveryLimit('signing-timeout');
+      }),
     ]);
     emitEvent(this.#onEvent, {
       event: 'transaction.signing',

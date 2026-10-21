@@ -35,7 +35,7 @@ const MAX_SIGNAL_BATCH_SIZE = 20;
 const IDLE_HEARTBEAT_INTERVAL_SECONDS = 12 * 60 * 60;
 const HEARTBEAT_RESERVE_BLOCKS = 8;
 const TRANSACTION_CONFIRMATION_BLOCKS = 12;
-// The provider's answer is awaited no longer than this; a slower provider stops the attempt as incomplete.
+// The provider's answer is awaited no longer than this; the anchors a slower provider has not answered are incomplete.
 const SCREENING_TIMEOUT_MS = 290_000;
 
 // The SDK's viem transport applies these settings to every physical HTTP attempt.
@@ -118,6 +118,11 @@ export async function cycle(guardian: Guardian, previousHeartbeatBlock: BlockRef
   }
   if (outcome.kind === 'nothing-due') {
     console.log(`nothing due: ${outcome.reason}`);
+    return outcome.previousHeartbeatBlock;
+  }
+  if (outcome.kind === 'incomplete') {
+    // The reports the complete answers required are sent; the next cycle asks about the rest again.
+    console.log(`incomplete: ${outcome.incomplete.length} anchors without a complete answer; no heartbeat`);
     return outcome.previousHeartbeatBlock;
   }
 
