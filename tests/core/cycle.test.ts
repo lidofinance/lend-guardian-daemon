@@ -174,3 +174,51 @@ test('cycle rejects overlapping iterations and observer failures do not affect t
   answers.resolve([FLAG]);
   assert.equal((await first).kind, 'observed');
 });
+
+test('a plan that aged out during reconstruction is stale before screening', async () => {
+  const events: SdkEvent[] = [];
+  const node = fakeNode(DUE);
+  const { guardian } = guardianOver(DUE, {
+    endpoints: [{ node: node.transport }],
+    onEvent: (event) => {
+      events.push(event);
+      if (event.event === 'cycle.reconstructed') {
+        node.advanceTo(DUE.head + 250);
+      }
+    },
+    screening: { screen: () => Promise.reject(new Error('screening must not start')) },
+  });
+
+  const outcome = await guardian.cycle();
+  assert.equal(outcome.kind, 'stale');
+  assert.equal(outcome.reason, 'report-block-aged-out');
+  const reconstructed = cycleEvents(events).find((event) => event.event === 'cycle.reconstructed');
+  assert.equal(reconstructed?.event, 'cycle.reconstructed');
+  assert.equal(outcome.work?.reportBlock, reconstructed.reportBlock);
+  assert.deepEqual(node.sent.calls, []);
+  assert.deepEqual(
+    cycleEvents(events).map((event) => event.event),
+    ['cycle.started', 'cycle.planned', 'cycle.discovered', 'cycle.reconstructed', 'cycle.finished'],
+  );
+  assert.throws(() => Object.assign(outcome, { reason: 'report-block-reorged' }), TypeError);
+});
+
+test('an observe cycle whose plan aged out during reconstruction is stale before screening', async () => {
+  const node = fakeNode(DUE);
+  const client = new BaseRpcProvider({ request: rpcRequest(node.transport), maxLogBlockRange: 10_000 });
+  const { guardian } = guardianOver(DUE, {
+    mode: 'observe',
+    client,
+    onEvent: (event) => {
+      if (event.event === 'cycle.reconstructed') {
+        node.advanceTo(DUE.head + 250);
+      }
+    },
+    screening: { screen: () => Promise.reject(new Error('screening must not start')) },
+  });
+
+  const outcome = await guardian.cycle();
+  assert.equal(outcome.kind, 'stale');
+  assert.equal(outcome.reason, 'report-block-aged-out');
+  assert.equal(outcome.work?.all().length, 1);
+});

@@ -115,6 +115,7 @@ function guardianOver(providers: readonly ScriptedProvider[], mode: 'observe' | 
     },
     maxSignalBatchSize: 20,
     idleHeartbeatInterval: 43_200,
+    screeningTimeoutMs: 10_000,
     heartbeatReserveBlocks: 8,
     txConfirmationBlocks: 12,
     confirmationPollIntervalMs: 5,
