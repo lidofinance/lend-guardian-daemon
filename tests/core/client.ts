@@ -48,6 +48,8 @@ export function signingClient(
       maxFeePerGas: 1_000_000_000_000n,
       replacementTimeoutMs: 3,
       sendAttempts: 2,
+      // The example's headroom; conformance reports race other guardians on the same accounts.
+      gasHeadroomBps: 2_000,
     },
     ...(onEvent === undefined ? {} : { onEvent }),
   });

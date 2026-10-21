@@ -88,6 +88,11 @@ export interface TransactionPolicy {
   readonly replacementTimeoutMs: number;
   /** Preparation attempts, including the initial transaction and estimates above the fee cap. */
   readonly sendAttempts: number;
+  /**
+   * Gas added to the node's estimate, in basis points; none when omitted. A registry report costs
+   * more gas when another guardian reports the same account between the estimate and inclusion.
+   */
+  readonly gasHeadroomBps?: number | undefined;
 }
 
 /** Fully specified EIP-1559 transaction, ready for a configured signer. */
