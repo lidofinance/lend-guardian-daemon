@@ -197,6 +197,8 @@ export interface RpcRequestFinishedEvent extends Omit<RpcRequestStartedEvent, 'e
   readonly responseBytes: number;
   /** The error the caller receives; it names the endpoint URL and the request, unlike `rpcIndex`. */
   readonly error?: unknown;
+  /** The response's `Retry-After` as passed to viem: whole seconds in milliseconds, bounded by the transport's `timeoutMs`. */
+  readonly retryAfterMs?: number;
 }
 
 /** Providers returned different logs for one read; indexes are positions in the configured URLs. */

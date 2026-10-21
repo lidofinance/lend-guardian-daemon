@@ -230,6 +230,9 @@ class HttpAttempt {
 
   #httpStatus = 0;
 
+  /** The response's `Retry-After` as passed to viem: whole seconds in milliseconds, bounded by `timeoutMs`. */
+  #retryAfterMs: number | undefined;
+
   #responseBytes = 0;
 
   constructor(
@@ -374,10 +377,32 @@ class HttpAttempt {
     return new HttpRequestError({
       body: this.#body,
       details: response.statusText,
-      headers: response.headers,
+      headers: this.#boundedRetryHeaders(response.headers),
       status: response.status,
       url: this.#target.url,
     });
+  }
+
+  /**
+   * viem waits the whole seconds a numeric `Retry-After` names before its next attempt, whatever its
+   * retry delay, so a provider could park an attempt for as long as it likes. The header is bounded by
+   * `timeoutMs`, the one time budget the transport owns. A date form, or a bound below one second,
+   * drops the header, and viem then backs off as configured.
+   */
+  #boundedRetryHeaders(headers: Headers): Headers {
+    const bounded = new Headers(headers);
+    const retryAfter = headers.get('retry-after');
+    if (retryAfter === null) {
+      return bounded;
+    }
+    const seconds = Math.min(Number.parseInt(retryAfter, 10), Math.floor(this.#options.timeoutMs / 1_000));
+    if (Number.isNaN(seconds) || seconds < 1) {
+      bounded.delete('retry-after');
+      return bounded;
+    }
+    this.#retryAfterMs = seconds * 1_000;
+    bounded.set('retry-after', String(seconds));
+    return bounded;
   }
 
   #failure(error: unknown, signal: AbortSignal): Error {
@@ -404,6 +429,7 @@ class HttpAttempt {
       requestBytes: Buffer.byteLength(this.#bodyText),
       responseBytes: this.#responseBytes,
       ...(error === undefined ? {} : { error }),
+      ...(this.#retryAfterMs === undefined ? {} : { retryAfterMs: this.#retryAfterMs }),
     };
     emitEvent(this.#options.onEvent, finished);
   }

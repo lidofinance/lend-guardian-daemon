@@ -399,6 +399,7 @@ test('the SDK commits its computed coverage digest in Heartbeat.data', async () 
     interBatchConfirmationBlocks: 1,
     confirmationPollIntervalMs: 10,
     idleHeartbeatInterval: 1,
+    screeningTimeoutMs: 10_000,
     heartbeatReserveBlocks: 8,
     txConfirmationBlocks: 1,
     maxSignalBatchSize: 20,

@@ -123,6 +123,7 @@ function recoveryFixture(overrides: NonceOverrides = {}) {
     interBatchConfirmationBlocks: 2,
     confirmationPollIntervalMs: 1,
     idleHeartbeatInterval: 3_600,
+    screeningTimeoutMs: 10_000,
     heartbeatReserveBlocks: 8,
     txConfirmationBlocks: 1,
     maxSignalBatchSize: 20,
