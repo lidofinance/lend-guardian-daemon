@@ -50,7 +50,7 @@ After registration, the Guardian can call the contract directly or appoint one d
 
 Only the registered Guardian can appoint, replace, or clear its delegate. Both the Guardian and its current delegate can call `suspect`, `flag`, `unsuspect`, `unflag`, and `heartbeat`. Because the delegate can also call `unsuspect` and `unflag`, a compromised delegate can retract the Guardian's reports.
 
-A heartbeat is not scoped to one market. Before sending it, the daemon must complete the required screening through its reported block for every market in the configured core whose controller uses the configured registry. Each successful heartbeat records the Guardian's latest scanned timestamp. When enough Guardians report newer timestamps, `GuardianSignals` may advance the quorum frontier. Controllers use this frontier as one condition for activating delayed collateral.
+A heartbeat is not scoped to one market. Before sending it, the daemon must complete the required screening through its reported block for every market in the configured core whose controller uses the configured registry. Each successful heartbeat records the Guardian's latest scanned timestamp. When enough Guardians report newer timestamps, `GuardianSignals` may advance the quorum frontier. Controllers use this frontier as one condition for activating delayed collateral. A controller stops waiting for the frontier once `maxGuardiansQuorumDelay` has elapsed since `activatingStart`, and does not wait for it at all when that value is zero. All other activation conditions still apply.
 
 | Signature or type | Relevant contract behavior | Use in the daemon |
 |---|---|---|
