@@ -18,6 +18,19 @@ export interface PositionKey {
   readonly borrower: Address;
 }
 
+/** Where a controller logged a position's newest event through the report block. */
+export interface LifecycleEventRef {
+  readonly blockNumber: number;
+  readonly logIndex: number;
+  readonly blockHash: Bytes32;
+}
+
+/** A candidate position with the newest event discovery read for it, which reconstruction must find first. */
+export interface DiscoveredPosition {
+  readonly position: PositionKey;
+  readonly newestEvent: LifecycleEventRef;
+}
+
 /**
  * One supply to screen. `transactionHash` and `logIndex` identify it, and `blockHash` ties that
  * identity to a chain state, so a reorged anchor is not silently the same anchor. `borrower` names

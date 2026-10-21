@@ -165,6 +165,8 @@ export interface Script {
   readonly logsTooLargeOver?: number;
   /** A controller log query over more blocks than `over` is refused by the node, as it words it. */
   readonly logsCapped?: LogsCap;
+  /** The head of the replica that answers history walks, which lack every event after it. */
+  readonly walksLagBehind?: number;
   /**
    * The log queries whose answers arrive broken: indexed arguments and data cut off. `supply` breaks
    * every supply query, `pairedSupply` only the one-block query phase C sends for an activation.
@@ -411,8 +413,14 @@ function logAnswer(script: Script, params: readonly unknown[], queries: Queries)
   }
   queries.ranges.push({ address: text(filter, 'address'), fromBlock: from, toBlock: to, topics });
 
-  const logs = selectedLogs(script, kind, from, to);
+  const logs = selectedLogs(script, kind, from, to).filter((log) => isServedToWalk(script, log, topics));
   return isBroken(script, kind, from === to) ? logs.map(undecodable) : logs;
+}
+
+/** A walk names the borrower in a topic; a lagging replica answers it without the newest events. */
+function isServedToWalk(script: Script, log: LogRecord, topics: readonly unknown[]): boolean {
+  const isWalk = topics.length > 1 && script.walksLagBehind !== undefined;
+  return !isWalk || Number(BigInt(text(log, 'blockNumber'))) <= (script.walksLagBehind ?? 0);
 }
 
 function isBroken(script: Script, kind: LogKind, isOneBlock: boolean): boolean {
