@@ -208,7 +208,7 @@ test('log reads use the configured static ranges in the requested order', async 
   ]);
 });
 
-test('a refused static log range propagates without adaptive range reduction', async () => {
+test('a block the node refuses alone propagates its error once the range is halved down to it', async () => {
   const attempts: { fromBlock: number; toBlock: number }[] = [];
   const rpc = new BaseRpcProvider({
     request: rpcRequest((method, params) => {
@@ -234,9 +234,8 @@ test('a refused static log range propagates without adaptive range reduction', a
     }),
     /block range exceeds the limit/,
   );
-  assert.ok(attempts.length > 0);
-  assert.ok(
-    attempts.every((attempt) => attempt.fromBlock === 1 && attempt.toBlock === 2),
-    'transport retries may repeat the request but must not hide a range configuration failure',
-  );
+  assert.deepEqual(attempts, [
+    { fromBlock: 1, toBlock: 2 },
+    { fromBlock: 1, toBlock: 1 },
+  ]);
 });
