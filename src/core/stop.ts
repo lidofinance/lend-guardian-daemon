@@ -35,6 +35,8 @@ export type StopReason =
   | 'screening-result-missing'
   /** Required report receipts did not reach the configured depth inside the client's delivery budget. */
   | 'report-confirmation-timeout'
+  /** A report receipt names a transaction that is not the report this Guardian's signer sent to the registry in this attempt. */
+  | 'report-receipt-foreign'
   /** A provider could not judge an anchor, so this cycle cannot attest that it was judged. */
   | 'screening-result-incomplete';
 
