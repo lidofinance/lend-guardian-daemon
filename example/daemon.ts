@@ -27,7 +27,8 @@ const RETRY_INTERVAL_MS = 5 * 60_000;
 
 // Guardian policy for this example, chosen by the application.
 const REPORT_BLOCK_LAG = 2;
-const FLAGGER_READ_CONCURRENCY = 8;
+const READ_CONCURRENCY = 8;
+const HISTORY_READ_CONCURRENCY = 8;
 const INTER_BATCH_CONFIRMATION_BLOCKS = 2;
 const CONFIRMATION_POLL_INTERVAL_MS = 12_000;
 const MAX_SIGNAL_BATCH_SIZE = 20;
@@ -190,7 +191,8 @@ function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
     guardian: guardianAddress,
     screening,
     reportBlockLag: REPORT_BLOCK_LAG,
-    flaggerReadConcurrency: FLAGGER_READ_CONCURRENCY,
+    readConcurrency: READ_CONCURRENCY,
+    historyReadConcurrency: HISTORY_READ_CONCURRENCY,
     interBatchConfirmationBlocks: INTER_BATCH_CONFIRMATION_BLOCKS,
     confirmationPollIntervalMs: CONFIRMATION_POLL_INTERVAL_MS,
     maxSignalBatchSize: MAX_SIGNAL_BATCH_SIZE,

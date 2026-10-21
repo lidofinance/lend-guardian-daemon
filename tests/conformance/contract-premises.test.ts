@@ -395,7 +395,7 @@ test('the SDK commits its computed coverage digest in Heartbeat.data', async () 
         ),
     },
     reportBlockLag: 2,
-    flaggerReadConcurrency: 2,
+    readConcurrency: 2,
     interBatchConfirmationBlocks: 1,
     confirmationPollIntervalMs: 10,
     idleHeartbeatInterval: 1,

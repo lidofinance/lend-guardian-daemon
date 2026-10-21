@@ -30,7 +30,7 @@ export { BroadcastFailure } from '../chain/rpc.ts';
 
 export { BaseRpcProvider } from '../chain/base-rpc-provider.ts';
 export type { BaseRpcProviderOptions } from '../chain/base-rpc-provider.ts';
-export type { ChainLog, LogFilter, BlockLogFilter, TransactionReceipt } from '../chain/rpc.ts';
+export type { ChainLog, LogFilter, TransactionReceipt } from '../chain/rpc.ts';
 
 export type {
   CycleContext,

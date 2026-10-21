@@ -1,7 +1,7 @@
 // What the five phases hand back. Each value says what the cycle established and what the caller
 // may do next, so the loop around them is a decision over values rather than over exceptions.
 
-import type { PositionKey, SignalTarget, SupplyAnchor } from './types.ts';
+import type { DiscoveredPosition, PositionKey, SignalTarget, SupplyAnchor } from './types.ts';
 import type { ScreeningResult } from './screening-provider.ts';
 import type { Address, BlockRef, Bytes32, TxHash } from '../common/types.ts';
 import { frozenCopy } from '../common/immutable.ts';
@@ -34,6 +34,12 @@ export interface ScanPlan {
   readonly kind: 'plan';
   readonly previousHeartbeatBlock: BlockRef | null;
   readonly heartbeatTimestampAtStart: number;
+  /**
+   * This Guardian's reports recorded after this registry timestamp belong to the current coverage:
+   * the block that included the previous heartbeat, or the `GuardianAdded` block of a Guardian
+   * without one. Null when the stored heartbeat has no reusable block.
+   */
+  readonly reportsSince: number | null;
   readonly discoveryRange: BlockRange;
 }
 
@@ -44,16 +50,17 @@ export interface ScanPlan {
 export class Discovered {
   readonly #plan: ScanPlan;
 
-  readonly #positions: readonly PositionKey[];
+  readonly #candidates: readonly DiscoveredPosition[];
 
-  constructor(plan: ScanPlan, positions: readonly PositionKey[]) {
+  constructor(plan: ScanPlan, candidates: readonly DiscoveredPosition[]) {
     this.#plan = frozenCopy({
       kind: 'plan',
       previousHeartbeatBlock: plan.previousHeartbeatBlock,
       heartbeatTimestampAtStart: plan.heartbeatTimestampAtStart,
+      reportsSince: plan.reportsSince,
       discoveryRange: plan.discoveryRange,
     });
-    this.#positions = frozenCopy(positions);
+    this.#candidates = frozenCopy(candidates);
     Object.freeze(this);
   }
 
@@ -62,7 +69,12 @@ export class Discovered {
   }
 
   all(): PositionKey[] {
-    return [...this.#positions];
+    return this.#candidates.map((candidate) => candidate.position);
+  }
+
+  /** Every candidate with the newest event discovery read for it. */
+  candidates(): DiscoveredPosition[] {
+    return [...this.#candidates];
   }
 }
 
@@ -80,6 +92,9 @@ export class Work {
   /** The stored heartbeat timestamp captured while the scan plan was built. */
   readonly heartbeatTimestampAtStart: number;
 
+  /** The plan's `reportsSince`: this Guardian's reports recorded after it count for this coverage. */
+  readonly reportsSince: number | null;
+
   readonly anchors: number;
 
   readonly positions: number;
@@ -90,6 +105,7 @@ export class Work {
     this.reportBlock = frozenCopy(plan.discoveryRange.to);
     this.previousHeartbeatBlock = frozenCopy(plan.previousHeartbeatBlock);
     this.heartbeatTimestampAtStart = plan.heartbeatTimestampAtStart;
+    this.reportsSince = plan.reportsSince;
     this.#byPosition = new Map(
       [...byPosition].map(([position, anchors]) => [frozenCopy(position), frozenCopy(anchors)]),
     );
@@ -263,6 +279,8 @@ export interface Attested {
 export interface Stale {
   readonly kind: 'stale';
   readonly reason: StaleReason;
+  /** Set by `Guardian.cycle`: the work this attempt reconstructed, which the next attempt can reuse. */
+  readonly work?: Work;
 }
 
 /** A complete read-only cycle: screening finished, but observe mode submitted nothing. */

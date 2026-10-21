@@ -17,12 +17,15 @@ import type {
   SignalTarget,
   Stale,
   TxHash,
+  Hex,
 } from '../../src/core/index.ts';
 import { GUARDIAN_SIGNALS_ABI } from '../../abi/GuardianSignals.abi.ts';
 import { Screened, Work } from '../../src/core/outcomes.ts';
 import { BLOCK_HASH, BORROWER, GUARDIAN, MARKET, REGISTRY, TRANSACTION_HASH } from './delivery-fakes.ts';
 
 const DEPTH = 12;
+/** The block a fixed receipt names: the one after the work's report block, 98. */
+const FIXED_RECEIPT_BLOCK = 99;
 type CheckPlan = () => Promise<Stale | null>;
 const validPlan: CheckPlan = () => Promise.resolve(null);
 
@@ -46,7 +49,12 @@ interface BatchState extends ChainState {
   nonce: number;
 }
 
-function reader(state: ChainState, receipts: ReadonlyMap<TxHash, ReceiptRef>, useFixedReceipt: boolean): NodeRequest {
+function reader(
+  state: ChainState,
+  receipts: ReadonlyMap<TxHash, ReceiptRef>,
+  calls: ReadonlyMap<TxHash, Hex>,
+  useFixedReceipt: boolean,
+): NodeRequest {
   const block = (number: number) => ({
     number: numberToHex(number),
     hash: padHex(numberToHex(number)),
@@ -56,7 +64,9 @@ function reader(state: ChainState, receipts: ReadonlyMap<TxHash, ReceiptRef>, us
     if (method === 'eth_getBlockByNumber') {
       if (params[0] !== 'latest') {
         const number = Number(params[0]);
-        return useFixedReceipt && number === 10 ? { ...block(number), hash: BLOCK_HASH } : block(number);
+        return useFixedReceipt && number === FIXED_RECEIPT_BLOCK
+          ? { ...block(number), hash: BLOCK_HASH }
+          : block(number);
       }
       const stale = await state.checkPlan();
       state.hasMovedHeartbeat = stale?.reason === 'stored-heartbeat-moved';
@@ -64,6 +74,11 @@ function reader(state: ChainState, receipts: ReadonlyMap<TxHash, ReceiptRef>, us
     }
     if (method === 'eth_call') {
       return padHex(state.hasMovedHeartbeat ? numberToHex(2000) : '0x0');
+    }
+    if (method === 'eth_getTransactionByHash') {
+      const input = calls.get(`0x${String(params[0]).slice(2)}`);
+      assert.ok(input !== undefined);
+      return { hash: params[0], from: GUARDIAN, to: REGISTRY, input, nonce: '0x0', value: '0x0' };
     }
     assert.equal(method, 'eth_getTransactionReceipt');
     const hash = params[0];
@@ -89,7 +104,8 @@ function reportClient(
   recordedCalls: unknown[][],
   useFixedReceipt: boolean,
 ): RpcClient {
-  const request = rpcRequest(reader(state, receipts, useFixedReceipt));
+  const calls = new Map<TxHash, Hex>();
+  const request = rpcRequest(reader(state, receipts, calls, useFixedReceipt));
   return Object.assign(new BaseRpcProvider({ request, maxLogBlockRange: 1000 }), {
     signer: GUARDIAN,
     transactionPolicy: {
@@ -115,11 +131,12 @@ function reportClient(
       const hash = useFixedReceipt ? TRANSACTION_HASH : padHex(numberToHex(++state.nonce));
       const receipt = {
         transactionHash: hash,
-        blockNumber: useFixedReceipt ? 10 : Number(state.head),
+        blockNumber: useFixedReceipt ? FIXED_RECEIPT_BLOCK : Number(state.head),
         blockHash: useFixedReceipt ? BLOCK_HASH : padHex(numberToHex(state.head)),
       };
       broadcasts.push(state.head);
       receipts.set(hash, receipt);
+      calls.set(hash, transaction.data);
       events.push({
         event: 'transaction.broadcast',
         context: options.context,
@@ -186,6 +203,7 @@ function batches(size = 1, useFixedReceipt = false) {
         kind: 'plan',
         previousHeartbeatBlock: null,
         heartbeatTimestampAtStart: 0,
+        reportsSince: null,
         discoveryRange: { from: reportBlock, to: reportBlock },
       },
       new Map(),
@@ -281,7 +299,9 @@ test('a failing plan check aborts before broadcasting a batch', async () => {
 test('a confirmed report is recorded as its broadcast and its confirmed action, with the receipt', async () => {
   const { submitter, events } = batches(20, true);
   const receipts = await submitter.sendSuspects([{ marketId: MARKET, borrower: BORROWER }], 1, validPlan);
-  assert.deepEqual(receipts, [{ transactionHash: TRANSACTION_HASH, blockNumber: 10, blockHash: BLOCK_HASH }]);
+  assert.deepEqual(receipts, [
+    { transactionHash: TRANSACTION_HASH, blockNumber: FIXED_RECEIPT_BLOCK, blockHash: BLOCK_HASH },
+  ]);
   const suspectEvents = events.filter((event) => 'context' in event && event.context?.method === 'suspect');
   const [started, broadcast, confirmed] = suspectEvents;
   assert.ok(started !== undefined && 'context' in started);

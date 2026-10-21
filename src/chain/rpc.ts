@@ -33,16 +33,19 @@ export interface TransactionReceipt extends ReceiptRef {
   readonly status: 'success' | 'reverted';
 }
 
+/** The transaction a receipt names, as the chain holds it; `input` is the call it carries. */
+export interface ChainTransaction {
+  readonly transactionHash: TxHash;
+  readonly from: Address;
+  readonly to: Address | null;
+  readonly input: Hex;
+}
+
 export interface LogFilter {
   readonly address: Address;
   readonly topics?: readonly (Hex | readonly Hex[] | null)[];
   readonly fromBlock: number;
   readonly toBlock: number;
-}
-
-export interface BlockLogFilter {
-  readonly address: Address;
-  readonly blockHash: Bytes32;
 }
 
 /** Chain reads in SDK types, independent of the library implementing request. */
@@ -53,7 +56,8 @@ export interface RpcProvider {
   getTransactionCount(address: Address, at: 'latest' | 'pending' | number): Promise<number>;
   getBlock(number?: number): Promise<BlockRef>;
   getReceipt(hash: TxHash): Promise<TransactionReceipt | null>;
-  getLogs(filter: LogFilter | BlockLogFilter): Promise<ChainLog[]>;
+  getTransaction(hash: TxHash): Promise<ChainTransaction | null>;
+  getLogs(filter: LogFilter): Promise<ChainLog[]>;
   logBatches(filter: LogFilter, direction: 'forward' | 'backward'): AsyncIterable<ChainLog[]>;
   /** Decode every fetched log before selecting the newest; stop before older ranges. */
   getLastLog<Result>(filter: LogFilter, decode: (log: ChainLog) => Result): Promise<Result | undefined>;
