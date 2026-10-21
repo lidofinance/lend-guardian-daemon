@@ -314,6 +314,23 @@ test('another Guardian flag does not excuse this one from screening', async () =
   assert.deepEqual(screened.skipped, []);
 });
 
+test('a provider slower than screeningTimeoutMs stops the attempt as incomplete and its late answer is dropped', async () => {
+  let answerLate: (answers: readonly ScreeningResult[]) => void = () => undefined;
+  const screening = {
+    screen: () =>
+      new Promise<readonly ScreeningResult[]>((resolve) => {
+        answerLate = resolve;
+      }),
+  };
+  const { guardian, sent } = guardianOver(ONE_DUE, { screening, screeningTimeoutMs: 20 });
+
+  await assert.rejects(guardian.cycle(), { name: 'GuardianStop', reason: 'screening-result-incomplete' });
+  answerLate([CLEAN]);
+  // The lock is released: the next cycle asks the provider again instead of failing as still in progress.
+  await assert.rejects(guardian.cycle(), { name: 'GuardianStop', reason: 'screening-result-incomplete' });
+  assert.deepEqual(sent.calls, []);
+});
+
 test('an incomplete result stops the attempt instead of passing as clean', async () => {
   await assertStops(ONE_DUE, [INCOMPLETE], 'screening-result-incomplete');
 });

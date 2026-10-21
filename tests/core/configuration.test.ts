@@ -31,6 +31,7 @@ function configuration() {
     heartbeatReserveBlocks: 8,
     txConfirmationBlocks: 12,
     confirmationPollIntervalMs: 12_000,
+    screeningTimeoutMs: 10_000,
   };
 }
 
@@ -43,6 +44,7 @@ const NUMERIC_FIELDS = [
   'idleHeartbeatInterval',
   'heartbeatReserveBlocks',
   'txConfirmationBlocks',
+  'screeningTimeoutMs',
 ];
 
 function withNumber(setup: GuardianSetup, field: string, value: unknown): GuardianSetup {
@@ -104,8 +106,9 @@ test('numeric setup accepts its documented limits and rejects values outside the
     { field: 'lidoLendDeploymentBlock', min: 0, max: Number.MAX_SAFE_INTEGER },
     { field: 'guardianSignalsDeploymentBlock', min: 0, max: Number.MAX_SAFE_INTEGER },
     { field: 'idleHeartbeatInterval', min: 1, max: Number.MAX_SAFE_INTEGER },
-    { field: 'txConfirmationBlocks', min: 1, max: Number.MAX_SAFE_INTEGER },
+    { field: 'txConfirmationBlocks', min: 1, max: 64 },
     { field: 'heartbeatReserveBlocks', min: 1, max: 254 },
+    { field: 'screeningTimeoutMs', min: 1, max: 2_147_483_647 },
   ];
   for (const { field, min, max } of ranges) {
     assert.doesNotThrow(() => new Guardian(withNumber(setup, field, min)));
@@ -303,10 +306,12 @@ test('editing the caller setup cannot reduce the heartbeat confirmation depth', 
           if (method === 'eth_sendRawTransaction') {
             const transaction = node.sent.transactions[0];
             assert.ok(transaction !== undefined);
+            // Six confirmations, short of the twelve the Guardian was built with.
+            node.advanceTo(HEAD + 6);
             node.setReceipt(transaction.hash, {
               transactionHash: transaction.hash,
-              blockNumber: HEAD - 5,
-              blockHash: blockAt(HEAD - 5).hash,
+              blockNumber: HEAD + 1,
+              blockHash: blockAt(HEAD + 1).hash,
               status: 'success',
             });
           }
@@ -330,7 +335,7 @@ test('editing the caller setup cannot reduce the heartbeat confirmation depth', 
   await new Promise<void>((resolve) => {
     setImmediate(resolve);
   });
-  node.advanceTo(HEAD + 6);
+  node.advanceTo(HEAD + 12);
   context.mock.timers.tick(4_000);
   assert.equal((await submitting).kind, 'attested');
 });
@@ -375,7 +380,8 @@ test('the RPC client validates the range limit before any request', () => {
 
 for (const field of [
   'reportBlockLag',
-  'flaggerReadConcurrency',
+  'readConcurrency',
+  'historyReadConcurrency',
   'interBatchConfirmationBlocks',
   'confirmationPollIntervalMs',
 ]) {

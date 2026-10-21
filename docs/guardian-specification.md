@@ -1,8 +1,12 @@
 # Guardian daemon specification
 
-> **Specification version:** `0.2.0` · **Previous version:** `0.1.0`
+> **Specification version:** `0.3.0` · **Previous version:** `0.2.0`
 >
-> **Changes from 0.1.0**
+> **Changes from 0.2.0**
+>
+> - A `suspect` recorded since the previous heartbeat and still inside `suspectWindow` need not be sent again by a repeated attempt before that heartbeat; across heartbeats a fresh `suspect` is still required.
+>
+> **Changes from 0.1.0 to 0.2.0**
 >
 > - The `heartbeat` call and `Heartbeat` event now carry `bytes data`, which the registry emits unchanged without validating or storing it.
 > - Every heartbeat must carry the deterministic 32-byte coverage digest defined by this specification. It commits to the complete reconstructed work set, including anchors excluded from provider screening because this Guardian had already flagged their target.
@@ -12,7 +16,7 @@ The lending protocol lets borrowers supply collateral to borrow. Collateral that
 
 A Guardian daemon performs this screening offchain. In each cycle, it selects a recent Ethereum block, finds the delayed collateral that must be reviewed by then, screens the relevant supply transactions, and submits any required `suspect` or `flag` reports.
 
-After screening is complete and all required reports are confirmed, the daemon sends a heartbeat for the selected block. This tells controllers that the Guardian has completed all screening due through the end of that block. Because controllers use heartbeats to decide when delayed collateral can activate, sending one too early can allow unscreened collateral to become active.
+After screening is complete and all required reports are confirmed, the daemon sends a heartbeat for the selected block. This tells controllers that the Guardian has completed all screening due through the end of that block. Because controllers use heartbeats to decide when delayed collateral can activate, sending one too early can allow unscreened collateral to become active. A controller uses heartbeats this way only while its `maxGuardiansQuorumDelay` is nonzero. With zero, delayed collateral activates at its base deadline whether or not it was screened, and this specification defines no procedure for such a market.
 
 This document defines the behavior required of a Guardian daemon. [Appendix: Example Pseudocode](#appendix-example-pseudocode) shows one possible implementation. Other designs are valid if they identify and screen every supply transaction that requires review and confirm all required reports before sending the heartbeat.
 
@@ -46,7 +50,7 @@ After registration, the Guardian can call the contract directly or appoint one d
 
 Only the registered Guardian can appoint, replace, or clear its delegate. Both the Guardian and its current delegate can call `suspect`, `flag`, `unsuspect`, `unflag`, and `heartbeat`. Because the delegate can also call `unsuspect` and `unflag`, a compromised delegate can retract the Guardian's reports.
 
-A heartbeat is not scoped to one market. Before sending it, the daemon must complete the required screening through its reported block for every market in the configured core whose controller uses the configured registry. Each successful heartbeat records the Guardian's latest scanned timestamp. When enough Guardians report newer timestamps, `GuardianSignals` may advance the quorum frontier. Controllers use this frontier as one condition for activating delayed collateral.
+A heartbeat is not scoped to one market. Before sending it, the daemon must complete the required screening through its reported block for every market in the configured core whose controller uses the configured registry. Each successful heartbeat records the Guardian's latest scanned timestamp. When enough Guardians report newer timestamps, `GuardianSignals` may advance the quorum frontier. Controllers use this frontier as one condition for activating delayed collateral. A controller stops waiting for the frontier once `maxGuardiansQuorumDelay` has elapsed since `activatingStart`, and does not wait for it at all when that value is zero. All other activation conditions still apply.
 
 | Signature or type | Relevant contract behavior | Use in the daemon |
 |---|---|---|
@@ -132,7 +136,7 @@ The Guardian must meet the scan cadence and reporting SLA agreed with Lido. Ever
 
 4. **Screen unresolved anchors.** For each current-work target, the daemon calls `getFlaggedBy(marketId, borrower)` at `reportBlock`. If this Guardian appears in the result, the daemon excludes every work anchor for that target from provider screening. It sends every work anchor for every remaining target to the configured screening provider and requires one complete result for each anchor.
 
-5. **Submit reports and, when required, the heartbeat.** With an empty work set, a heartbeat is due only when no stored heartbeat exists or `reportBlock.timestamp` is at least `idleHeartbeatInterval` later than the stored heartbeat timestamp. If a heartbeat is not due, the daemon finishes without a transaction. With a nonempty work set, the daemon groups the screening results by signal target. A target requires `suspect` or `flag` when at least one of its screened anchors requires that report. The daemon sends a fresh `suspect` for every target that requires one, even when an earlier report is still inside `suspectWindow`. It sends every required `flag`; repeating an existing flag has no effect. After every report is confirmed, the daemon commits the complete work set in the heartbeat's `data` and sends the heartbeat for `reportBlock`. The cycle completes when that heartbeat is confirmed.
+5. **Submit reports and, when required, the heartbeat.** With an empty work set, a heartbeat is due only when no stored heartbeat exists or `reportBlock.timestamp` is at least `idleHeartbeatInterval` later than the stored heartbeat timestamp. If a heartbeat is not due, the daemon finishes without a transaction. With a nonempty work set, the daemon groups the screening results by signal target. A target requires `suspect` or `flag` when at least one of its screened anchors requires that report. The daemon sends a fresh `suspect` for every target that requires one, even when an earlier report is still inside `suspectWindow`. The one exception is a repeated attempt before the heartbeat: a `suspect` that this Guardian recorded since its previous heartbeat need not be sent again while it is still inside `suspectWindow`. It sends every required `flag`; repeating an existing flag has no effect. After every report is confirmed, the daemon commits the complete work set in the heartbeat's `data` and sends the heartbeat for `reportBlock`. The cycle completes when that heartbeat is confirmed.
 
 ## Heartbeat requirements
 
@@ -144,7 +148,7 @@ The daemon may send the heartbeat only after:
 
 - candidate discovery and contributor reconstruction finished with every requested log range returned successfully;
 - every work anchor has one complete screening result, except anchors for a target that this Guardian had already flagged at `reportBlock`;
-- every `suspect` or `flag` required by those results was submitted in this cycle and remains confirmed with at least `txConfirmationBlocks` confirmations.
+- every `suspect` or `flag` required by those results was submitted in this cycle or in an earlier attempt since the previous heartbeat, remains confirmed with at least `txConfirmationBlocks` confirmations and, for a `suspect`, is still inside `suspectWindow`.
 
 Any other tool or person that sends a heartbeat for this Guardian makes the same attestation. Later cycles use that heartbeat as their previous coverage boundary and may skip earlier anchors. Removing a flag later does not make those anchors require screening again.
 

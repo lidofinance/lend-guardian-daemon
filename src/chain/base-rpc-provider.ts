@@ -1,10 +1,11 @@
 // Shared JSON-RPC reads. No client is constructed here; request uses the caller's transport.
 import { hexToBigInt, hexToNumber, numberToHex } from 'viem';
 import type { RpcLog, PublicRpcSchema } from 'viem';
+import { lower } from '../common/types.ts';
 import type { Address, BlockRef, Bytes32, Hex, TxHash } from '../common/types.ts';
 import { requireInteger } from '../common/validation.ts';
 import type {
-  BlockLogFilter,
+  ChainTransaction,
   ChainLog,
   LogFilter,
   ReceiptRef,
@@ -78,10 +79,21 @@ export class BaseRpcProvider implements RpcProvider {
     };
   }
 
-  async getLogs(filter: LogFilter | BlockLogFilter): Promise<ChainLog[]> {
-    if ('blockHash' in filter) {
-      return this.#logs(filter);
+  /** JSON-RPC null means unknown. A pending transaction is returned with the call it carries. */
+  async getTransaction(hash: TxHash): Promise<ChainTransaction | null> {
+    const transaction = await this.request({ method: 'eth_getTransactionByHash', params: [hash] });
+    if (transaction === null) {
+      return null;
     }
+    return {
+      transactionHash: transaction.hash,
+      from: lower(transaction.from),
+      to: transaction.to === null ? null : lower(transaction.to),
+      input: transaction.input,
+    };
+  }
+
+  async getLogs(filter: LogFilter): Promise<ChainLog[]> {
     const found: ChainLog[] = [];
     for await (const logs of this.logBatches(filter, 'forward')) {
       found.push(...logs);
@@ -89,20 +101,41 @@ export class BaseRpcProvider implements RpcProvider {
     return found.sort(byLogPosition);
   }
 
-  /** Static inclusive ranges; the consumer can stop a backward walk as soon as it has evidence. */
+  /**
+   * Static inclusive ranges; the consumer can stop a backward walk as soon as it has evidence. A range
+   * whose read fails is read again in halves, down to one block, because a provider's log limit or the
+   * transport's response limit refuses a range that holds too many logs. The rest of that static range is
+   * then read at the size that worked, since the blocks next to a dense one are usually as dense, and the
+   * next static range is tried whole again. A block that fails alone propagates its error.
+   */
   async *logBatches(filter: LogFilter, direction: 'forward' | 'backward'): AsyncGenerator<ChainLog[]> {
-    const ranges = this.#blockRanges(filter.fromBlock, filter.toBlock, direction);
-    for (const [from, to] of ranges) {
-      yield await this.#logs({
-        address: filter.address,
-        ...(filter.topics === undefined
-          ? {}
-          : {
-              topics: filter.topics.map((topic) => (typeof topic === 'string' || topic === null ? topic : [...topic])),
-            }),
-        fromBlock: numberToHex(from),
-        toBlock: numberToHex(to),
-      });
+    // Ranges still to read, the next one last, each with the size of its next read: the whole range until a
+    // read fails, then half the failed size for the rest of the range.
+    const pending = [...this.#blockRanges(filter.fromBlock, filter.toBlock, direction)]
+      .reverse()
+      .map(([from, to]) => ({ from, to, size: to - from + 1 }));
+    while (true) {
+      const range = pending.pop();
+      if (range === undefined) {
+        return;
+      }
+      const from = direction === 'forward' ? range.from : Math.max(range.from, range.to - range.size + 1);
+      const to = direction === 'forward' ? Math.min(range.to, range.from + range.size - 1) : range.to;
+      let logs: ChainLog[];
+      try {
+        logs = await this.#rangeLogs(filter, from, to);
+      } catch (error) {
+        if (from === to) {
+          throw error;
+        }
+        pending.push({ ...range, size: Math.ceil((to - from + 1) / 2) });
+        continue;
+      }
+      yield logs;
+      const unread = direction === 'forward' ? { ...range, from: to + 1 } : { ...range, to: from - 1 };
+      if (unread.from <= unread.to) {
+        pending.push(unread);
+      }
     }
   }
 
@@ -131,6 +164,15 @@ export class BaseRpcProvider implements RpcProvider {
     }
     const canonical = await this.getBlock(receipt.blockNumber);
     return canonical.hash === receipt.blockHash && head.number - receipt.blockNumber + 1 >= depth;
+  }
+
+  #rangeLogs(filter: LogFilter, from: number, to: number): Promise<ChainLog[]> {
+    return this.#logs({
+      address: filter.address,
+      ...(filter.topics === undefined ? {} : { topics: [...filter.topics] }),
+      fromBlock: numberToHex(from),
+      toBlock: numberToHex(to),
+    });
   }
 
   async #logs(filter: RpcLogFilter): Promise<ChainLog[]> {

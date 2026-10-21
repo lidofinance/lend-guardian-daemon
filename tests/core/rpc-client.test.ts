@@ -51,6 +51,52 @@ test('latest-log search sorts a batch, decodes every returned log and stops befo
   );
 });
 
+/** A client over a node that serves at most two blocks per log query; `asked` records every range. */
+function twoBlockClient(maxLogBlockRange: number, asked: string[]): BaseRpcProvider {
+  return new BaseRpcProvider({
+    maxLogBlockRange,
+    request: rpcRequest((method, params) => {
+      assert.equal(method, 'eth_getLogs');
+      const filter: unknown = params[0];
+      assert.ok(typeof filter === 'object' && filter !== null && 'fromBlock' in filter && 'toBlock' in filter);
+      const from = Number(BigInt(String(filter.fromBlock)));
+      const to = Number(BigInt(String(filter.toBlock)));
+      asked.push(`${String(from)}-${String(to)}`);
+      if (to - from + 1 > 2) {
+        return Promise.reject(new Error('query returned more than 10000 results'));
+      }
+      return Promise.resolve([rawLog(from)]);
+    }),
+  });
+}
+
+test('a refused log range is read again in halves, and the rest of it at the size that worked', async () => {
+  const asked: string[] = [];
+  const client = twoBlockClient(8, asked);
+  for (const [direction, expected] of [
+    ['forward', ['1-8', '1-4', '1-2', '3-4', '5-6', '7-8']],
+    ['backward', ['1-8', '5-8', '7-8', '5-6', '3-4', '1-2']],
+  ] as const) {
+    asked.length = 0;
+    const batches: ChainLog[][] = [];
+    for await (const logs of client.logBatches(FILTER, direction)) {
+      batches.push(logs);
+    }
+    assert.deepEqual(asked, expected);
+    assert.equal(batches.length, 4, direction);
+  }
+});
+
+test('the static range after a refused one is tried whole again', async () => {
+  const asked: string[] = [];
+  const batches: ChainLog[][] = [];
+  for await (const logs of twoBlockClient(4, asked).logBatches(FILTER, 'forward')) {
+    batches.push(logs);
+  }
+  assert.deepEqual(asked, ['1-4', '1-2', '3-4', '5-8', '5-6', '7-8']);
+  assert.equal(batches.length, 4);
+});
+
 test('receipt confirmation requires the inclusion block to remain canonical', async () => {
   const transactionHash = padHex('0x99', { size: 32 });
   const receipt = {
@@ -159,7 +205,7 @@ test('missing blocks and pending logs fail while an absent receipt remains null'
     request: rpcRequest(() => Promise.resolve([{ ...rawLog(0), blockHash: null, blockNumber: null }])),
     maxLogBlockRange: 1,
   });
-  await assert.rejects(pending.getLogs({ address: CORE, blockHash: padHex('0x01') }), /RPC log has no mined block/);
+  await assert.rejects(pending.getLogs({ address: CORE, fromBlock: 1, toBlock: 1 }), /RPC log has no mined block/);
 });
 
 test('invalid receipt status is rejected instead of becoming a confirmed result', async () => {
@@ -168,4 +214,25 @@ test('invalid receipt status is rejected instead of becoming a confirmed result'
     maxLogBlockRange: 1,
   });
   await assert.rejects(client.getReceipt(padHex('0x01')), /RPC receipt has no valid status/);
+});
+
+test('a transaction carries its sender and recipient in lower case, no recipient for a creation, null when unknown', async () => {
+  const answer = {
+    hash: padHex('0x01'),
+    from: '0x000000000000000000000000000000000000AbCd',
+    to: '0x00000000000000000000000000000000000000Ef',
+    input: '0x1234',
+  };
+  const provider = (to: string | null) =>
+    new BaseRpcProvider({ request: rpcRequest(() => Promise.resolve({ ...answer, to })), maxLogBlockRange: 1 });
+  const known = await provider(answer.to).getTransaction(answer.hash);
+  assert.deepEqual(known, {
+    transactionHash: answer.hash,
+    from: '0x000000000000000000000000000000000000abcd',
+    to: '0x00000000000000000000000000000000000000ef',
+    input: '0x1234',
+  });
+  assert.equal((await provider(null).getTransaction(answer.hash))?.to, null);
+  const unknown = new BaseRpcProvider({ request: rpcRequest(() => Promise.resolve(null)), maxLogBlockRange: 1 });
+  assert.equal(await unknown.getTransaction(answer.hash), null);
 });

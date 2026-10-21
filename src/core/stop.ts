@@ -23,6 +23,8 @@ export type StopReason =
   | 'log-undecodable'
   /** The head a submission is measured from is not the block the nodes hold at its number. */
   | 'head-not-canonical'
+  /** A log a walk read sits in a block that is not the canonical block at its number: a branch the chain does not hold. */
+  | 'log-not-canonical'
   /** A candidate position has no controller history at all, which cannot be. */
   | 'position-without-history'
   /** The controller's events for a position do not compose into the position they record. */
@@ -33,6 +35,8 @@ export type StopReason =
   | 'screening-result-missing'
   /** Required report receipts did not reach the configured depth inside the client's delivery budget. */
   | 'report-confirmation-timeout'
+  /** A report receipt names a transaction that is not the report this Guardian's signer sent to the registry in this attempt. */
+  | 'report-receipt-foreign'
   /** A provider could not judge an anchor, so this cycle cannot attest that it was judged. */
   | 'screening-result-incomplete';
 
