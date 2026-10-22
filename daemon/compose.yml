@@ -1,0 +1,32 @@
+# The daemon, configured from `.env` in this directory; README.md lists the variables.
+#   docker compose -f daemon/compose.yml up --build -d
+services:
+  daemon:
+    build:
+      context: ..
+      dockerfile: daemon/Dockerfile
+    env_file: .env
+    # The resources README.md requires, with three quarters of the memory for Node's heap.
+    environment:
+      NODE_OPTIONS: --max-old-space-size=3072
+    cpus: 2
+    mem_limit: 4g
+    # As the container's first process Node ignores SIGTERM; init passes it on, so a stop is immediate.
+    init: true
+    restart: unless-stopped
+    # Docker's default driver keeps the log in one file that grows without a limit.
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: '5'
+    # `$$` is a literal `$` for Compose, so the check reads HEALTH_PORT inside the container.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - 'fetch(`http://127.0.0.1:$${process.env.HEALTH_PORT ?? 8080}/health`).then((response) => process.exit(response.ok ? 0 : 1), () => process.exit(1))'
+      interval: 1m
+      timeout: 10s
+      retries: 3
