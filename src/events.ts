@@ -126,6 +126,13 @@ export type SdkEvent =
   | CycleEvent
   | RpcEvent
   | {
+      /** The signer's transaction counts a clearing decision was made by, as the answering node reported them. */
+      readonly event: 'nonce.checked';
+      readonly context: TransactionContext;
+      readonly latest: number;
+      readonly pending: number;
+    }
+  | {
       readonly event: 'nonce.cleared';
       readonly context: TransactionContext;
       readonly nonce: number;
@@ -142,6 +149,14 @@ export type SdkEvent =
       readonly transactionHash: TxHash;
       readonly receiptStatus: 'success';
       readonly receiptBlockHash: Bytes32;
+    }
+  | {
+      /** A suspect this Guardian recorded since the previous heartbeat, kept instead of sent again. */
+      readonly event: 'report.skipped';
+      readonly cycleId?: string;
+      readonly method: 'suspect';
+      readonly target: SignalTarget;
+      readonly recordedAt: number;
     };
 
 /**
@@ -182,6 +197,8 @@ export interface RpcRequestFinishedEvent extends Omit<RpcRequestStartedEvent, 'e
   readonly responseBytes: number;
   /** The error the caller receives; it names the endpoint URL and the request, unlike `rpcIndex`. */
   readonly error?: unknown;
+  /** The response's `Retry-After` as passed to viem: whole seconds in milliseconds, bounded by the transport's `timeoutMs`. */
+  readonly retryAfterMs?: number;
 }
 
 /** Providers returned different logs for one read; indexes are positions in the configured URLs. */

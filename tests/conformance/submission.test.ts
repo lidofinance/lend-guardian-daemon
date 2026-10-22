@@ -4,7 +4,7 @@ import { signingClient } from '../core/client.ts';
 // Internal phase values isolate submission here; guardian-cycle.test.ts also runs all five phases.
 import assert from 'node:assert/strict';
 import { after, afterEach, before, beforeEach, test } from 'node:test';
-import { isHex, padHex } from 'viem';
+import { isHex, padHex, zeroHash } from 'viem';
 import { Guardian } from '../../src/core/index.ts';
 import type { Address, Bytes32, SignalTarget, TxHash } from '../../src/core/index.ts';
 import { Screened, Work } from '../../src/core/outcomes.ts';
@@ -221,6 +221,7 @@ function guardianOf(fixture: ProtocolFixture, transport: NodeRequest): Guardian 
     client: signingClient([{ node: transport }], DELEGATE_KEY, 25),
     maxSignalBatchSize: 20,
     idleHeartbeatInterval: 1,
+    screeningTimeoutMs: 10_000,
     heartbeatReserveBlocks: 8,
     txConfirmationBlocks: 12,
   });
@@ -264,3 +265,48 @@ function arrayOf(value: unknown, field: string): readonly unknown[] {
   }
   return value;
 }
+
+/** Mine two blocks a second apart and attest the one before the head, as a previous cycle would have. */
+async function heartbeatBeforeHead(fixture: ProtocolFixture): Promise<void> {
+  await fixture.anvil.testClient.mine({ blocks: 2, interval: 1 });
+  const head = await fixture.anvil.publicClient.getBlockNumber({ cacheTime: 0 });
+  const block = await fixture.anvil.publicClient.getBlock({ blockNumber: head - 1n });
+  await fixture.heartbeat(block, zeroHash);
+}
+
+test('keeps a suspect this Guardian recorded since its previous heartbeat and sends only the heartbeat', async () => {
+  const fixture = await deployed;
+  const target = { marketId: fixture.primaryMarket.id, borrower: BORROWER };
+  await fixture.setSuspectWindow(86_400);
+  await heartbeatBeforeHead(fixture);
+  await fixture.anvil.testClient.mine({ blocks: 1, interval: 1 });
+  await fixture.suspect(target.marketId, [target.borrower]);
+  await fixture.anvil.testClient.mine({ blocks: 12, interval: 1 });
+  const built = await prepared(fixture, [target], 'suspect', async (method) => {
+    if (method === 'eth_sendRawTransaction') {
+      await fixture.anvil.testClient.mine({ blocks: 11 });
+    }
+  });
+  const outcome = await built.guardian.signalAndHeartbeat(built.screened);
+  assert.equal(outcome.kind, 'attested');
+  assert.deepEqual(built.hashes, [outcome.heartbeat]);
+  assert.deepEqual(await suspectedBy(fixture, target.marketId, target.borrower), [fixture.admin.address]);
+});
+
+test('sends again a suspect recorded before the previous heartbeat', async () => {
+  const fixture = await deployed;
+  const target = { marketId: fixture.primaryMarket.id, borrower: BORROWER };
+  await fixture.setSuspectWindow(86_400);
+  await fixture.suspect(target.marketId, [target.borrower]);
+  await heartbeatBeforeHead(fixture);
+  await fixture.anvil.testClient.mine({ blocks: 12, interval: 1 });
+  const built = await prepared(fixture, [target], 'suspect', async (method) => {
+    if (method === 'eth_sendRawTransaction') {
+      await fixture.anvil.testClient.mine({ blocks: 11 });
+    }
+  });
+  const outcome = await built.guardian.signalAndHeartbeat(built.screened);
+  assert.equal(outcome.kind, 'attested');
+  assert.equal(built.hashes.length, 2);
+  assert.equal(built.hashes[1], outcome.heartbeat);
+});

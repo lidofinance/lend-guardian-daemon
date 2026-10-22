@@ -728,3 +728,23 @@ test('replacement fees honor the configured percentage on both fee fields', asyn
   assert.equal(replacement.maxPriorityFeePerGas, 13n);
   assert.equal(replacement.nonce, prepared.nonce);
 });
+
+test('a signature that never returns stops at the send deadline and releases the send', async () => {
+  const hanging = harness({
+    signer: { signTransaction: implemented((_request: Signed) => new Promise<Hex>(() => undefined)) },
+    policy: { sendTimeoutMs: 50 },
+  });
+  const delivery = registryDelivery(hanging.options, hanging.observe);
+  await assert.rejects(delivery.sendSuspects([TARGET], 1), { name: 'DeliveryLimit', reason: 'signing-timeout' });
+  assert.equal(hanging.signer.signTransaction.calls.length, 1);
+  assert.equal(hanging.node.sendRawTransaction.calls.length, 0);
+  assert.deepEqual(
+    hanging.events.map((event) => [event.event, 'stage' in event ? event.stage : undefined]),
+    [
+      ['transaction.preparation', undefined],
+      ['transaction.failed', 'signing'],
+    ],
+  );
+  // The send is released: the next one is not refused as concurrent.
+  await assert.rejects(delivery.sendSuspects([TARGET], 1), { name: 'DeliveryLimit', reason: 'signing-timeout' });
+});
