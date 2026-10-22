@@ -1042,7 +1042,7 @@ export class Guardian {
       return false;
     }
     const transaction = await this.#rpc.getTransaction(receipt.transactionHash);
-    if (transaction === null) {
+    if (transaction?.transactionHash !== receipt.transactionHash) {
       return false;
     }
     this.#requireOwnReport(transaction, context);

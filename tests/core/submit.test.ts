@@ -14,6 +14,7 @@ import type { Address, Hex } from '../../src/common/types.ts';
 import { blockAt, BORROWER, CHAIN_ID, CORE, fakeNode, GUARDIAN, MARKET, REGISTRY } from './fake-node.ts';
 import type { FakeNode, Lot, Script, SuspectRecord } from './fake-node.ts';
 import { guardianOver, IDLE_HEARTBEAT_SECONDS } from './setup.ts';
+import { isRecord } from '../../src/common/validation.ts';
 
 const HEAD = 200_000;
 const REPORT = HEAD - 2;
@@ -763,6 +764,45 @@ for (const field of ['from', 'to', 'input'] as const) {
     assert.deepEqual(sent.calls, ['heartbeat']);
   });
 }
+
+/** A node whose every transaction lookup names another hash than the one asked for, as a broken endpoint might. */
+function otherHashAnswers(node: FakeNode): NodeRequest {
+  return async (method, params) => {
+    const response = await node.transport(method, params);
+    const isTransaction = method === 'eth_getTransactionByHash' && isRecord(response);
+    return isTransaction ? { ...response, hash: blockAt(123).hash } : response;
+  };
+}
+
+/** Screen the due lot over `otherHashAnswers`, every anchor answered with `result`. */
+async function screenOverOtherHash(result: ScreeningResult) {
+  const node = fakeNode(ONE_DUE);
+  const { guardian } = guardianOver(ONE_DUE, {
+    endpoints: [{ node: otherHashAnswers(node) }],
+    screening: { screen: (request) => Promise.resolve(request.anchors.map(() => result)) },
+  });
+  const plan = await guardian.buildScanPlan();
+  assert.equal(plan.kind, 'plan');
+  const work = await guardian.reconstructWork(await guardian.discoverCandidatePositions(plan));
+  return { guardian, sent: node.sent, screened: await guardian.screenWork(work) };
+}
+
+test('a report whose transaction lookup names another hash prevents heartbeat', async () => {
+  const flag: ScreeningResult = { status: 'judged', requiresSuspect: false, requiresFlag: true };
+  const { guardian, sent, screened } = await screenOverOtherHash(flag);
+  assert.deepEqual(await guardian.signalAndHeartbeat(screened), {
+    kind: 'stale',
+    reason: 'report-no-longer-confirmed',
+  });
+  assert.deepEqual(sent.calls, ['flags']);
+});
+
+test('a heartbeat whose transaction lookup names another hash cannot return attested', async () => {
+  const clean: ScreeningResult = { status: 'judged', requiresSuspect: false, requiresFlag: false };
+  const { guardian, sent, screened } = await screenOverOtherHash(clean);
+  await assert.rejects(guardian.signalAndHeartbeat(screened), /is no longer confirmed/);
+  assert.deepEqual(sent.calls, ['heartbeat']);
+});
 
 test('a client that answers the flag batch with the suspect receipt stops the attempt before heartbeat', async () => {
   const node = fakeNode(ONE_DUE);
