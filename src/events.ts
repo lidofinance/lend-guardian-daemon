@@ -28,7 +28,10 @@ export type TransactionContext =
 
 export type TransactionStage = 'preparation' | 'signing' | 'broadcast' | 'confirmation' | 'nonce-clearing';
 
-/** Facts emitted by the signing client; phase timestamps are Unix milliseconds on the process's monotonic timeline. */
+/**
+ * Delivery facts: the signing client emits them for its sends, Guardian for nonce clearing; phase
+ * timestamps are Unix milliseconds on the process's monotonic timeline.
+ */
 export type TransactionDeliveryEvent =
   | {
       readonly event: 'transaction.preparation' | 'transaction.signing';
@@ -195,7 +198,10 @@ export interface RpcRequestFinishedEvent extends Omit<RpcRequestStartedEvent, 'e
   readonly httpStatus: number;
   readonly requestBytes: number;
   readonly responseBytes: number;
-  /** The error the caller receives; it names the endpoint URL and the request, unlike `rpcIndex`. */
+  /**
+   * The error this attempt failed with, which may differ from the error the caller receives; it names
+   * the endpoint URL and the request, unlike `rpcIndex`.
+   */
   readonly error?: unknown;
   /** The response's `Retry-After` as passed to viem: whole seconds in milliseconds, bounded by the transport's `timeoutMs`. */
   readonly retryAfterMs?: number;

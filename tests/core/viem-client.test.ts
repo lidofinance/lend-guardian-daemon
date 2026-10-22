@@ -176,6 +176,49 @@ test('a heartbeat is written with the block as the ABI states it and returns its
   );
 });
 
+test('the signed gas limit is the estimate when the policy sets no headroom', async () => {
+  const { options, observe, signer } = harness();
+
+  await registryDelivery(options, observe).sendHeartbeat(REPORT_BLOCK, DIGEST, 1);
+
+  assert.equal(signer.signTransaction.calls[0]?.[0].gas, 50_000n);
+});
+
+for (const [gasHeadroomBps, gas] of [
+  [2_000, 60_000n],
+  [1_000, 55_000n],
+] as const) {
+  test(`the signed gas limit adds a configured headroom of ${gasHeadroomBps} basis points`, async () => {
+    const { options, observe, signer } = harness({ policy: { gasHeadroomBps } });
+
+    await registryDelivery(options, observe).sendHeartbeat(REPORT_BLOCK, DIGEST, 1);
+
+    assert.equal(signer.signTransaction.calls[0]?.[0].gas, gas);
+  });
+}
+
+test('a gas limit the caller gives is kept without the headroom', async () => {
+  const { options } = harness({ policy: { gasHeadroomBps: 2_000 } });
+
+  const prepared = await new ViemRpcClient(options).prepareTransaction(
+    { chainId: 1, to: GUARDIAN, data: '0x', value: 0n, nonce: 7, gas: 21_000n },
+    { attempt: 1 },
+  );
+
+  assert.equal(prepared.gas, 21_000n);
+});
+
+test('transaction policy rejects an invalid gas headroom before contacting the node', () => {
+  const { options, node } = harness();
+  for (const gasHeadroomBps of [NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => new ViemRpcClient({ ...options, transactionPolicy: { ...options.transactionPolicy, gasHeadroomBps } }),
+      RangeError,
+    );
+  }
+  assert.equal(node.getChainId.calls.length, 0);
+});
+
 test('a second write while one is unresolved is refused', async () => {
   const { options, observe } = harness();
   const submitter = registryDelivery(options, observe);

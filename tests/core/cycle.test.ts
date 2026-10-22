@@ -115,6 +115,27 @@ test('observe cycle returns screened evidence and never submits', async () => {
   assert.equal(cycleEvents(events).at(-1)?.event, 'cycle.finished');
 });
 
+test('an observe cycle with an incomplete answer ends incomplete with its work, and submits nothing', async () => {
+  const events: SdkEvent[] = [];
+  const node = fakeNode(DUE);
+  const client = new BaseRpcProvider({ request: rpcRequest(node.transport), maxLogBlockRange: 10_000 });
+  const { guardian } = guardianOver(DUE, {
+    mode: 'observe',
+    client,
+    onEvent: (event) => events.push(event),
+    screening: { screen: () => Promise.resolve([{ status: 'incomplete' }]) },
+  });
+
+  const outcome = await guardian.cycle();
+  assert.ok(outcome.kind === 'incomplete');
+  assert.equal(outcome.incomplete.length, 1);
+  assert.equal(outcome.work?.anchors, 1);
+  assert.deepEqual(node.sent.calls, []);
+  const finished = cycleEvents(events).at(-1);
+  assert.equal(finished?.event, 'cycle.finished');
+  assert.equal(finished.outcome, outcome);
+});
+
 test('nothing due is a finished cycle without discovery or screening', async () => {
   const events: SdkEvent[] = [];
   const { guardian, sent } = guardianOver(

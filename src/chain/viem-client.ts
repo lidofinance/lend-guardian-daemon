@@ -4,7 +4,7 @@ import type { Account, Chain, PublicClient, TransactionReceipt as ViemReceipt, T
 import { emitEvent } from '../events.ts';
 import type { EventHandler, TransactionContext, TransactionStage } from '../events.ts';
 import { frozenCopy } from '../common/immutable.ts';
-import { rejectAfter } from '../common/timeout.ts';
+import { wait } from '../common/timeout.ts';
 import { BaseRpcProvider } from './base-rpc-provider.ts';
 import { GuardianStop } from '../core/stop.ts';
 import { BroadcastFailure, ReceiptReverted, replacementFee } from './rpc.ts';
@@ -19,6 +19,8 @@ import type {
 } from './rpc.ts';
 import type { Address, Hex, TxHash } from '../common/types.ts';
 import { requireDefined, requireInteger } from '../common/validation.ts';
+
+const BASIS_POINTS_SCALE = 10_000n;
 
 export interface ViemRpcClientOptions {
   readonly publicClient: PublicClient;
@@ -45,6 +47,7 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
   readonly #walletClient: WalletClient<Transport, Chain, Account> | undefined;
   readonly transactionPolicy: TransactionPolicy;
   readonly #onEvent: EventHandler | undefined;
+  readonly #gasHeadroomBps: bigint;
   #isSending = false;
   readonly signer: Address | undefined;
 
@@ -61,6 +64,9 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
     requireInteger('sendTimeoutMs', policy.sendTimeoutMs, { min: 1, max: 2_147_483_647 });
     requireInteger('replacementFeeBumpBps', policy.replacementFeeBumpBps, { min: 1 });
     requireInteger('sendAttempts', policy.sendAttempts, { min: 1 });
+    const gasHeadroomBps = policy.gasHeadroomBps ?? 0;
+    requireInteger('gasHeadroomBps', gasHeadroomBps, { min: 0 });
+    this.#gasHeadroomBps = BigInt(gasHeadroomBps);
     this.#publicClient = options.publicClient;
     this.#walletClient = options.walletClient;
     this.transactionPolicy = Object.freeze({ ...policy });
@@ -163,7 +169,10 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
     }
   }
 
-  /** Estimate a transaction without broadcasting; the caller may supply a specific nonce. */
+  /**
+   * Estimate a transaction without broadcasting. A nonce or gas limit the caller supplies is kept as
+   * given; the policy's headroom goes only on an estimated gas limit.
+   */
   async prepareTransaction(transaction: TransactionRequest, options: TransactionAttempt): Promise<PreparedTransaction> {
     const walletClient = requireDefined('walletClient', this.#walletClient);
     const startedAt = performance.timeOrigin + performance.now();
@@ -180,7 +189,7 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
       value: transaction.value,
       data: transaction.data,
       nonce: prepared.nonce,
-      gas: prepared.gas,
+      gas: transaction.gas ?? prepared.gas + (prepared.gas * this.#gasHeadroomBps) / BASIS_POINTS_SCALE,
       maxFeePerGas: prepared.maxFeePerGas,
       maxPriorityFeePerGas: prepared.maxPriorityFeePerGas,
     });
@@ -246,10 +255,13 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
   ): Promise<Hex> {
     const startedAt = performance.timeOrigin + performance.now();
     const remainingMs = Math.max(deadline - Date.now(), 0);
+    const timer = new AbortController();
     const signed = await Promise.race([
       walletClient.signTransaction({ ...prepared, type: 'eip1559' }),
-      rejectAfter(remainingMs, new DeliveryLimit('signing-timeout')),
-    ]);
+      wait(remainingMs, timer.signal).then(() => {
+        throw new DeliveryLimit('signing-timeout');
+      }),
+    ]).finally(() => timer.abort());
     emitEvent(this.#onEvent, {
       event: 'transaction.signing',
       context,

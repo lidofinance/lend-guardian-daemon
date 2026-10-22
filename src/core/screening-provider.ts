@@ -20,7 +20,7 @@ export interface ScreeningRequest {
  * decision, so a timed-out API cannot be confused with a clean answer: an incomplete result blocks
  * the heartbeat, a judged one does not. The two reports are separate answers, because one anchor
  * can require both. `evidenceReference` is an opaque, non-secret pointer to the provider's evidence,
- * for the Guardian's cycle record. Omission, undefined and null mean no evidence; an identifier
+ * for the Guardian's own records. Omission, undefined and null mean no evidence; an identifier
  * must be a nonempty string.
  */
 export type ScreeningResult =

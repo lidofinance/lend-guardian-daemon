@@ -79,7 +79,8 @@ export interface TransactionPolicy {
   /**
    * Total time budget for one send, including preparation, inclusion and confirmation. Guardian
    * requires an integer from `(txConfirmationBlocks + 1) * slotSeconds * 1000` to 2_147_483_647 and
-   * applies the same budget to its shared report-confirmation wait and to nonce clearing.
+   * applies the same budget to its shared report-confirmation wait and checks it before each step of
+   * nonce clearing.
    */
   readonly sendTimeoutMs: number;
   /** Minimum fee increase for both EIP-1559 fields on replacement, in basis points. */
@@ -88,6 +89,11 @@ export interface TransactionPolicy {
   readonly replacementTimeoutMs: number;
   /** Preparation attempts, including the initial transaction and estimates above the fee cap. */
   readonly sendAttempts: number;
+  /**
+   * Gas added to the node's estimate, in basis points; none when omitted. A registry report costs
+   * more gas when another guardian reports the same account between the estimate and inclusion.
+   */
+  readonly gasHeadroomBps?: number | undefined;
 }
 
 /** Fully specified EIP-1559 transaction, ready for a configured signer. */
