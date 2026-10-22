@@ -65,13 +65,13 @@ interface GuardianConfig {
   readonly screening: ScreeningProvider;
   /** Distance from the observed head to the report block. Defaults to 2. */
   readonly reportBlockLag?: number;
-  /** Registry reads of the targets kept open at once, such as their flags and recorded suspects. Defaults to 8. */
+  /** Reads open at once: the targets' flags and recorded suspects, and the rereads of sent reports. Defaults to 8. */
   readonly readConcurrency?: number;
   /** Maximum markets or controllers read at once in discovery, or candidate positions reconstructed. Defaults to 1. */
   readonly historyReadConcurrency?: number;
   /** Confirmations between report batches, capped at txConfirmationBlocks. Defaults to 2. */
   readonly interBatchConfirmationBlocks?: number;
-  /** Interval between shared report-confirmation checks. Defaults to one network slot. */
+  /** Interval between shared report-confirmation checks and nonce-clearing checks. Defaults to one network slot. */
   readonly confirmationPollIntervalMs?: number;
   /** Seconds after the stored heartbeat before a cycle with no work heartbeats again. */
   readonly idleHeartbeatInterval: number;

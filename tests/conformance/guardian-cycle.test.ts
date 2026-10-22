@@ -198,7 +198,7 @@ test('keeps own-flagged work in coverage without calling the provider', async ()
   assert.equal(await heartbeatTimestamp(fixture), outcome.previousHeartbeatBlock.timestamp);
 });
 
-test('an incomplete real-cycle decision withholds the heartbeat and sends no report', async () => {
+test('an incomplete real-cycle decision withholds the heartbeat', async () => {
   const fixture = await deployed;
   await fixture.primaryMarket.supply(100n);
   await passDeadline(fixture);
