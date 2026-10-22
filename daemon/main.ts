@@ -47,11 +47,10 @@ const SETTINGS = {
   MAX_RESTARTS_PER_CYCLE: { default: 5, min: 0 },
   // Guardian policy; the defaults are the reference example's.
   REPORT_BLOCK_LAG: { default: 2, min: 1 },
-  FLAGGER_READ_CONCURRENCY: { default: 8, min: 1 },
+  READ_CONCURRENCY: { default: 8, min: 1 },
   HISTORY_READ_CONCURRENCY: { default: 8, min: 1 },
-  // A report that a reorg drops is sent again after the shared wait, so a batch waits only for its inclusion.
+  // Every report is read again at full depth before the heartbeat, so a batch waits only for its inclusion.
   INTER_BATCH_CONFIRMATION_BLOCKS: { default: 1, min: 1 },
-  MAX_REPORT_ATTEMPTS: { default: 3, min: 1 },
   CONFIRMATION_POLL_INTERVAL_MS: { default: 12_000, min: 1, max: MAX_TIMER_MS },
   // A report costs up to about 156,000 gas per borrower, so 50 borrowers stay under half of the
   // 16,777,216 gas one transaction may use.
@@ -75,7 +74,6 @@ const SETTINGS = {
   MAX_FEE_PER_GAS_WEI: { default: 100_000_000_000, min: 1 },
   REPLACEMENT_TIMEOUT_MS: { default: 36_000, min: 1, max: MAX_TIMER_MS },
   SEND_ATTEMPTS: { default: 5, min: 1 },
-  GAS_HEADROOM_BPS: { default: 2_000, min: 0 },
   // The screening service, the event receiver and the liveness endpoint.
   SCREENING_TIMEOUT_MS: { default: MAX_SCREENING_TIMEOUT_MS, min: 1, max: MAX_SCREENING_TIMEOUT_MS },
   // A receiver that has not answered by then loses the event; see README.md, Limitations.
@@ -279,10 +277,9 @@ function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
     guardian,
     screening: new HttpScreening(readUrl('SCREENING_URL'), setting('SCREENING_TIMEOUT_MS')),
     reportBlockLag: setting('REPORT_BLOCK_LAG'),
-    flaggerReadConcurrency: setting('FLAGGER_READ_CONCURRENCY'),
+    readConcurrency: setting('READ_CONCURRENCY'),
     historyReadConcurrency: setting('HISTORY_READ_CONCURRENCY'),
     interBatchConfirmationBlocks: setting('INTER_BATCH_CONFIRMATION_BLOCKS'),
-    maxReportAttempts: setting('MAX_REPORT_ATTEMPTS'),
     confirmationPollIntervalMs: setting('CONFIRMATION_POLL_INTERVAL_MS'),
     maxSignalBatchSize: setting('MAX_SIGNAL_BATCH_SIZE'),
     idleHeartbeatInterval: setting('IDLE_HEARTBEAT_INTERVAL_SECONDS'),
@@ -323,7 +320,6 @@ function createClient(mode: Mode, chain: Chain, guardian: Address, onEvent: Even
       maxFeePerGas: BigInt(setting('MAX_FEE_PER_GAS_WEI')),
       replacementTimeoutMs: setting('REPLACEMENT_TIMEOUT_MS'),
       sendAttempts: setting('SEND_ATTEMPTS'),
-      gasHeadroomBps: setting('GAS_HEADROOM_BPS'),
     },
   });
 }
