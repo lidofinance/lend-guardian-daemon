@@ -64,7 +64,8 @@ const GAS_HEADROOM_BPS = 2_000;
  */
 async function main(): Promise<void> {
   const mode = env.mode('MODE');
-  // Only an attempt that reached sending can have left a transaction pending.
+  // Only an attempt that reached sending can have left a transaction pending. The flag sits in an
+  // object because the event handler sets it: TypeScript would narrow a `let` to its initial `false`.
   const attempt = { hasReachedSending: false };
   const guardian = createGuardian(mode, (event) => {
     if (event.event === 'cycle.started') {

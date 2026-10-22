@@ -351,8 +351,8 @@ export class Guardian {
    * The [provider boundary](../../docs/guardian-specification.md#screening-provider) leaves risk policy
    * to the adapter. Skipped anchors remain in Work and therefore in the heartbeat's coverage digest.
    * The provider's answer is awaited no longer than `screeningTimeoutMs`; past it every asked anchor is
-   * incomplete, and a later answer is dropped. Which anchors a repeated attempt asks the provider about
-   * again is the provider's own matter.
+   * incomplete, and a later answer is dropped. A repeated attempt asks the provider about every
+   * remaining anchor again.
    */
   async screenWork(work: Work): Promise<Screened> {
     const { pending, skipped } = await this.#screeningTargets(work);
