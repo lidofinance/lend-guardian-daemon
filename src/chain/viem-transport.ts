@@ -306,6 +306,10 @@ class HttpAttempt {
     if (limit !== false && contentLength !== null) {
       const size = Number(contentLength);
       if (size > limit) {
+        // The body is not read, so cancel it: otherwise the response keeps its connection open.
+        void response.body?.cancel().catch(() => {
+          // The size error is the outcome; cancellation has no separate one.
+        });
         throw new ResponseBodyTooLargeError({ maxSize: limit, size });
       }
     }

@@ -580,6 +580,35 @@ test('rejects an oversized declared body before reading it', async (context) => 
   assert.equal(finished(fixture.events)[0]?.responseBytes, 0);
 });
 
+test('an oversized declared body is cancelled unread, so its connection is not left open', async (context) => {
+  let cancellations = 0;
+  const fixture = transportFixture(
+    context,
+    () =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{'));
+            },
+            cancel() {
+              cancellations += 1;
+            },
+          }),
+          { headers: { 'content-length': '200' } },
+        ),
+      ),
+    { urls: [URLS[0]], maxResponseBodySize: 80, retryCount: 0 },
+  );
+
+  await assert.rejects(fixture.request(CHAIN_ID_REQUEST), (error: unknown) => {
+    const tooLarge = nestedError(error, (candidate) => candidate instanceof ResponseBodyTooLargeError);
+    return tooLarge instanceof ResponseBodyTooLargeError;
+  });
+  await sleep(1);
+  assert.equal(cancellations, 1);
+});
+
 test('observer failures cannot change a successful request', async (context) => {
   const fixture = transportFixture(context, (_input, init) => Promise.resolve(answer(init)), {
     onEvent: () => {
