@@ -321,10 +321,10 @@ export class Guardian {
    * A position of `earlierWork`, such as a stale attempt's, keeps its anchors when that work was
    * reconstructed from the plan's previous heartbeat at a report block that is still canonical, and the
    * newest lifecycle event that discovery read for the position is not after that block. That block's hash
-   * fixes the history below it, and every change of a lot is such an event, so a walk would find the same
-   * anchors: the work is the one a full reconstruction finds, and a retry walks only what changed. The
-   * decision rests on the events discovery read, not on another read that a lagging endpoint could answer
-   * without them.
+   * fixes the history below it, and every change of a lot is such an event, so with complete reads the work
+   * is the one a full reconstruction finds, and a retry walks only what changed. The decision rests on the
+   * events discovery read, not on another read that a lagging endpoint could answer without them. A reused
+   * position is not walked, so a lagging answer in discovery's read is not compared with a walk.
    *
    * The report block is checked canonical before and after the walks, as around discovery, so an
    * endpoint that moved to another branch meanwhile stops the attempt instead of feeding it a history.

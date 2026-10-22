@@ -38,7 +38,7 @@ const TRANSACTION_CONFIRMATION_BLOCKS = 12;
 // The provider's answer is awaited no longer than this; the anchors a slower provider has not answered are incomplete.
 const SCREENING_TIMEOUT_MS = 290_000;
 
-// The SDK's viem transport applies these settings to every physical HTTP attempt.
+// Transport and RPC client settings of this example.
 const RPC_REQUEST_TIMEOUT_MS = 10_000;
 const RPC_RETRY_COUNT = 2;
 const RPC_RETRY_DELAY_MS = 150;

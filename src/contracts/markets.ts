@@ -1,4 +1,4 @@
-// Core and controller reads return typed market evidence; Guardian decides what the cycle covers.
+// Core and controller evidence, and the discovery and reconstruction algorithms that read it.
 
 import {
   encodeEventTopics,
@@ -277,9 +277,9 @@ export class Markets {
   }
 
   /**
-   * The zero-boundary shortcut requires exactly one core supply paired with the activation. The
-   * query names the position's market and borrower, so a block of many borrowers' supplies returns
-   * only this position's; the pairing below checks them as before.
+   * Appendix C reads the previous event to learn whether a lot started from zero absorbed dust. Here the
+   * walk first reads the supply paired with the activation and stops when it carries the whole amount.
+   * The anchors are the same: the activated amount is that supply plus any absorbed dust, so there was none.
    */
   async supplyAfter(position: PositionKey, activation: LifecycleEvent): Promise<SupplyLog> {
     const block = Number(activation.at.blockNumber);
