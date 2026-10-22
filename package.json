@@ -44,6 +44,7 @@
     "check:package": "node scripts/check-package.ts",
     "test:core": "node --test 'tests/core/**/*.test.ts'",
     "test:example": "node --test 'tests/example/**/*.test.ts'",
+    "test:daemon": "node --test 'tests/daemon/**/*.test.ts'",
     "test:conformance": "node --test 'tests/conformance/*.test.ts'"
   },
   "devDependencies": {
