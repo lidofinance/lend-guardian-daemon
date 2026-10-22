@@ -5,7 +5,7 @@ run-name: Build and push lend-guardian-daemon:dev to dev
 on:
   push:
     branches:
-      - develop
+      - feat/develop-build
     paths-ignore:
       - "docs/**"
       - "**.md"
@@ -15,15 +15,49 @@ on:
 permissions:
   contents: read
 
+# The steps of lidofinance/actions k8s-build-push-harbor.yml, without its GitHub environment: the
+# registry credentials are repository secrets and variables, so any branch this file names can build.
+concurrency:
+  group: harbor-push-registry.dev.k8s-dev.org-team-lend/lend-guardian-daemon-dev
+  cancel-in-progress: false
+
 jobs:
   build-and-push:
-    uses: lidofinance/actions/.github/workflows/k8s-build-push-harbor.yml@c7b5b6c5d8013046347d728d748fa741eb214e28
-    with:
-      tag: dev
-      registry: registry.dev.k8s-dev.org
-      registry_username: ${{ vars.REGISTRY_USERNAME }}
-      image: team-lend/lend-guardian-daemon
-      environment: harbor_dev_release
-      dockerfile: daemon/Dockerfile
-    secrets:
-      registry_token: ${{ secrets.HARBOR_DEV_TOKEN }}
+    runs-on: ubuntu-22.04
+    env:
+      IMAGE_REF: registry.dev.k8s-dev.org/team-lend/lend-guardian-daemon:dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup buildx
+        id: buildx
+        uses: docker/setup-buildx-action@d70bba72b1f3fd22344832f00baa16ece964efeb # v3.3.0
+
+      - name: Login to Harbor
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: registry.dev.k8s-dev.org
+          username: ${{ vars.REGISTRY_USERNAME }}
+          password: ${{ secrets.HARBOR_DEV_TOKEN }}
+
+      - name: Build and push docker image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: daemon/Dockerfile
+          push: true
+          builder: ${{ steps.buildx.outputs.name }}
+          tags: ${{ env.IMAGE_REF }}
+          build-args: |
+            BUILD_VERSION=dev
+            BUILD_BRANCH=${{ github.ref_name }}
+            BUILD_COMMIT=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=dev
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
