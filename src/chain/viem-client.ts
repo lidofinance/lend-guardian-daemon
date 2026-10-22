@@ -255,12 +255,13 @@ export class ViemRpcClient extends BaseRpcProvider implements RpcClient {
   ): Promise<Hex> {
     const startedAt = performance.timeOrigin + performance.now();
     const remainingMs = Math.max(deadline - Date.now(), 0);
+    const timer = new AbortController();
     const signed = await Promise.race([
       walletClient.signTransaction({ ...prepared, type: 'eip1559' }),
-      wait(remainingMs).then(() => {
+      wait(remainingMs, timer.signal).then(() => {
         throw new DeliveryLimit('signing-timeout');
       }),
-    ]);
+    ]).finally(() => timer.abort());
     emitEvent(this.#onEvent, {
       event: 'transaction.signing',
       context,

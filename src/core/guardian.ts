@@ -368,10 +368,11 @@ export class Guardian {
       return Screened.fromAnswers(work, { pending, skipped }, []);
     }
     // A provider that never answers must not hold the cycle lock: past the timeout every asked anchor is incomplete.
+    const timer = new AbortController();
     const answers = await Promise.race([
       this.#setup.screening.screen(request),
-      wait(this.#setup.screeningTimeoutMs).then(() => anchors.map(() => INCOMPLETE)),
-    ]);
+      wait(this.#setup.screeningTimeoutMs, timer.signal).then(() => anchors.map(() => INCOMPLETE)),
+    ]).finally(() => timer.abort());
     return Screened.fromAnswers(work, { pending, skipped }, answers);
   }
 
