@@ -24,7 +24,7 @@ export interface ViemRpcTransportOptions {
   /**
    * Providers that must return the same logs; at least two and at most the number of `urls`. When
    * set, every provider is asked for logs and the answers are compared: a lagging provider answers a
-   * log range without its latest blocks and without an error. Every other request is sent as without it.
+   * log range without its latest blocks and without an error. Requests other than `eth_getLogs` are sent as without it.
    */
   readonly logQuorum?: number | undefined;
 }
@@ -98,8 +98,8 @@ const INVALID_ERROR = 'The RPC endpoint returned an invalid error.';
 
 /**
  * The SDK's viem transport: direct HTTP owns an attempt; viem owns retries and endpoint selection.
- * With `logQuorum` it also meets the [RPC requirements](../../docs/guardian-specification.md#rpc-requirements)
- * through several independent providers. That is runner policy, not a specification requirement:
+ * With `logQuorum` it helps the runner meet the [RPC requirements](../../docs/guardian-specification.md#rpc-requirements)
+ * for log completeness through several independent providers. That is runner policy, not a specification requirement:
  * it compares logs only and cannot detect a log that every answering provider omits.
  */
 export function createViemRpcTransport(options: ViemRpcTransportOptions): ViemRpcTransport {
@@ -306,6 +306,10 @@ class HttpAttempt {
     if (limit !== false && contentLength !== null) {
       const size = Number(contentLength);
       if (size > limit) {
+        // The body is not read, so cancel it: otherwise the response keeps its connection open.
+        void response.body?.cancel().catch(() => {
+          // The size error is the outcome; cancellation has no separate one.
+        });
         throw new ResponseBodyTooLargeError({ maxSize: limit, size });
       }
     }

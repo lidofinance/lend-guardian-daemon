@@ -24,8 +24,10 @@ import { Discovered, Screened, Work } from './outcomes.ts';
 import type {
   Attested,
   CycleOutcome,
+  Incomplete,
   NothingDue,
   NothingDueReason,
+  Observed,
   PendingTarget,
   ScanPlan,
   ScreeningTargets,
@@ -35,12 +37,12 @@ import type {
 } from './outcomes.ts';
 import { coverageDigest } from './digest.ts';
 import type { CoverageBounds } from './digest.ts';
-import type { ScreeningProvider } from './screening-provider.ts';
+import type { ScreeningProvider, ScreeningResult } from './screening-provider.ts';
 import { GuardianStop } from './stop.ts';
 import { mapConcurrently } from '../common/concurrency.ts';
 import { requireDefined, requireInteger } from '../common/validation.ts';
 import { frozenCopy } from '../common/immutable.ts';
-import { rejectAfter } from '../common/timeout.ts';
+import { wait } from '../common/timeout.ts';
 import type { Address, BlockRef, Bytes32, ContractDeployment, MarketId } from '../common/types.ts';
 
 /** The deployment a Guardian screens. Every field is fixed for the life of the process. */
@@ -63,13 +65,13 @@ interface GuardianConfig {
   readonly screening: ScreeningProvider;
   /** Distance from the observed head to the report block. Defaults to 2. */
   readonly reportBlockLag?: number;
-  /** Registry reads of the targets kept open at once, such as their flags and recorded suspects. Defaults to 8. */
+  /** Reads open at once: the targets' flags and recorded suspects, and the rereads of sent reports. Defaults to 8. */
   readonly readConcurrency?: number;
   /** Maximum markets or controllers read at once in discovery, or candidate positions reconstructed. Defaults to 1. */
   readonly historyReadConcurrency?: number;
   /** Confirmations between report batches, capped at txConfirmationBlocks. Defaults to 2. */
   readonly interBatchConfirmationBlocks?: number;
-  /** Interval between shared report-confirmation checks. Defaults to one network slot. */
+  /** Interval between shared report-confirmation checks and nonce-clearing checks. Defaults to one network slot. */
   readonly confirmationPollIntervalMs?: number;
   /** Seconds after the stored heartbeat before a cycle with no work heartbeats again. */
   readonly idleHeartbeatInterval: number;
@@ -79,7 +81,7 @@ interface GuardianConfig {
   readonly txConfirmationBlocks: number;
   /** Borrowers per registry report transaction; grouping and ordering belong to Guardian. */
   readonly maxSignalBatchSize: number;
-  /** Longest wait for the provider's answer in `screenWork`; when it ends first the attempt stops as incomplete. */
+  /** Longest wait for the provider's answer in `screenWork`; the anchors it has not answered by then are incomplete. */
   readonly screeningTimeoutMs: number;
   /** Delivery observations and canonically confirmed actions; omitted when no observer is needed. */
   readonly onEvent?: EventHandler;
@@ -117,6 +119,9 @@ const DEFAULT_HISTORY_READ_CONCURRENCY = 1;
 const DEFAULT_INTER_BATCH_CONFIRMATION_BLOCKS = 2;
 
 const MILLISECONDS_PER_SECOND = 1_000;
+
+/** What the attempt holds for an anchor the provider has not answered about in time. */
+const INCOMPLETE: ScreeningResult = Object.freeze({ status: 'incomplete' });
 
 // The supported profile follows the [fixed constants](../../docs/guardian-specification.md#fixed-constants).
 const ACTIVATION_LOOKBACK_SECONDS = 7 * 24 * 60 * 60;
@@ -188,7 +193,7 @@ export class Guardian {
    * Run one complete [scan cycle](../../docs/guardian-specification.md#scan-cycle). The caller owns
    * scheduling and recovery between calls; observe mode returns the screened result without writes.
    * A plan that can no longer be attested once the work is reconstructed is stale before screening.
-   * Pass a stale outcome's `work` as `earlierWork` to the next attempt, which reuses what it reconstructed.
+   * Pass a stale or incomplete outcome's `work` as `earlierWork` to the next attempt, which reuses what it reconstructed.
    */
   async cycle(previousHeartbeatBlock?: BlockRef | null, earlierWork?: Work): Promise<CycleOutcome> {
     if (this.#activeCycle !== undefined) {
@@ -243,12 +248,8 @@ export class Guardian {
       });
       const outcome: CycleOutcome =
         this.#setup.mode === 'observe'
-          ? Object.freeze({
-              kind: 'observed',
-              previousHeartbeatBlock: frozenCopy(work.previousHeartbeatBlock),
-              screened,
-            })
-          : attachWorkToStale(frozenCopy(await this.signalAndHeartbeat(screened)), work);
+          ? observedOutcome(screened)
+          : attachWork(frozenCopy(await this.signalAndHeartbeat(screened)), screened.work());
       return this.#finishCycle(context, startedAt, outcome);
     } catch (error) {
       emitEvent(this.#setup.onEvent, {
@@ -320,10 +321,10 @@ export class Guardian {
    * A position of `earlierWork`, such as a stale attempt's, keeps its anchors when that work was
    * reconstructed from the plan's previous heartbeat at a report block that is still canonical, and the
    * newest lifecycle event that discovery read for the position is not after that block. That block's hash
-   * fixes the history below it, and every change of a lot is such an event, so a walk would find the same
-   * anchors: the work is the one a full reconstruction finds, and a retry walks only what changed. The
-   * decision rests on the events discovery read, not on another read that a lagging endpoint could answer
-   * without them.
+   * fixes the history below it, and every change of a lot is such an event, so with complete reads the work
+   * is the one a full reconstruction finds, and a retry walks only what changed. The decision rests on the
+   * events discovery read, not on another read that a lagging endpoint could answer without them. A reused
+   * position is not walked, so a lagging answer in discovery's read is not compared with a walk.
    *
    * The report block is checked canonical before and after the walks, as around discovery, so an
    * endpoint that moved to another branch meanwhile stops the attempt instead of feeding it a history.
@@ -349,7 +350,9 @@ export class Guardian {
    * skip provider screening for their targets; every remaining anchor needs a complete decision.
    * The [provider boundary](../../docs/guardian-specification.md#screening-provider) leaves risk policy
    * to the adapter. Skipped anchors remain in Work and therefore in the heartbeat's coverage digest.
-   * The provider's answer is awaited no longer than `screeningTimeoutMs`; a later answer is dropped.
+   * The provider's answer is awaited no longer than `screeningTimeoutMs`; past it every asked anchor is
+   * incomplete, and a later answer is dropped. A repeated attempt asks the provider about every
+   * remaining anchor again.
    */
   async screenWork(work: Work): Promise<Screened> {
     const { pending, skipped } = await this.#screeningTargets(work);
@@ -364,11 +367,12 @@ export class Guardian {
     if (anchors.length === 0) {
       return Screened.fromAnswers(work, { pending, skipped }, []);
     }
-    // A provider that never answers must not hold the cycle lock.
+    // A provider that never answers must not hold the cycle lock: past the timeout every asked anchor is incomplete.
+    const timer = new AbortController();
     const answers = await Promise.race([
       this.#setup.screening.screen(request),
-      rejectAfter(this.#setup.screeningTimeoutMs, new GuardianStop('screening-result-incomplete')),
-    ]);
+      wait(this.#setup.screeningTimeoutMs, timer.signal).then(() => anchors.map(() => INCOMPLETE)),
+    ]).finally(() => timer.abort());
     return Screened.fromAnswers(work, { pending, skipped }, answers);
   }
 
@@ -381,8 +385,13 @@ export class Guardian {
    * still be canonical before heartbeat; the cycle ends only after the heartbeat is confirmed.
    * The client's `sendTimeoutMs` bounds each send and the shared wait of each report kind. When
    * the wait ends first the attempt stops with `report-confirmation-timeout`, its reports included.
+   *
+   * With anchors still incomplete, the reports the complete answers require are sent and confirmed
+   * all the same, and the attempt ends as incomplete instead of a heartbeat: the reports then stand
+   * in the chain whatever happens to the process, and the attempt that completes the screening
+   * finds them recorded and has fewer to send.
    */
-  async signalAndHeartbeat(screened: Screened): Promise<Attested | Stale | NothingDue> {
+  async signalAndHeartbeat(screened: Screened): Promise<Attested | Stale | NothingDue | Incomplete> {
     if (this.#isWriting) {
       throw new Error('another write operation is in progress');
     }
@@ -404,6 +413,13 @@ export class Guardian {
       const reported = await this.#submitRequiredSignals(screened, recorded, reportConfirmationTimeoutMs);
       if ('kind' in reported) {
         return reported;
+      }
+      if (screened.incomplete.length > 0) {
+        return {
+          kind: 'incomplete',
+          previousHeartbeatBlock: work.previousHeartbeatBlock,
+          incomplete: screened.incomplete,
+        };
       }
 
       const staleReason = await this.#planInvalidationReason(work);
@@ -1027,7 +1043,7 @@ export class Guardian {
       return false;
     }
     const transaction = await this.#rpc.getTransaction(receipt.transactionHash);
-    if (transaction === null) {
+    if (transaction?.transactionHash !== receipt.transactionHash) {
       return false;
     }
     this.#requireOwnReport(transaction, context);
@@ -1098,9 +1114,20 @@ function validateSetup(setup: GuardianState): void {
   }
 }
 
-/** A stale result carries the attempt's work to the next attempt. */
-function attachWorkToStale(result: Attested | Stale | NothingDue, work: Work): Attested | Stale | NothingDue {
-  return result.kind === 'stale' ? Object.freeze({ ...result, work }) : result;
+/** A stale or incomplete result carries the attempt's work to the next attempt. */
+function attachWork(result: Attested | Stale | NothingDue | Incomplete, work: Work): CycleOutcome {
+  const carriesWork = result.kind === 'stale' || result.kind === 'incomplete';
+  return carriesWork ? Object.freeze({ ...result, work }) : result;
+}
+
+/** What an observing cycle established: the screened result, or the anchors still without an answer. */
+function observedOutcome(screened: Screened): Observed | Incomplete {
+  const work = screened.work();
+  const previousHeartbeatBlock = frozenCopy(work.previousHeartbeatBlock);
+  if (screened.incomplete.length > 0) {
+    return Object.freeze({ kind: 'incomplete', previousHeartbeatBlock, incomplete: screened.incomplete, work });
+  }
+  return Object.freeze({ kind: 'observed', previousHeartbeatBlock, screened });
 }
 
 /** viem caches its verdict by the text of a value, so only a string may reach it. */

@@ -95,7 +95,7 @@ function print(...values: unknown[]): void {
     process.exit(0);
   }
   const observed = message.startsWith('observed:');
-  const incomplete = message.includes('screening-result-incomplete');
+  const incomplete = message.startsWith('incomplete:');
   if (scenario === 'observe' && observed) {
     assert.deepEqual(node.sent.calls, []);
     process.exit(0);

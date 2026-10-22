@@ -1,7 +1,7 @@
 // The specification's `REQUIRE`: the attempt cannot continue, and no heartbeat is sent. It is an
 // exception rather than a returned value because it can arise several calls deep, and the phases
-// read better without threading a failure through every step. The reason is a closed set because
-// the daemon writes it into the cycle record and decides from it whether to alert.
+// read better without threading a failure through every step. The reason is a closed set so the
+// caller can decide from it what to do next.
 
 /** Why the attempt stopped: a missing requirement or an SDK mode restriction. */
 export type StopReason =
@@ -25,7 +25,7 @@ export type StopReason =
   | 'head-not-canonical'
   /** A log a walk read sits in a block that is not the canonical block at its number: a branch the chain does not hold. */
   | 'log-not-canonical'
-  /** A candidate position has no controller history at all, which cannot be. */
+  /** A walk found no controller event for a candidate position, as a lagging endpoint answers. */
   | 'position-without-history'
   /** The controller's events for a position do not compose into the position they record. */
   | 'position-history-broken'
@@ -36,9 +36,7 @@ export type StopReason =
   /** Required report receipts did not reach the configured depth inside the client's delivery budget. */
   | 'report-confirmation-timeout'
   /** A report receipt names a transaction that is not the report this Guardian's signer sent to the registry in this attempt. */
-  | 'report-receipt-foreign'
-  /** A provider could not judge an anchor, so this cycle cannot attest that it was judged. */
-  | 'screening-result-incomplete';
+  | 'report-receipt-foreign';
 
 export class GuardianStop extends Error {
   readonly reason: StopReason;

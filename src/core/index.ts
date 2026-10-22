@@ -7,6 +7,7 @@ export type {
   BlockRange,
   CycleOutcome,
   Discovered,
+  Incomplete,
   NothingDue,
   NothingDueReason,
   Observed,
@@ -30,7 +31,7 @@ export { BroadcastFailure } from '../chain/rpc.ts';
 
 export { BaseRpcProvider } from '../chain/base-rpc-provider.ts';
 export type { BaseRpcProviderOptions } from '../chain/base-rpc-provider.ts';
-export type { ChainLog, LogFilter, TransactionReceipt } from '../chain/rpc.ts';
+export type { ChainLog, ChainTransaction, LogFilter, TransactionReceipt } from '../chain/rpc.ts';
 
 export type {
   CycleContext,

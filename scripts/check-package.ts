@@ -41,7 +41,7 @@ try {
     access(join(installed, 'example', 'daemon.ts')),
     access(join(installed, 'src', 'core', 'guardian.ts')),
   ]);
-  for (const path of ['audit-scope.md', 'docs/audit.md', 'tests']) {
+  for (const path of ['audit-scope.md', 'tests']) {
     await assert.rejects(access(join(installed, path)), { code: 'ENOENT' });
   }
   console.log('Packed SDK installs cleanly and exposes /core, /clients, source and maintained documentation');

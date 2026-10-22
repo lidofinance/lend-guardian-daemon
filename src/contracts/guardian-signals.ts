@@ -15,7 +15,7 @@ const HEARTBEAT_ABI = [getAbiItem({ abi: GUARDIAN_SIGNALS_ABI, name: 'Heartbeat'
 
 const GUARDIAN_ADDED_ABI = [getAbiItem({ abi: GUARDIAN_SIGNALS_ABI, name: 'GuardianAdded' })] as const;
 
-/** Chain evidence recovered for phase A of the scan cycle. */
+/** Chain evidence recovered for scan phase 1 (Appendix A). */
 export interface PreviousHeartbeatEvidence {
   readonly previousHeartbeatBlock: BlockRef | null;
   /** The timestamp of the block that included the reusable heartbeat, or null without one. */

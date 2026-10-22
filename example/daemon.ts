@@ -10,7 +10,7 @@ import { pathToFileURL } from 'node:url';
 import { createPublicClient, createWalletClient, isAddressEqual } from 'viem';
 import { createViemRpcTransport, ViemRpcClient } from '../src/chain/viem-client.ts';
 import { Guardian } from '../src/core/index.ts';
-import type { BlockRef, EventHandler, SdkEvent } from '../src/core/index.ts';
+import type { BlockRef, EventHandler, SdkEvent, Work } from '../src/core/index.ts';
 import { screening } from './screening-adapter.ts';
 import { privateKeyToAccount } from 'viem/accounts';
 import * as env from './env.ts';
@@ -35,10 +35,10 @@ const MAX_SIGNAL_BATCH_SIZE = 20;
 const IDLE_HEARTBEAT_INTERVAL_SECONDS = 12 * 60 * 60;
 const HEARTBEAT_RESERVE_BLOCKS = 8;
 const TRANSACTION_CONFIRMATION_BLOCKS = 12;
-// The provider's answer is awaited no longer than this; a slower provider stops the attempt as incomplete.
+// The provider's answer is awaited no longer than this; the anchors a slower provider has not answered are incomplete.
 const SCREENING_TIMEOUT_MS = 290_000;
 
-// The SDK's viem transport applies these settings to every physical HTTP attempt.
+// Transport and RPC client settings of this example.
 const RPC_REQUEST_TIMEOUT_MS = 10_000;
 const RPC_RETRY_COUNT = 2;
 const RPC_RETRY_DELAY_MS = 150;
@@ -52,16 +52,20 @@ const REPLACEMENT_FEE_BUMP_BPS = 1_000;
 const MAX_FEE_PER_GAS_WEI = 100_000_000_000n;
 const REPLACEMENT_TIMEOUT_MS = 36_000;
 const SEND_ATTEMPTS = 5;
+// A report costs more gas when other guardians report the same accounts first, so the gas limit adds
+// a fifth to the node's estimate.
+const GAS_HEADROOM_BPS = 2_000;
 
 /**
  * Schedule [scan attempts](../docs/guardian-specification.md#scan-cycle). The intervals below are
  * example policy and must be chosen for the operator's agreed SLA; the SDK supplies no scheduler.
- * [Failed attempts](../docs/guardian-specification.md#failure-handling) leave the heartbeat hint unchanged
- * and are followed by another attempt after a delay.
+ * [Failed attempts](../docs/guardian-specification.md#failure-handling) leave the heartbeat hint and the
+ * earlier work unchanged and are followed by another attempt after a delay.
  */
 async function main(): Promise<void> {
   const mode = env.mode('MODE');
-  // Only an attempt that reached sending can have left a transaction pending.
+  // Only an attempt that reached sending can have left a transaction pending. The flag sits in an
+  // object because the event handler sets it: TypeScript would narrow a `let` to its initial `false`.
   const attempt = { hasReachedSending: false };
   const guardian = createGuardian(mode, (event) => {
     if (event.event === 'cycle.started') {
@@ -73,11 +77,11 @@ async function main(): Promise<void> {
     logEvent(event);
   });
 
-  // This block only spares the next plan a wider event search, so losing it on restart costs nothing else.
-  let previousHeartbeatBlock: BlockRef | null = null;
+  // The hint and the work only spare the next attempt reads, so losing them on restart costs nothing else.
+  let start: CycleStart = { previousHeartbeatBlock: null };
   while (true) {
     try {
-      previousHeartbeatBlock = await cycle(guardian, previousHeartbeatBlock);
+      start = await cycle(guardian, start);
     } catch (error) {
       console.error('cycle failed:', error);
       if (attempt.hasReachedSending) {
@@ -95,33 +99,45 @@ async function main(): Promise<void> {
   }
 }
 
+/** Where a cycle starts from: the heartbeat hint, and the work an earlier attempt handed on. */
+export interface CycleStart {
+  readonly previousHeartbeatBlock: BlockRef | null;
+  readonly earlierWork?: Work | undefined;
+}
+
 /**
  * Run one [scan cycle](../docs/guardian-specification.md#scan-cycle) and retain only confirmed
- * coverage. A stale result leaves the previous heartbeat hint unchanged.
+ * coverage. A stale result leaves the previous heartbeat hint unchanged; a stale or incomplete one
+ * hands its work to the next attempt.
  */
-export async function cycle(guardian: Guardian, previousHeartbeatBlock: BlockRef | null): Promise<BlockRef | null> {
-  const outcome = await guardian.cycle(previousHeartbeatBlock);
+export async function cycle(guardian: Guardian, start: CycleStart): Promise<CycleStart> {
+  const outcome = await guardian.cycle(start.previousHeartbeatBlock, start.earlierWork);
   if (outcome.kind === 'observed') {
     const { screened } = outcome;
     console.log(
       `observed: ${screened.results.length} screened, ${screened.skipped.length} targets already flagged, ` +
         `${screened.suspects.length} suspects, ${screened.flags.length} flags; no transactions sent`,
     );
-    return outcome.previousHeartbeatBlock;
+    return { previousHeartbeatBlock: outcome.previousHeartbeatBlock };
   }
   if (outcome.kind === 'stale') {
     console.log(`plan went stale: ${outcome.reason}`);
-    return previousHeartbeatBlock;
+    return { previousHeartbeatBlock: start.previousHeartbeatBlock, earlierWork: outcome.work };
   }
   if (outcome.kind === 'nothing-due') {
     console.log(`nothing due: ${outcome.reason}`);
-    return outcome.previousHeartbeatBlock;
+    return { previousHeartbeatBlock: outcome.previousHeartbeatBlock };
+  }
+  if (outcome.kind === 'incomplete') {
+    // The reports the complete answers required are sent; the next cycle asks about the rest again.
+    console.log(`incomplete: ${outcome.incomplete.length} anchors without a complete answer; no heartbeat`);
+    return { previousHeartbeatBlock: outcome.previousHeartbeatBlock, earlierWork: outcome.work };
   }
 
   console.log(
     `attested block ${outcome.previousHeartbeatBlock.number}: heartbeat ${outcome.heartbeat}, digest ${outcome.digest}`,
   );
-  return outcome.previousHeartbeatBlock;
+  return { previousHeartbeatBlock: outcome.previousHeartbeatBlock };
 }
 
 /** Keep the example's progress readable while retaining every lower-level SDK event. */
@@ -169,6 +185,7 @@ function createGuardian(mode: Mode, onEvent: EventHandler): Guardian {
       maxFeePerGas: MAX_FEE_PER_GAS_WEI,
       replacementTimeoutMs: REPLACEMENT_TIMEOUT_MS,
       sendAttempts: SEND_ATTEMPTS,
+      gasHeadroomBps: GAS_HEADROOM_BPS,
     },
   });
 
