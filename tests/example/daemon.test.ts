@@ -4,9 +4,10 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { padHex } from 'viem';
 import { cycle } from '../../example/daemon.ts';
+import type { CycleStart } from '../../example/daemon.ts';
 import { UnconfiguredScreening } from '../../example/screening-adapter.ts';
 import { BaseRpcProvider } from '../../src/core/index.ts';
-import { blockAt, CORE, fakeNode, GUARDIAN, REGISTRY } from '../core/fake-node.ts';
+import { blockAt, CONTROLLER, CORE, fakeNode, GUARDIAN, REGISTRY } from '../core/fake-node.ts';
 import type { Script } from '../core/fake-node.ts';
 import { guardianOver } from '../core/setup.ts';
 
@@ -30,10 +31,25 @@ const DUE: Script = {
   ],
 };
 
+const START: CycleStart = { previousHeartbeatBlock: null };
+
 test('the example never submits or advances coverage when screening is unconfigured', async () => {
   const { guardian, sent } = guardianOver(DUE, { screening: new UnconfiguredScreening() });
-  assert.equal(await cycle(guardian, null), null);
+  assert.equal((await cycle(guardian, START)).previousHeartbeatBlock, null);
   assert.deepEqual(sent.calls, []);
+});
+
+test('an incomplete cycle hands its work to the next one, which walks no position again', async () => {
+  const { guardian, node } = guardianOver(DUE, { screening: new UnconfiguredScreening() });
+  // A walk reads the controller's history of one borrower, named in a topic.
+  const walks = () => node.logQueries.filter((query) => query.address === CONTROLLER && query.topics.length > 1);
+
+  const next = await cycle(guardian, START);
+  const walked = walks().length;
+  assert.ok(walked > 0);
+  await cycle(guardian, next);
+
+  assert.equal(walks().length, walked);
 });
 
 test('observe runs screening through a read-only client and never signals', async (context) => {
@@ -51,7 +67,7 @@ test('observe runs screening through a read-only client and never signals', asyn
   const signalAndHeartbeat = context.mock.method(guardian, 'signalAndHeartbeat', () => {
     assert.fail('observe must not signal or heartbeat');
   });
-  assert.equal(await cycle(guardian, null), null);
+  assert.equal((await cycle(guardian, START)).previousHeartbeatBlock, null);
   assert.equal(signalAndHeartbeat.mock.callCount(), 0);
   assert.deepEqual(node.sent.calls, []);
 });
@@ -62,7 +78,7 @@ test('signal submits the configured provider decisions before the heartbeat', as
       screen: () => Promise.resolve([{ status: 'judged', requiresSuspect: true, requiresFlag: true }]),
     },
   });
-  const previousHeartbeatBlock = await cycle(guardian, null);
+  const { previousHeartbeatBlock } = await cycle(guardian, START);
   assert.ok(previousHeartbeatBlock !== null);
   assert.deepEqual(sent.calls, ['suspects', 'flags', 'heartbeat']);
 });
@@ -72,7 +88,7 @@ test('a provider exception escapes the cycle without sending reports or heartbea
   const { guardian, sent } = guardianOver(DUE, {
     screening: { screen: () => Promise.reject(failure) },
   });
-  await assert.rejects(cycle(guardian, null), (error) => error === failure);
+  await assert.rejects(cycle(guardian, START), (error) => error === failure);
   assert.deepEqual(sent.calls, []);
 });
 
