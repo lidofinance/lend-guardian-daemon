@@ -210,6 +210,7 @@ npm run test:core
 npm run test:example
 npm run test:daemon
 npm run test:conformance
+npm run benchmark:smoke
 node example/main.ts
 ```
 
@@ -224,6 +225,7 @@ Tests use scripted nodes and isolated local Anvil processes; they make no extern
 - [`example/`](example/README.md): the SDK example: the Guardian setup and schedule that the daemon also runs, with a placeholder screening provider.
 - [`daemon/`](daemon/README.md): the deployable daemon built on the example: HTTP screening, event forwarding and a Docker image.
 - [`tests/`](tests/): core, example, daemon and contract-conformance tests.
+- [`benchmarks/`](benchmarks/README.md): SDK cost, amplification, liveness and daemon overhead benchmarks, with [their latest results](benchmarks/RESULTS.md).
 - [`docs/guardian-specification.md`](docs/guardian-specification.md): Guardian specification 0.3.0.
 
 ## License
