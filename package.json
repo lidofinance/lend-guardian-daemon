@@ -5,7 +5,7 @@
   "license": "GPL-2.0-only",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lidofinance/lido-lend-guardian-daemon-sdk.git"
+    "url": "git+https://github.com/lidofinance/lend-guardian-daemon.git"
   },
   "description": "Reference Guardian cycle SDK with a caller-supplied screening provider.",
   "type": "module",

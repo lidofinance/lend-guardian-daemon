@@ -1,4 +1,4 @@
-# guardian-daemon-sdk: agent guide
+# Lido Lend Guardian Daemon: agent guide
 
 This repository contains the Guardian cycle SDK and its partner reference application. The caller implements `ScreeningProvider` and supplies its configured signing/RPC client and cycle loop. The SDK signs and submits registry reports and heartbeats. Transaction deduplication and concurrency belong to each screening provider. Vendor integrations and production operating tools belong to the consuming application. Read this file fully before editing; `CLAUDE.md` points here.
 
@@ -31,7 +31,7 @@ Monitoring, cycle-record retention and operator alerts are outside the Guardian 
 - `scripts/check-surface.ts` follows declarations from the public `/core` entry point and permits only `EIP1193Parameters` and `PublicRpcSchema` in the RPC declaration and rejects other exposed viem types.
 - `tests/core/` drives the core over a scripted node. `tests/example/` covers the launcher modes and incomplete screening placeholder.
 - `tests/conformance/` is the standalone contract and submission evidence package. Its pinned artifacts have their own recorded revision and build provenance; they are not evidence that a live deployment or the current contract checkout has identical bytecode.
-- `docs/guardian-specification.md` is the normative contract. Audit planning stays in the ignored local `audit-scope.md`; do not link it from partner documentation or include it in the package.
+- `docs/guardian-specification.md` is the normative contract.
 
 A module under `src/` never imports from `scripts/`, `tests/` or `example/`. The package exports `/core` for SDK contracts with the standard RPC schema and `/clients` for supplied implementations; it has no root tracker or `/adapters` entry point.
 
@@ -83,7 +83,7 @@ ABI-filtered event queries decode every returned log and stop on one that does n
 
 - Node 24 or newer (`.node-version`). TypeScript runs natively with type stripping. Only erasable syntax is allowed: no enums, namespaces or parameter properties.
 - `npm run check` runs typecheck, lint, format check, a clean build, the public surface check and all tests. Run every stage before finishing a change. `test:core`, `test:example` and `test:conformance` select the corresponding suites. Tests use local fixtures, scripted nodes and isolated Anvil processes and make no external requests. Contract conformance requires Anvil 1.7.1 on `PATH` or selected through `ANVIL_BIN`.
-- `npm run build` removes `dist/` and emits JavaScript and declarations from `src/` and `abi/` into `dist/src/` and `dist/abi/`; no output of a removed module survives. `prepare` builds on dependency installation. The package ships `dist/`, `src/`, `abi/`, the specification, reference example and standard package metadata, README and license, with `/core` and `/clients` entry points. Tests, verification scripts and the local audit scope are outside the package.
+- `npm run build` removes `dist/` and emits JavaScript and declarations from `src/` and `abi/` into `dist/src/` and `dist/abi/`; no output of a removed module survives. `prepare` builds on dependency installation. The package ships `dist/`, `src/`, `abi/`, the specification, reference example and standard package metadata, README and license, with `/core` and `/clients` entry points. Tests and verification scripts are outside the package.
 - The package is `private` until registry publication is arranged. The maintainer has decided the SDK repository will be public; installation uses the public source without credentials. No deploy key is needed. Never create, request or check `SDK_DEPLOY_KEY`.
 - ESLint enforces the mechanical rules of `STYLE_GUIDE.md`; Prettier owns formatting. Do not add `eslint-disable` comments. Format and lint changed files while iterating, then run the full check.
 - Code, comments, tests, documents and reports are written in English. Use the checklist under `.claude/skills/code-quality/SKILL.md` for code changes.
@@ -109,4 +109,4 @@ Keep README and docs focused on maintained API, configuration, operating behavio
 
 ## Public reference distribution
 
-Keep product naming out of prose unless it is required for compatibility. Preserve public configuration fields, ABI signatures and the coverage domain. Do not publish private contract repository URLs in source, fixtures, tests, manifests or documentation. Fixture ABIs include only entries used by the tests or SDK and omit parameter names and Solidity `internalType` metadata; creation bytecode stays pinned. The example is a partner entry point and its guide must match shipped files and behavior.
+Preserve public configuration fields, ABI signatures and the coverage domain. Fixture ABIs include only entries used by the tests or SDK and omit parameter names and Solidity `internalType` metadata; creation bytecode stays pinned. The example is a partner entry point and its guide must match shipped files and behavior.
