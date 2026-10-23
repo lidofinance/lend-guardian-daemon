@@ -20,30 +20,31 @@ npm run benchmark:profile -- --from benchmarks/results/<run>/results.json
 
 `benchmark:smoke` runs small deterministic instances of every scenario family once and fails if any scenario's own checks fail. It makes no timing claims. `benchmark` runs the `full` preset: two warm-up runs and five measured runs of every scenario. `benchmark:profile` re-runs the slowest and the most memory-heavy scenario of an earlier run once, by median CPU time and median peak RSS, with Node's CPU profiler and sampling heap profiler; `--profile --preset <preset> --scenario <id>` profiles a named scenario instead.
 
-The `anvil` family and the conformance fixtures it reuses need Anvil 1.7.1 on `PATH` or selected through `ANVIL_BIN`. The `griefing` family searches for a capacity in every run and builds histories of hundreds of thousands of logs, so run it once per scenario with a larger heap and an hour per scenario:
+The `anvil` family and the conformance fixtures it reuses need Anvil 1.7.1 on `PATH` or selected through `ANVIL_BIN`. The `griefing` family searches for a capacity in every run, so run it once per scenario, with the daemon's 3 GB heap and an hour per scenario. The chain server holds the attack's history in a heap of its own, 16 GB by default:
 
 ```bash
-npm run benchmark -- --filter griefing --repeat 1 --warmup 0 --max-old-space-mb 16384 --timeout-ms 3600000
+npm run benchmark -- --filter griefing --repeat 1 --warmup 0 --max-old-space-mb 3072 --timeout-ms 3600000
 ```
 
-The `stress` preset runs the same floods without the attacker's budget, up to the most operations whose history the chain server holds in that heap: five million dust deposits or four and a half million withdrawn lots. It shows how large an attack a first cycle survives, not what one costs; give it two hours per scenario:
+The `stress` preset runs the same floods without the attacker's budget, up to the most operations whose history the chain server holds in its default heap: five million dust deposits or four and a half million withdrawn lots. It shows how large an attack a first cycle survives, not what one costs; give it two hours per scenario:
 
 ```bash
-node benchmarks/run.ts --preset stress --commit <revision> --max-old-space-mb 16384 --timeout-ms 7200000
+node benchmarks/run.ts --preset stress --commit <revision> --max-old-space-mb 3072 --timeout-ms 7200000
 ```
 
 Runner options:
 
-| Option                         | Meaning                                                                                                |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------ |
-| `--preset smoke\|full\|stress` | Scenario set; `smoke` by default.                                                                      |
-| `--filter <text>`              | Only scenarios whose identifier contains the text.                                                     |
-| `--repeat <n>`, `--warmup <n>` | Override the preset's measured and warm-up runs.                                                       |
-| `--commit <revision>`          | Revision recorded with the results; also read from `BENCHMARK_COMMIT`. The runner runs no Git command. |
-| `--output <directory>`         | Parent of the result directory; `benchmarks/results/` by default.                                      |
-| `--timeout-ms <n>`             | Wall-clock limit of one child process; 600000 by default.                                              |
-| `--max-old-space-mb <n>`       | Heap limit of one child process; 4096 by default.                                                      |
-| `--profile`                    | Profile scenarios instead of measuring a preset; needs `--from <results.json>` or `--scenario <id>`.   |
+| Option                          | Meaning                                                                                                |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `--preset smoke\|full\|stress`  | Scenario set; `smoke` by default.                                                                      |
+| `--filter <text>`               | Only scenarios whose identifier contains the text.                                                     |
+| `--repeat <n>`, `--warmup <n>`  | Override the preset's measured and warm-up runs.                                                       |
+| `--commit <revision>`           | Revision recorded with the results; also read from `BENCHMARK_COMMIT`. The runner runs no Git command. |
+| `--output <directory>`          | Parent of the result directory; `benchmarks/results/` by default.                                      |
+| `--timeout-ms <n>`              | Wall-clock limit of one child process; 600000 by default.                                              |
+| `--max-old-space-mb <n>`        | Heap limit of every measured process, one per run and one per griefing probe; 4096 by default.         |
+| `--server-max-old-space-mb <n>` | Heap limit of the chain server process; 16384 by default.                                              |
+| `--profile`                     | Profile scenarios instead of measuring a preset; needs `--from <results.json>` or `--scenario <id>`.   |
 
 Each invocation writes a new directory `<output>/<timestamp>-<preset>/` with `results.json` (environment, parameters, every run's raw measurements and per-metric median, minimum and maximum) and `summary.md` (the tables the runner prints). A profile invocation writes `<timestamp>-profile/` with one directory of `.cpuprofile` and `.heapprofile` files per scenario and `profiles.json`; the files open in Chrome DevTools. An existing directory is never overwritten. `benchmarks/results/` is ignored by Git and Prettier; results are local measurements, not repository documentation.
 
@@ -63,7 +64,7 @@ The `liveness` and `griefing` families run the synthetic node as a paid shared p
 
 The `liveness` family runs a Guardian's whole first cycle over due positions, with a screening service that answers at once or, in one scenario, after 290 seconds, the longest one screening request of the daemon may take, and bisects the largest number whose reports and heartbeat still land within the blockhash budget. With `restarts`, a stale attempt is replanned at once from its work, as the daemon does, and the number counts when any attempt attests. Each probe starts at a slot boundary, so the answer does not depend on where in a slot the previous probe ended.
 
-In the `griefing` family a capped provider refuses a log list above 10,000 entries, and every provider fails a response above the daemon's 10 MB transport limit. Each scenario writes an attack into the first blocks of a Guardian's discovery window and runs the Guardian's first cycle against it in signal mode: it doubles the attack from 100 operations until the cycle no longer attests or the attack reaches its bound, then bisects to within two percent. The bound is two million operations, or fewer when 40 ETH of gas at the cheap base fee buys fewer. The SDK reads a refused range again in halves, so a refusal fails a cycle only when a single block's answer is refused. In the report flood the screening service answers after 290 seconds of chain time, the longest the daemon waits for it. A cycle also fails when the report block ages out or the child's heap in use grows by more than 2,800 MB during it, sampled every 50 ms: the daemon's default 3 GB heap less what an idle daemon holds. Heap in use counts garbage between collections, so the capacity errs low. The attack's price uses the gas of each operation measured on Anvil against the pinned contracts, at the 10th percentile and the median of mainnet base fees over 30 days of 2026, 0.07 and 0.35 gwei. It assumes the base fee stays put; an attack that fills a large share of blocks for hours would raise it.
+In the `griefing` family a capped provider refuses a log list above 10,000 entries, and every provider fails a response above the daemon's 10 MB transport limit. Each scenario writes an attack into the first blocks of a Guardian's discovery window and runs the Guardian's first cycle against it in signal mode: it doubles the attack from 100 operations until the cycle no longer attests or the attack reaches its bound, then bisects to within two percent. The bound is two million operations, or fewer when 40 ETH of gas at the cheap base fee buys fewer. The SDK reads a refused range again in halves, so a refusal fails a cycle only when a single block's answer is refused. In the report flood the screening service answers after 290 seconds of chain time, the longest one screening request of the daemon may take. Each probe runs in a process of its own with the measured process's heap limit, the daemon's 3 GB in the command above, so a cycle also fails when the report block ages out or the probe runs out of heap; `memoryGrowthMb` records how much its heap in use grew, sampled every 50 ms. The attack's price uses the gas of each operation measured on Anvil against the pinned contracts, at the 10th percentile and the median of mainnet base fees over 30 days of 2026, 0.07 and 0.35 gwei. It assumes the base fee stays put; an attack that fills a large share of blocks for hours would raise it.
 
 `synthetic-history.ts` generates lending histories with a seeded pseudo-random source: supplies classified by their controller, drains, maturations and absorbed dust, each with the post-event position the controller records. It follows the transitions in the specification and the controller's activation timer: a lot's delay grows with the market's decaying inflow, and a top-up restarts the timer when that ends it later. The histories cap the delay at two minutes, so every lot is due at the report block; production delays can be far longer. It is not a model of every contract rule; [`tests/conformance/benchmark-history.test.ts`](../tests/conformance/benchmark-history.test.ts) checks that it writes the events the pinned contracts emit for the same operations. `worlds.ts` builds each family's deployment and history from scenario parameters alone, so a separate server process can rebuild the same chain.
 

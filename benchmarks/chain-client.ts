@@ -49,6 +49,12 @@ const TRANSACTION_STATUSES: readonly MinedTransaction['status'][] = ['success', 
 
 const SERVER = new URL('./chain-server.ts', import.meta.url);
 
+/**
+ * Heap of the chain server unless the runner sets another. The server plays the provider and holds the
+ * history, about 2.7 GB per million attack operations; the largest stress attack has five million.
+ */
+export const DEFAULT_SERVER_MAX_OLD_SPACE_MB = 16_384;
+
 /** The scenario's delays on answers: real latency, or a modelled provider's delays in chain time. */
 export interface NodeDelays {
   readonly latency: RpcLatency;
@@ -73,13 +79,17 @@ interface RpcReply {
   readonly error: string | undefined;
 }
 
-/** Start the chain server process and wait for its URL. */
-export function startChainServer(clock: VirtualClock): Promise<ChainServer> {
+/**
+ * Start the chain server process and wait for its URL. It plays the provider, so its heap limit is its
+ * own rather than the measured process's, and it writes no profile of its own.
+ */
+export function startChainServer(clock: VirtualClock, maxOldSpaceMb: number): Promise<ChainServer> {
   return new Promise((resolve, reject) => {
-    // The server inherits the heap limit, but writes no profile of its own.
-    const execArgv = process.execArgv.filter(
-      (flag) => !flag.startsWith('--cpu-prof') && !flag.startsWith('--heap-prof'),
+    const inherited = process.execArgv.filter(
+      (flag) =>
+        !flag.startsWith('--cpu-prof') && !flag.startsWith('--heap-prof') && !flag.startsWith('--max-old-space-size'),
     );
+    const execArgv = [...inherited, `--max-old-space-size=${String(maxOldSpaceMb)}`];
     const server = fork(SERVER, [], {
       execArgv,
       stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
@@ -107,12 +117,12 @@ export function startChainServer(clock: VirtualClock): Promise<ChainServer> {
 
 /** The synthetic chain in the server process, as the benchmark child builds, moves and reads it. */
 export class RemoteChain {
-  readonly #url: string;
+  readonly url: string;
 
   readonly #clock: VirtualClock;
 
   constructor(url: string, clock: VirtualClock) {
-    this.#url = url;
+    this.url = url;
     this.#clock = clock;
   }
 
@@ -244,7 +254,7 @@ export class RemoteChain {
 
   /** Send the child's chain time with the request, and move the clock forward to the server's. */
   async #post(path: string, body: unknown, headers: Readonly<Record<string, string>>): Promise<Response> {
-    const response = await fetch(`${this.#url}${path}`, {
+    const response = await fetch(`${this.url}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', [CHAIN_TIME_HEADER]: String(this.#clock.now()), ...headers },
       body: JSON.stringify(body),

@@ -4,6 +4,8 @@
 // family states checks about its own result, so a benchmark that measured the wrong behaviour fails
 // instead of reporting numbers.
 
+import { fork } from 'node:child_process';
+import { isRecord } from '../src/common/validation.ts';
 import { Guardian, GuardianStop } from '../src/core/index.ts';
 import type {
   CycleOutcome,
@@ -15,7 +17,15 @@ import type {
 } from '../src/core/index.ts';
 import { Screened, Work } from '../src/core/outcomes.ts';
 import type { PendingTarget } from '../src/core/outcomes.ts';
-import { PhaseTimer, ProviderMeter, ResourceWindow, RpcMeter, amplificationOf, check } from './metrics.ts';
+import {
+  PhaseTimer,
+  ProviderMeter,
+  ResourceWindow,
+  RpcMeter,
+  amplificationOf,
+  check,
+  numberRecordOf,
+} from './metrics.ts';
 import type { Check, ProviderPlan, ResourceUsage, RunReport, WorkCounts } from './metrics.ts';
 import type {
   CycleProfile,
@@ -31,8 +41,8 @@ import type {
   ScreeningScenario,
   SubmissionFault,
 } from './scenarios.ts';
-import { startChainServer } from './chain-client.ts';
-import type { RemoteChain, WorldFacts } from './chain-client.ts';
+import { RemoteChain, startChainServer } from './chain-client.ts';
+import type { WorldFacts } from './chain-client.ts';
 import { SyntheticClient } from './synthetic-client.ts';
 import type { Delivery } from './synthetic-client.ts';
 import { BLOCKHASH_LOOKBACK, CHAIN_ID, ProviderQueue, SLOT_SECONDS, timestampOf } from './synthetic-rpc.ts';
@@ -78,6 +88,13 @@ interface RunContext {
   readonly clock: VirtualClock;
   readonly presetName: string;
   readonly scenarioId: string;
+  readonly serverMaxOldSpaceMb: number;
+}
+
+/** What a run needs besides its scenario and clock: the preset it belongs to and the chain server's heap. */
+interface RunSetting {
+  readonly presetName: string;
+  readonly serverMaxOldSpaceMb: number;
 }
 
 interface GuardianSettings {
@@ -103,7 +120,7 @@ const DEFAULT_SETTINGS: GuardianSettings = {
   historyReadConcurrency: 8,
   maxSignalBatchSize: 50,
   txConfirmationBlocks: 12,
-  interBatchConfirmationBlocks: 1,
+  interBatchConfirmationBlocks: 2,
   inclusionBlocks: 1,
   rpcLatency: NO_LATENCY,
   providerProfile: undefined,
@@ -162,8 +179,9 @@ interface Settled<Result> {
 }
 
 /** Run one scenario in this process and report what it measured. */
-export function runScenario(scenario: Scenario, clock: VirtualClock, presetName: string): Promise<RunReport> {
-  const context: RunContext = { clock, presetName, scenarioId: scenario.id };
+export function runScenario(scenario: Scenario, clock: VirtualClock, run: RunSetting): Promise<RunReport> {
+  const { presetName } = run;
+  const context: RunContext = { clock, ...run, scenarioId: scenario.id };
   const { parameters } = scenario;
   switch (parameters.family) {
     case 'discovery':
@@ -748,12 +766,6 @@ async function cycleProbe(
 /** The log list limit of a capped provider, as major public providers set it. */
 const PROVIDER_LOG_LIMIT = 10_000;
 
-/**
- * Memory a cycle may add to the process before the attack counts as exceeding the Guardian: the
- * daemon's default heap of 3,072 MB less the about 270 MB an idle daemon holds in its container.
- */
-const MEMORY_LIMIT_MB = 2_800;
-
 const MEMORY_SAMPLE_INTERVAL_MS = 50;
 
 /**
@@ -795,7 +807,7 @@ interface GriefingProbe {
 
 async function runGriefing(parameters: GriefingScenario, context: RunContext): Promise<RunReport> {
   const window = new ResourceWindow();
-  const search = await runOnChainServer(context, (chain) => searchCapacity(parameters, context, chain));
+  const search = await runOnChainServer(context, (chain) => searchCapacity(parameters, context, chain.url));
   const usage = window.close();
   const { fits, breaks } = search;
   const capacity = fits?.operations ?? 0;
@@ -841,24 +853,24 @@ interface CapacitySearch {
 async function searchCapacity(
   parameters: GriefingScenario,
   context: RunContext,
-  chain: RemoteChain,
+  chainUrl: string,
 ): Promise<CapacitySearch> {
-  const doubled = await doubleUntilBreak(parameters, context, chain);
+  const doubled = await doubleUntilBreak(parameters, context, chainUrl);
   const { breaks } = doubled;
-  return breaks === undefined ? doubled : bisect(parameters, { context, chain }, { ...doubled, breaks });
+  return breaks === undefined ? doubled : bisect({ context, chainUrl }, { ...doubled, breaks });
 }
 
 async function doubleUntilBreak(
   parameters: GriefingScenario,
   context: RunContext,
-  chain: RemoteChain,
+  chainUrl: string,
 ): Promise<CapacitySearch> {
   let fits: GriefingProbe | undefined;
   let probes = 0;
   const bound = searchBound(parameters);
   let operations = Math.min(FIRST_PROBE_OPERATIONS, bound);
   while (true) {
-    const probe = await griefingProbe(parameters, operations, context, chain);
+    const probe = await probeInProcess(operations, context, chainUrl);
     probes += 1;
     if (probe.failure !== null) {
       return { fits, breaks: probe, probes };
@@ -879,8 +891,7 @@ function searchBound(parameters: GriefingScenario): number {
 }
 
 async function bisect(
-  parameters: GriefingScenario,
-  run: { readonly context: RunContext; readonly chain: RemoteChain },
+  run: { readonly context: RunContext; readonly chainUrl: string },
   bracket: CapacitySearch & { readonly breaks: GriefingProbe },
 ): Promise<CapacitySearch> {
   let { fits, breaks, probes } = bracket;
@@ -889,7 +900,7 @@ async function bisect(
     if (breaks.operations - low <= Math.max(1, Math.floor(low * SEARCH_PRECISION))) {
       return { fits, breaks, probes };
     }
-    const probe = await griefingProbe(parameters, Math.floor((low + breaks.operations) / 2), run.context, run.chain);
+    const probe = await probeInProcess(Math.floor((low + breaks.operations) / 2), run.context, run.chainUrl);
     probes += 1;
     if (probe.failure === null) {
       fits = probe;
@@ -897,6 +908,70 @@ async function bisect(
       breaks = probe;
     }
   }
+}
+
+const CHILD = new URL('./child.ts', import.meta.url);
+
+/**
+ * Run one probe in a process of its own with this process's flags, so it has the heap limit of the
+ * measured process: an attack that exhausts that heap ends the probe, not the search.
+ */
+function probeInProcess(operations: number, context: RunContext, chainUrl: string): Promise<GriefingProbe> {
+  return new Promise((resolve) => {
+    const options = ['--probe-operations', String(operations), '--chain-url', chainUrl];
+    const probe = fork(CHILD, [context.presetName, context.scenarioId, ...options], {
+      execArgv: process.execArgv,
+      stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+      serialization: 'json',
+    });
+    let reported: GriefingProbe | undefined;
+    probe.on('message', (message: unknown) => {
+      reported = parseGriefingProbe(message);
+    });
+    probe.on('exit', (code, signal) => {
+      resolve(
+        reported ?? { operations, outcome: 'crashed', failure: exitFailure(code, signal), candidates: 0, metrics: {} },
+      );
+    });
+  });
+}
+
+/** A probe's report as its process sent it, or undefined when the message is not one. */
+function parseGriefingProbe(message: unknown): GriefingProbe | undefined {
+  if (!isRecord(message)) {
+    return undefined;
+  }
+  const { operations, outcome, failure, candidates } = message;
+  const metrics = numberRecordOf(message.metrics);
+  const hasCounts = typeof operations === 'number' && typeof candidates === 'number';
+  const hasOutcome = typeof outcome === 'string' && (failure === null || typeof failure === 'string');
+  if (!hasCounts || !hasOutcome) {
+    return undefined;
+  }
+  return metrics === undefined ? undefined : { operations, outcome, failure, candidates, metrics };
+}
+
+/** Node aborts once its heap limit is reached, so an abort is the Guardian running out of memory. */
+function exitFailure(code: number | null, signal: NodeJS.Signals | null): string {
+  if (signal === 'SIGABRT' || code === 134) {
+    return 'heap limit';
+  }
+  return `probe exited with ${signal ?? `code ${String(code)}`}`;
+}
+
+/** One probe of a griefing scenario, in the process `probeInProcess` started for it. */
+export function runGriefingProbe(
+  scenario: Scenario,
+  clock: VirtualClock,
+  run: RunSetting,
+  probe: { readonly chainUrl: string; readonly operations: number },
+): Promise<GriefingProbe> {
+  const { parameters } = scenario;
+  if (parameters.family !== 'griefing') {
+    throw new TypeError(`${scenario.id} is not a griefing scenario`);
+  }
+  const context: RunContext = { clock, ...run, scenarioId: scenario.id };
+  return griefingProbe(parameters, probe.operations, context, new RemoteChain(probe.chainUrl, clock));
 }
 
 /** Build the attack, run a first cycle against it over the provider, and record what it cost. */
@@ -929,7 +1004,7 @@ async function griefingProbe(
   const outcome = await harness.guardian.cycle(null).then(outcomeOf, griefingFailure);
   const cpu = process.cpuUsage(cpuBefore);
   const memoryGrowthMb = memory.stop();
-  const failure = outcome === 'attested' ? memoryFailure(memoryGrowthMb) : outcome;
+  const failure = outcome === 'attested' ? null : outcome;
   return {
     operations,
     outcome,
@@ -943,10 +1018,6 @@ async function griefingProbe(
       reportTransactions: transactionCounts(harness.client.deliveries()).reportTransactions,
     },
   };
-}
-
-function memoryFailure(memoryGrowthMb: number): string | null {
-  return memoryGrowthMb > MEMORY_LIMIT_MB ? `memory above ${String(MEMORY_LIMIT_MB)} MB` : null;
 }
 
 /** A provider's or transport's refusal is named by its limit; any other failure keeps its outcome. */
@@ -1052,7 +1123,7 @@ async function runOnChainServer<Result>(
   context: RunContext,
   operation: (chain: RemoteChain) => Promise<Result>,
 ): Promise<Result> {
-  const server = await startChainServer(context.clock);
+  const server = await startChainServer(context.clock, context.serverMaxOldSpaceMb);
   try {
     return await operation(server.chain);
   } finally {

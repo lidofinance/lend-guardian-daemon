@@ -13,6 +13,7 @@ import { arch, cpus, platform, release, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { DEFAULT_SERVER_MAX_OLD_SPACE_MB } from './chain-client.ts';
 import { isPassing, markdownSummary, parseRunReport, summarizeMetrics } from './metrics.ts';
 import type { RunReport, SummaryRow } from './metrics.ts';
 import { profileTargetsOf } from './profiles.ts';
@@ -33,6 +34,7 @@ interface Options {
   readonly output: string;
   readonly timeoutMs: number;
   readonly maxOldSpaceMb: number;
+  readonly serverMaxOldSpaceMb: number;
   /** Re-run chosen scenarios once with CPU and heap profiling instead of measuring a preset. */
   readonly profile: boolean;
   readonly from: string | undefined;
@@ -98,6 +100,7 @@ function parseOptions(): Options {
       output: { type: 'string', default: DEFAULT_OUTPUT },
       'timeout-ms': { type: 'string', default: '600000' },
       'max-old-space-mb': { type: 'string', default: '4096' },
+      'server-max-old-space-mb': { type: 'string', default: String(DEFAULT_SERVER_MAX_OLD_SPACE_MB) },
       profile: { type: 'boolean', default: false },
       from: { type: 'string' },
       scenario: { type: 'string', multiple: true, default: [] },
@@ -113,6 +116,7 @@ function parseOptions(): Options {
     output: values.output,
     timeoutMs: countOf('timeout-ms', values['timeout-ms']),
     maxOldSpaceMb: countOf('max-old-space-mb', values['max-old-space-mb']),
+    serverMaxOldSpaceMb: countOf('server-max-old-space-mb', values['server-max-old-space-mb']),
     profile: values.profile,
     from: values.from,
     scenarios: values.scenario,
@@ -162,13 +166,10 @@ async function measureScenario(scenario: Scenario, preset: Preset, options: Opti
   };
 }
 
-function runChild(
-  presetName: string,
-  scenarioId: string,
-  execution: { readonly flags: readonly string[]; readonly timeoutMs: number },
-): Promise<RunResult> {
+function runChild(presetName: string, scenarioId: string, execution: ChildExecution): Promise<RunResult> {
   return new Promise((resolve) => {
-    const child = fork(CHILD, [presetName, scenarioId], {
+    const serverHeap = ['--server-max-old-space-mb', String(execution.serverMaxOldSpaceMb)];
+    const child = fork(CHILD, [presetName, scenarioId, ...serverHeap], {
       execArgv: [...execution.flags],
       stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
       serialization: 'json',
@@ -193,8 +194,15 @@ function runChild(
   });
 }
 
+/** How a measured child runs: its flags, its time limit and the heap of the chain server it starts. */
+interface ChildExecution {
+  readonly flags: readonly string[];
+  readonly timeoutMs: number;
+  readonly serverMaxOldSpaceMb: number;
+}
+
 /** Flags of every measured child: forced collections, virtual SDK timers and a heap ceiling. */
-function childFlags(options: Options, extraFlags: readonly string[] = []): { flags: string[]; timeoutMs: number } {
+function childFlags(options: Options, extraFlags: readonly string[] = []): ChildExecution {
   return {
     flags: [
       '--expose-gc',
@@ -205,6 +213,7 @@ function childFlags(options: Options, extraFlags: readonly string[] = []): { fla
       ...extraFlags,
     ],
     timeoutMs: options.timeoutMs,
+    serverMaxOldSpaceMb: options.serverMaxOldSpaceMb,
   };
 }
 
