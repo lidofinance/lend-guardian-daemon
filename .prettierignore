@@ -4,4 +4,3 @@ package-lock.json
 dist/
 # Preserve the reviewed specification's minimal editorial diff.
 docs/guardian-specification.md
-audit-scope.md

@@ -1,4 +1,4 @@
-# guardian-daemon-sdk
+# Lido Lend Guardian Daemon
 
 TypeScript reference implementation of the Guardian offchain logic for `GuardianSignals`.
 
@@ -20,14 +20,14 @@ The example starts in observe mode, creates no signer and submits no transaction
 Install a pinned commit from the public repository:
 
 ```bash
-npm install git+https://github.com/lidofinance/lido-lend-guardian-daemon-sdk.git#<commit>
+npm install git+https://github.com/lidofinance/lend-guardian-daemon.git#<commit>
 ```
 
 Node.js 24 or newer is required. The package currently uses `private: true` to disable npm registry publication; installation from Git is supported.
 
 Both entry points need viem at run time. The package declares it as a peer dependency, `^2.55.19`, so the application and the SDK share one viem installation; the SDK is tested with viem 2.55.19. npm installs a missing peer automatically. With a package manager that does not, add viem to the application.
 
-The package exposes two entry points:
+The package is named `guardian-daemon-sdk` and exposes two entry points:
 
 - `guardian-daemon-sdk/core` contains `Guardian`, the screening interface, phase outcomes, shared types and the generic RPC interfaces.
 - `guardian-daemon-sdk/clients` contains `ViemRpcClient`, `createViemRpcTransport` and `LogsNotConfirmedError` for applications using viem.
