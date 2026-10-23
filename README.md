@@ -1,4 +1,4 @@
-# lend-guardian-daemon
+# Lido Lend Guardian Daemon
 
 TypeScript reference implementation of the Guardian offchain logic for `GuardianSignals`.
 

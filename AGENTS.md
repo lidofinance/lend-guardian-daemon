@@ -1,4 +1,4 @@
-# lend-guardian-daemon: agent guide
+# Lido Lend Guardian Daemon: agent guide
 
 This repository contains the Guardian cycle SDK and its partner reference application. The caller implements `ScreeningProvider` and supplies its configured signing/RPC client and cycle loop. The SDK signs and submits registry reports and heartbeats. Transaction deduplication and concurrency belong to each screening provider. Vendor integrations and production operating tools belong to the consuming application. Read this file fully before editing; `CLAUDE.md` points here.
 
