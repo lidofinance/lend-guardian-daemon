@@ -109,4 +109,4 @@ Keep README and docs focused on maintained API, configuration, operating behavio
 
 ## Public reference distribution
 
-Keep product naming out of prose unless it is required for compatibility. Preserve public configuration fields, ABI signatures and the coverage domain. Do not publish private contract repository URLs in source, fixtures, tests, manifests or documentation. Fixture ABIs include only entries used by the tests or SDK and omit parameter names and Solidity `internalType` metadata; creation bytecode stays pinned. The example is a partner entry point and its guide must match shipped files and behavior.
+Preserve public configuration fields, ABI signatures and the coverage domain. Fixture ABIs include only entries used by the tests or SDK and omit parameter names and Solidity `internalType` metadata; creation bytecode stays pinned. The example is a partner entry point and its guide must match shipped files and behavior.
