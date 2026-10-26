@@ -1,0 +1,5 @@
+# Build context is the repository root; the image needs monitoring/ only.
+*
+!monitoring/
+monitoring/node_modules/
+monitoring/.env
