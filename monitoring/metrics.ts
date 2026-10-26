@@ -1,350 +1,312 @@
+// The Prometheus registry. Metric names and outcome labels are those of the previous Guardian daemon, so
+// the `Guardian daemon` dashboard reads them unchanged; the receiver's own state is under
+// `lido_lend_guardian_monitor_`. Label values come from closed sets, never from the stream.
+
 import { collectDefaultMetrics, Counter, Gauge, Histogram, Registry } from '@prometheus-io/client';
-import type { BuildInfo } from './build-info.ts';
-import { isObject } from './events.ts';
-import type { EventPayload, EventName } from './events.ts';
-import type { LogRecord } from './logger.ts';
+import type { DaemonIdentity } from './config.ts';
+import type { Level, Rejection } from './events.ts';
 
-export const CONTENT_TYPE = Registry.PROMETHEUS_CONTENT_TYPE;
-
-const PREFIX = 'lido_lend_guardian_daemon_';
+const DAEMON = 'lido_lend_guardian_daemon_';
 
 const MONITOR = 'lido_lend_guardian_monitor_';
 
-type MetricName =
-  | `${typeof PREFIX}${string}`
-  | `${typeof MONITOR}${string}`
-  | `http_rpc_${string}`
-  | 'rpc_request_total';
+export type CycleOutcome = 'complete' | 'observed' | 'no-change' | 'stale' | 'failed';
 
-const RPC_LABELS = ['network', 'layer', 'provider'] as const;
+export const CYCLE_OUTCOMES: readonly CycleOutcome[] = ['complete', 'observed', 'no-change', 'stale', 'failed'];
 
-const TRANSACTION_EVENTS: ReadonlyMap<string, string> = new Map([
-  ['transaction.preparation', 'preparation'],
-  ['transaction.signing', 'signing'],
-  ['transaction.broadcast', 'broadcast'],
-  ['transaction.included', 'included'],
-  ['transaction.replaced', 'replaced'],
-  ['transaction.retry', 'retry'],
-  ['transaction.failed', 'failed'],
-  ['report.confirmed', 'action-confirmed'],
-  ['report.skipped', 'skipped'],
-  ['nonce.cleared', 'action-confirmed'],
-]);
+/** The registry methods a report names, plus the nonce cancellation. */
+export type ReportMethod = 'suspect' | 'flag' | 'heartbeat' | 'cancel' | 'unknown';
 
-interface HttpStatusLabels {
-  readonly response_code: string;
-  readonly result: 'success' | 'fail';
+export type TransactionStage =
+  | 'preparation'
+  | 'signing'
+  | 'broadcast'
+  | 'included'
+  | 'replaced'
+  | 'retry'
+  | 'failed'
+  | 'confirmed'
+  | 'skipped'
+  | 'nonce-cleared';
+
+export type AnchorResult = 'none' | 'suspect' | 'flag' | 'incomplete';
+
+/** One `rpc.requestFinished`, reduced to the labels of the Lido RPC metrics policy. */
+export interface RpcSample {
+  readonly provider: string;
+  readonly method: string;
+  readonly responseCode: string;
+  readonly isSuccess: boolean;
+  readonly errorCode: string;
+  readonly durationSeconds: number;
+  readonly requestBytes: number;
+  readonly responseBytes: number;
 }
 
-const HTTP_STATUS_LABELS: ReadonlyMap<number, HttpStatusLabels> = new Map([
-  [0, { response_code: '0xx', result: 'fail' }],
-  [1, { response_code: '1xx', result: 'fail' }],
-  [2, { response_code: '2xx', result: 'success' }],
-  [3, { response_code: '3xx', result: 'fail' }],
-  [4, { response_code: '4xx', result: 'fail' }],
-  [5, { response_code: '5xx', result: 'fail' }],
-]);
-
-export interface MetricsSource {
-  metrics(): Promise<string>;
+export interface BuildInfo {
+  readonly version: string;
+  readonly branch: string;
+  readonly commit: string;
 }
 
-/** Runtime metrics belong to the monitoring process. */
-export function runtimeMetrics(): MetricsSource {
-  const registry = new Registry();
-  collectDefaultMetrics({ register: registry });
-  return registry;
-}
+export type RejectionReason = Rejection | 'method' | 'content-type' | 'body-size';
+
+const SECONDS_BUCKETS = [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
+
+const CYCLE_BUCKETS = [1, 5, 15, 30, 60, 120, 300, 600, 1200, 1800];
+
+const DELIVERY_BUCKETS = [1, 5, 12, 24, 36, 60, 120, 240, 336];
+
+const BYTES_BUCKETS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+
+const RPC_LABELS = ['network', 'layer', 'chain_id', 'provider'] as const;
 
 export class Metrics {
   readonly #registry = new Registry();
 
-  readonly #environment: string;
+  readonly #chainId: string;
 
-  #latestCycleAt = 0;
-
-  readonly #cycleTimes = new Map<string, number>();
-
-  readonly #cycle = {
-    count: this.#counter(`${PREFIX}cycles_total`, 'SDK cycle completions by outcome.', ['outcome']),
-    timestamp: this.#gauge(`${PREFIX}last_cycle_timestamp_seconds`, 'Latest SDK cycle completion time by outcome.', [
-      'outcome',
-    ]),
-    duration: this.#gauge(`${PREFIX}last_cycle_duration_seconds`, 'Duration of the latest SDK cycle.'),
-  };
-
-  readonly #report = {
-    number: this.#gauge(`${PREFIX}report_block_number`, 'Latest attested report block number.'),
-    timestamp: this.#gauge(`${PREFIX}report_block_timestamp_seconds`, 'Latest attested report block timestamp.'),
-  };
-
-  readonly #transaction = {
-    count: this.#counter(`${PREFIX}transactions_total`, 'SDK transaction events by method.', ['event', 'method']),
-    preparation: this.#histogram(
-      `${PREFIX}transaction_preparation_duration_seconds`,
-      'Preparation time per broadcast, including replacements.',
-      ['method'],
-      [0.01, 0.05, 0.1, 0.5, 1, 5, 15, 60],
-    ),
-    signing: this.#histogram(
-      `${PREFIX}transaction_signing_duration_seconds`,
-      'Signing time per broadcast, including replacements.',
-      ['method'],
-      [0.01, 0.05, 0.1, 0.5, 1, 5, 15, 60],
-    ),
-    inclusion: this.#histogram(
-      `${PREFIX}transaction_inclusion_duration_seconds`,
-      'First broadcast to inclusion time, not confirmation.',
-      ['method'],
-      [1, 3, 6, 12, 24, 60, 120, 300, 600],
-    ),
-  };
-
-  readonly #transactionDurations: ReadonlyMap<string, Histogram<string>> = new Map([
-    ['transaction.preparation', this.#transaction.preparation],
-    ['transaction.signing', this.#transaction.signing],
-    ['transaction.included', this.#transaction.inclusion],
+  readonly #info = this.#gauge(`${DAEMON}info`, 'Mode, Guardian and chain of the daemon as the pod configures it; 1.', [
+    'mode',
+    'guardian',
+    'chain_id',
   ]);
 
-  readonly #screening = {
-    anchors: this.#counter(`${PREFIX}anchors_screened_total`, 'Screened supply anchors.'),
-    decisions: this.#counter(`${PREFIX}risk_decisions_total`, 'Required screening actions.', ['action']),
-  };
+  readonly #cycles = this.#counter(`${DAEMON}cycles_total`, 'Finished and failed cycles by outcome.', ['outcome']);
 
-  readonly #records = this.#counter(`${PREFIX}log_records_total`, 'Structured log records by level.', ['level']);
+  readonly #lastCycle = this.#gauge(
+    `${DAEMON}last_cycle_timestamp_seconds`,
+    'Unix time of the last finished or failed cycle, by outcome.',
+    ['outcome'],
+  );
 
-  readonly #rpc = {
-    http: this.#counter('http_rpc_requests_total', 'RPC HTTP requests by status and result.', [
-      ...RPC_LABELS,
-      'batched',
-      'response_code',
-      'result',
-    ]),
-    calls: this.#counter('rpc_request_total', 'RPC calls by method and result.', [
-      ...RPC_LABELS,
-      'method',
-      'result',
-      'rpc_error_code',
-    ]),
-    batchSize: this.#histogram(
-      'http_rpc_batch_size',
-      'RPC calls per HTTP request.',
-      RPC_LABELS,
-      [1, 2, 5, 10, 20, 50, 100],
-    ),
-    responseTime: this.#histogram(
-      'http_rpc_response_seconds',
-      'RPC HTTP response time.',
-      RPC_LABELS,
-      [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
-    ),
-    requestBytes: this.#histogram(
-      'http_rpc_request_payload_bytes',
-      'RPC HTTP request body size.',
-      RPC_LABELS,
-      [128, 256, 512, 1024, 2048, 4096, 8192, 16384],
-    ),
-    responseBytes: this.#histogram(
-      'http_rpc_response_payload_bytes',
-      'Successful RPC HTTP response body size.',
-      RPC_LABELS,
-      [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
-    ),
-  };
+  readonly #lastDuration = this.#gauge(
+    `${DAEMON}last_cycle_duration_seconds`,
+    'Duration of the last finished or failed cycle.',
+  );
 
-  readonly #monitor = {
-    events: this.#counter(`${MONITOR}events_total`, 'Accepted SDK events by name.', ['event']),
-    lastEvent: this.#gauge(`${MONITOR}last_event_timestamp_seconds`, 'Latest accepted SDK event ingestion time.', []),
-    failures: this.#counter(`${MONITOR}failures_total`, 'Rejected HTTP events and record failures.', ['reason']),
-  };
+  readonly #cycleDuration = this.#histogram(
+    `${DAEMON}cycle_duration_seconds`,
+    'Duration of finished and failed cycles by outcome.',
+    ['outcome'],
+    CYCLE_BUCKETS,
+  );
 
-  constructor(options: { readonly environment?: string | undefined } = {}) {
-    this.#environment = options.environment ?? 'unknown';
-    for (const outcome of ['no-change', 'complete', 'observed', 'stale', 'failed']) {
-      this.#cycle.count.inc({ outcome }, 0);
+  readonly #reportBlockNumber = this.#gauge(
+    `${DAEMON}report_block_number`,
+    'Report block number of the last complete or observed cycle.',
+  );
+
+  readonly #reportBlockTimestamp = this.#gauge(
+    `${DAEMON}report_block_timestamp_seconds`,
+    'Unix time of the report block of the last complete or observed cycle.',
+  );
+
+  readonly #restarts = this.#counter(
+    `${DAEMON}cycle_restarts_total`,
+    'Plans that went stale and were rebuilt, by reason.',
+    ['reason'],
+  );
+
+  readonly #budgetExhausted = this.#counter(
+    `${DAEMON}restart_budget_exhausted_total`,
+    'Cycles that gave up rebuilding a stale plan.',
+  );
+
+  readonly #notStarted = this.#counter(
+    `${DAEMON}cycles_not_started_total`,
+    'Cycles that did not start because clearing pending nonces failed.',
+  );
+
+  readonly #transactions = this.#counter(
+    `${DAEMON}transactions_total`,
+    'Transaction delivery steps and report outcomes by stage and contract method.',
+    ['event', 'method'],
+  );
+
+  readonly #inclusion = this.#histogram(
+    `${DAEMON}transaction_inclusion_duration_seconds`,
+    'Time from the first broadcast to the first observed inclusion, by contract method.',
+    ['method'],
+    DELIVERY_BUCKETS,
+  );
+
+  readonly #anchors = this.#counter(`${DAEMON}anchors_screened_total`, 'Screened supply anchors by result.', [
+    'result',
+  ]);
+
+  readonly #decisions = this.#counter(
+    `${DAEMON}risk_decisions_total`,
+    'Suspect and flag actions required by screening.',
+    ['action'],
+  );
+
+  readonly #skippedTargets = this.#counter(
+    `${DAEMON}screening_skipped_targets_total`,
+    'Targets withheld from screening because this Guardian had already flagged them.',
+  );
+
+  readonly #records = this.#counter(`${DAEMON}log_records_total`, 'Accepted events by level.', ['level']);
+
+  readonly #answersDiffer = this.#counter(
+    `${DAEMON}rpc_answers_differ_total`,
+    'Log reads for which the RPC providers answered differently.',
+  );
+
+  readonly #httpRequests = this.#counter(
+    'http_rpc_requests_total',
+    'HTTP requests to RPC endpoints by batching, response code class and result.',
+    [...RPC_LABELS, 'batched', 'response_code', 'result'],
+  );
+
+  readonly #httpSeconds = this.#histogram(
+    'http_rpc_response_seconds',
+    'Response time of HTTP requests to RPC endpoints.',
+    RPC_LABELS,
+    SECONDS_BUCKETS,
+  );
+
+  readonly #requestBytes = this.#histogram(
+    'http_rpc_request_payload_bytes',
+    'Body size of HTTP requests to RPC endpoints.',
+    RPC_LABELS,
+    BYTES_BUCKETS,
+  );
+
+  readonly #responseBytes = this.#histogram(
+    'http_rpc_response_payload_bytes',
+    'Body size of HTTP responses from RPC endpoints.',
+    RPC_LABELS,
+    BYTES_BUCKETS,
+  );
+
+  readonly #rpcCalls = this.#counter('rpc_request_total', 'JSON-RPC calls by method, result and JSON-RPC error code.', [
+    ...RPC_LABELS,
+    'method',
+    'result',
+    'rpc_error_code',
+  ]);
+
+  readonly #build = this.#gauge(`${MONITOR}build_info`, 'Version, branch and commit of the receiver; 1.', [
+    'version',
+    'branch',
+    'commit',
+  ]);
+
+  readonly #events = this.#counter(`${MONITOR}events_total`, 'Accepted events by name.', ['event']);
+
+  readonly #rejected = this.#counter(`${MONITOR}rejected_events_total`, 'Rejected requests by reason.', ['reason']);
+
+  readonly #lastEvent = this.#gauge(`${MONITOR}last_event_timestamp_seconds`, 'Unix time the last event was accepted.');
+
+  readonly #lastCycleEnd = this.#gauge(
+    `${MONITOR}last_cycle_end_timestamp_seconds`,
+    'Unix time the last finished or failed cycle was accepted.',
+  );
+
+  readonly #ready = this.#gauge(`${MONITOR}ready`, 'The daemon is fresh: events and cycle ends within their windows.');
+
+  constructor(identity: DaemonIdentity, build: BuildInfo) {
+    this.#chainId = identity.chainId;
+    this.#info.set({ mode: identity.mode, guardian: identity.guardian, chain_id: identity.chainId }, 1);
+    this.#build.set({ version: build.version, branch: build.branch, commit: build.commit }, 1);
+    for (const outcome of CYCLE_OUTCOMES) {
+      this.#cycles.inc({ outcome }, 0);
     }
-    for (const action of ['suspect', 'flag']) {
-      this.#screening.decisions.inc({ action }, 0);
-    }
-    for (const level of ['info', 'warn', 'error', 'fatal']) {
-      this.#records.inc({ level }, 0);
-    }
+    this.#ready.set(0);
+    collectDefaultMetrics({ register: this.#registry });
   }
 
-  monitorStarted(build: BuildInfo): void {
-    this.#gauge(`${MONITOR}build_info`, 'Monitoring image build.', ['name', 'env', 'version', 'branch', 'commit']).set(
-      { name: 'lido-lend-guardian-monitoring', env: this.#environment, ...build },
-      1,
-    );
-  }
-
-  observe(record: LogRecord): void {
-    this.#records.inc({ level: record.level });
-    const transaction = TRANSACTION_EVENTS.get(record.event);
-    if (transaction !== undefined) {
-      const method = text(record.details.method);
-      this.#transaction.count.inc({ event: transaction, method });
-      this.#observeTransaction(record, method);
-      return;
-    }
-    switch (record.event) {
-      case 'cycle.finished':
-      case 'cycle.failed':
-        this.#observeCycle(record);
-        return;
-      case 'screening-result':
-        this.#screening.anchors.inc();
-        return;
-      case 'risk-decision':
-        this.#screening.anchors.inc();
-        if (Array.isArray(record.details.actions)) {
-          for (const action of record.details.actions) {
-            this.#screening.decisions.inc({ action: text(action) });
-          }
-        }
-    }
-  }
-
-  #observeTransaction(record: LogRecord, method: string): void {
-    if (!['suspect', 'flag', 'heartbeat'].includes(method)) {
-      return;
-    }
-    const { startedAt, finishedAt } = record.details;
-    let durationMs = record.details.durationMs;
-    if (record.event !== 'transaction.included') {
-      if (typeof startedAt !== 'number' || typeof finishedAt !== 'number') {
-        return;
-      }
-      durationMs = finishedAt - startedAt;
-    }
-    if (typeof durationMs !== 'number' || !Number.isFinite(durationMs)) {
-      return;
-    }
-    if (durationMs < 0) {
-      return;
-    }
-    const seconds = durationMs / 1000;
-    this.#transactionDurations.get(record.event)?.observe({ method }, seconds);
-  }
-
-  #observeCycle(record: LogRecord): void {
-    const { details } = record;
-    // Source time retains fractional milliseconds that an ISO log timestamp cannot represent.
-    let at: number;
-    if (typeof details.finishedAt === 'number') {
-      at = details.finishedAt / 1000;
-    } else {
-      at = Date.parse(record.timestamp) / 1000;
-    }
-    const outcome = text(details.outcome);
-    this.#cycle.count.inc({ outcome });
-    const previous = this.#cycleTimes.get(outcome) ?? -1;
-    if (at >= previous) {
-      this.#cycleTimes.set(outcome, at);
-      this.#cycle.timestamp.set({ outcome }, at);
-      const report = details.reportBlock;
-      if (outcome === 'complete' && isObject(report)) {
-        this.#report.number.set(Number(report.number));
-        this.#report.timestamp.set(Number(report.timestamp));
-      }
-    }
-    if (at < this.#latestCycleAt) {
-      return;
-    }
-    this.#latestCycleAt = at;
-    if (typeof details.durationMs === 'number') {
-      this.#cycle.duration.set(details.durationMs / 1000);
-    }
-  }
-
-  receivedEvent(event: EventName, timestamp: number): void {
-    this.#monitor.events.inc({ event });
-    this.#monitor.lastEvent.set(timestamp / 1000);
-  }
-
-  receiverFailed(reason: 'body' | 'schema' | 'record' | 'content-type'): void {
-    this.#monitor.failures.inc({ reason });
-  }
-
-  observeRemoteRpc(payload: EventPayload): void {
-    const index = Number(payload.rpcIndex);
-    const labels = { network: 'ethereum', layer: 'el', provider: rpcProvider(index) };
-    const http = httpStatusLabels(Number(payload.httpStatus));
-    this.#rpc.http.inc({
-      ...labels,
-      batched: 'false',
-      ...http,
-    });
-    let rpcResult = 'success';
-    if (payload.error !== undefined) {
-      rpcResult = 'fail';
-    }
-    this.#rpc.calls.inc({
-      ...labels,
-      method: text(payload.method),
-      result: rpcResult,
-      rpc_error_code: '',
-    });
-    this.#rpc.batchSize.observe(labels, 1);
-    this.#rpc.responseTime.observe(labels, (Number(payload.finishedAt) - Number(payload.startedAt)) / 1000);
-    this.#rpc.requestBytes.observe(labels, Number(payload.requestBytes));
-    this.#rpc.responseBytes.observe(labels, Number(payload.responseBytes));
+  get contentType(): string {
+    return this.#registry.contentType;
   }
 
   render(): Promise<string> {
     return this.#registry.metrics();
   }
 
-  #counter(name: MetricName, help: string, labelNames: readonly string[] = []): Counter<string> {
+  accepted(event: string, level: Level, at: number): void {
+    this.#events.inc({ event });
+    this.#records.inc({ level });
+    this.#lastEvent.set(at);
+  }
+
+  rejected(reason: RejectionReason): void {
+    this.#rejected.inc({ reason });
+  }
+
+  ready(isReady: boolean): void {
+    this.#ready.set(isReady ? 1 : 0);
+  }
+
+  /** One cycle end; `finishedAt` is the source's Unix time in seconds, kept monotonic per outcome. */
+  cycleEnded(outcome: CycleOutcome, finishedAt: number, durationSeconds: number, acceptedAt: number): void {
+    this.#cycles.inc({ outcome });
+    this.#cycleDuration.observe({ outcome }, durationSeconds);
+    this.#lastDuration.set(durationSeconds);
+    this.#lastCycle.set({ outcome }, finishedAt);
+    this.#lastCycleEnd.set(acceptedAt);
+  }
+
+  reportBlock(number: number, timestamp: number): void {
+    this.#reportBlockNumber.set(number);
+    this.#reportBlockTimestamp.set(timestamp);
+  }
+
+  restart(reason: string): void {
+    this.#restarts.inc({ reason });
+  }
+
+  restartBudgetExhausted(): void {
+    this.#budgetExhausted.inc();
+  }
+
+  cycleNotStarted(): void {
+    this.#notStarted.inc();
+  }
+
+  transaction(stage: TransactionStage, method: ReportMethod): void {
+    this.#transactions.inc({ event: stage, method });
+  }
+
+  inclusion(method: ReportMethod, seconds: number): void {
+    this.#inclusion.observe({ method }, seconds);
+  }
+
+  anchor(result: AnchorResult): void {
+    this.#anchors.inc({ result });
+    if (result === 'suspect' || result === 'flag') {
+      this.#decisions.inc({ action: result });
+    }
+  }
+
+  skippedTargets(count: number): void {
+    this.#skippedTargets.inc(count);
+  }
+
+  answersDiffer(): void {
+    this.#answersDiffer.inc();
+  }
+
+  rpc(sample: RpcSample): void {
+    const labels = { network: 'ethereum', layer: 'el', chain_id: this.#chainId, provider: sample.provider };
+    const result = sample.isSuccess ? 'success' : 'fail';
+    this.#httpRequests.inc({ ...labels, batched: 'false', response_code: sample.responseCode, result });
+    this.#httpSeconds.observe(labels, sample.durationSeconds);
+    this.#requestBytes.observe(labels, sample.requestBytes);
+    this.#responseBytes.observe(labels, sample.responseBytes);
+    this.#rpcCalls.inc({ ...labels, method: sample.method, result, rpc_error_code: sample.errorCode });
+  }
+
+  #counter(name: string, help: string, labelNames: readonly string[] = []): Counter<string> {
     return new Counter({ name, help, labelNames: [...labelNames], registers: [this.#registry] });
   }
 
-  #gauge(name: MetricName, help: string, labelNames: readonly string[] = []): Gauge<string> {
-    const gauge = new Gauge<string>({
-      name,
-      help,
-      labelNames: [...labelNames],
-      registers: [this.#registry],
-    });
-    if (labelNames.length === 0) {
-      gauge.remove({});
-    }
-    return gauge;
+  #gauge(name: string, help: string, labelNames: readonly string[] = []): Gauge<string> {
+    return new Gauge({ name, help, labelNames: [...labelNames], registers: [this.#registry] });
   }
 
-  #histogram(
-    name: MetricName,
-    help: string,
-    labelNames: readonly string[],
-    buckets: readonly number[],
-  ): Histogram<string> {
-    return new Histogram({
-      name,
-      help,
-      labelNames: [...labelNames],
-      buckets: [...buckets],
-      registers: [this.#registry],
-    });
+  #histogram(name: string, help: string, labelNames: readonly string[], buckets: number[]): Histogram<string> {
+    return new Histogram({ name, help, labelNames: [...labelNames], buckets, registers: [this.#registry] });
   }
-}
-
-function text(value: unknown): string {
-  if (typeof value === 'string') {
-    return value;
-  }
-  return '';
-}
-
-function rpcProvider(index: number): string {
-  if (index < 64) {
-    return `rpc-${index + 1}`;
-  }
-  return 'rpc-other';
-}
-
-function httpStatusLabels(status: number): HttpStatusLabels {
-  if (status === 0) {
-    return { response_code: '', result: 'fail' };
-  }
-  return HTTP_STATUS_LABELS.get(Math.floor(status / 100)) ?? { response_code: '', result: 'fail' };
 }
