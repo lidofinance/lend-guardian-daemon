@@ -104,6 +104,28 @@ test('Work owns its blocks, keys, anchors and map without freezing constructor i
   assert.throws(() => Object.assign(anchor, { logIndex: 0 }), TypeError);
 });
 
+test('Work owns the newest events of its positions without freezing constructor inputs', () => {
+  const source = inputs();
+  const newestEvent = { blockNumber: 100_000, logIndex: 3, blockHash: blockAt(100_000).hash };
+  const expected = new Map([[structuredClone(source.key), structuredClone(newestEvent)]]);
+  const newestEventByPosition = new Map([[source.key, newestEvent]]);
+  const work = new Work(source.plan, source.entries, newestEventByPosition);
+  Object.assign(source.key, { borrower: CORE });
+  Object.assign(newestEvent, { logIndex: 99 });
+  newestEventByPosition.clear();
+  assert.deepEqual(work.newestEvents(), expected);
+
+  const visible = work.newestEvents();
+  assert.ok(visible instanceof Map);
+  visible.clear();
+  assert.deepEqual(work.newestEvents(), expected);
+  const entry = [...work.newestEvents()][0];
+  assert.ok(entry !== undefined);
+  const [key, event] = entry;
+  assert.throws(() => Object.assign(key, { borrower: CORE }), TypeError);
+  assert.throws(() => Object.assign(event, { logIndex: 0 }), TypeError);
+});
+
 test('Screened owns its decisions, skipped entries and report targets', () => {
   const source = inputs();
   const work = new Work(source.plan, source.entries);

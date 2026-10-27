@@ -188,8 +188,9 @@ export class Markets {
 
   /**
    * Reconstruct the uncovered contributors for every candidate position under Appendix C,
-   * `concurrency` positions at a time. A position of `reusableWork` keeps its anchors instead when the
-   * newest event that discovery read for it is not after that work's report block: nothing changed it since.
+   * `concurrency` positions at a time. A position of `reusableWork` keeps its anchors instead when
+   * discovery read for it the newest event that the work's reconstruction started from. The result is keyed
+   * by the candidates' own `position` objects.
    */
   async reconstructWork(
     plan: ScanPlan,
@@ -201,10 +202,14 @@ export class Markets {
     for (const [position, anchors] of reusableWork?.entries() ?? []) {
       reusableAnchors.set(`${position.controller}:${position.borrower}`, anchors);
     }
+    const reusableNewestEventByPosition = new Map<string, LifecycleEventRef>();
+    for (const [position, newestEvent] of reusableWork?.newestEvents() ?? []) {
+      reusableNewestEventByPosition.set(`${position.controller}:${position.borrower}`, newestEvent);
+    }
     const walks = await mapConcurrently(concurrency, candidates, async (candidate) => {
-      const isUnchanged =
-        reusableWork !== undefined && candidate.newestEvent.blockNumber <= reusableWork.reportBlock.number;
       const key = `${candidate.position.controller}:${candidate.position.borrower}`;
+      const earlierNewestEvent = reusableNewestEventByPosition.get(key);
+      const isUnchanged = earlierNewestEvent !== undefined && isSameEventRef(earlierNewestEvent, candidate.newestEvent);
       const anchors = isUnchanged ? reusableAnchors.get(key) : undefined;
       return { position: candidate.position, anchors: anchors ?? (await this.#reconstructPosition(plan, candidate)) };
     });
@@ -711,4 +716,10 @@ class CandidatePositions {
 
 function isSameEvent(at: LogRef, ref: LifecycleEventRef): boolean {
   return Number(at.blockNumber) === ref.blockNumber && at.logIndex === ref.logIndex && at.blockHash === ref.blockHash;
+}
+
+function isSameEventRef(left: LifecycleEventRef, right: LifecycleEventRef): boolean {
+  return (
+    left.blockNumber === right.blockNumber && left.logIndex === right.logIndex && left.blockHash === right.blockHash
+  );
 }
