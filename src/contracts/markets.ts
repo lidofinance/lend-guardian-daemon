@@ -307,10 +307,22 @@ export class Markets {
     return supply;
   }
 
-  /** The controller's lifecycle events for one borrower, newest first. */
+  /**
+   * The controller's lifecycle events for one borrower, newest first. Logs are read back from `until` one range
+   * at a time, only as far as the walk asks.
+   *
+   * Each event after the first is also checked against the event yielded before it: when the position it records
+   * cannot directly precede that event, the walk stops with `position-history-broken`. The check defends against
+   * a node that leaves logs out of the history it returns. The walk takes each older event as the position right
+   * before the newer one, as [Appendix C](../../docs/guardian-specification.md#c-reconstruct-the-contributors)
+   * does, so a missing log would make it drop an anchor or take an older supply in its place. A complete history
+   * always passes, so the check costs no reads and changes no work; an inconsistent one stops, as
+   * [Failure handling](../../docs/guardian-specification.md#failure-handling) requires.
+   */
   async *lifecycleBack(position: PositionKey, until: BlockRef): AsyncGenerator<LifecycleEvent> {
     const floor = this.#deploymentBlock;
     const borrower = pad(position.borrower, { size: 32 });
+    let newer: LifecycleEvent | null = null;
     for await (const logs of this.#rpc.logBatches(
       {
         address: position.controller,
@@ -320,9 +332,16 @@ export class Markets {
       },
       'backward',
     )) {
-      yield* decodeLogs(MARKET_CONTROLLER_ABI, logs)
+      const events = decodeLogs(MARKET_CONTROLLER_ABI, logs)
         .map((log) => this.#lifecycleOf(log))
         .sort((left, right) => byLogPosition(right.at, left.at));
+      for (const event of events) {
+        if (newer !== null && !this.#canPrecede(event.position, newer)) {
+          throw new GuardianStop('position-history-broken');
+        }
+        yield event;
+        newer = event;
+      }
     }
   }
 
@@ -591,6 +610,38 @@ export class Markets {
         return { event: current, positionAtPreviousHeartbeat };
       }
       current = await this.#readOlderLifecycleEvent(events);
+    }
+  }
+
+  /**
+   * Whether `event` can directly follow the event that recorded `before`. Each case mirrors the
+   * `CollateralActivationLib` write that emits that kind of event, compared on `dust` and `activating`; the
+   * controller changes a position only through these writes, so a complete history always passes.
+   */
+  #canPrecede(before: Position, event: LifecycleEvent): boolean {
+    const after = event.position;
+    switch (event.kind) {
+      case 'dusted':
+        // `credit` keeps a supply below the activation threshold as dust.
+        return after.dust === before.dust + event.amount && after.activating === before.activating;
+      case 'activating':
+        // `credit` moves the supply and all the dust into `activating`, so the dust before it cannot exceed `amount`.
+        return after.activating === before.activating + event.amount && before.dust <= event.amount;
+      case 'activated': {
+        // `CollateralActivated` comes from an instant `credit`, which leaves the position as it was, or from a
+        // maturity in `sync`, which moves all of `activating` out as `amount`. Neither changes dust.
+        const isDustUnchanged = after.dust === before.dust;
+        const isInstantActivation = after.activating === before.activating;
+        const isMaturation = after.activating === 0n && event.amount === before.activating;
+        return isDustUnchanged && (isInstantActivation || isMaturation);
+      }
+      case 'drained': {
+        // `CollateralDrained` comes from `seize`, which takes `amount` from dust first and then from `activating`,
+        // or from `debit`, which takes both whole and so fits the same split.
+        const takenDust = before.dust < event.amount ? before.dust : event.amount;
+        const takenActivating = event.amount - takenDust;
+        return after.dust === before.dust - takenDust && after.activating === before.activating - takenActivating;
+      }
     }
   }
 

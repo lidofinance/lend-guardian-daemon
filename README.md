@@ -124,18 +124,19 @@ In observe mode the SDK sends no heartbeat, so a missing log changes only what t
 
 Recommended for production signal mode: at least three endpoints, each from a different provider, with `logQuorum: 2`, so that reads continue while one provider is down or lags. Use different providers because the endpoints of one provider can lag alike.
 
-The SDK checks some answers itself and stops the attempt when they disagree:
+The SDK checks some answers itself and stops the attempt when they disagree. The checks are a defense against a node that answers wrongly or leaves logs out; correct answers always pass them.
 
 - Before and after discovery, and before and after reconstruction, the node must return the report block with the plan's hash. A different hash stops the attempt with `node-behind-the-plan`; a node that does not have the block fails the attempt with the error `RPC block is missing or pending`. With `createViemRpcTransport` this block is read from one endpoint, the first in `urls` that answers, and `logQuorum` does not compare it, so the check says nothing about the heads of the other endpoints. A load balancer can also answer this check from one backend and a log read from another.
 - A walk that finds no lifecycle event for a position stops the attempt with `position-without-history`.
 - The first event of each position's history walk must be the newest event that discovery read for that position; otherwise the attempt stops with `position-history-broken`.
 - That event must be in the canonical block at its number; otherwise the attempt stops with `log-not-canonical`.
+- A node that leaves lifecycle logs out of a position's history breaks the chain of events the walk reads. Each lifecycle event records the position after its change, so going back the walk checks that each event's change, applied to the position that the next older event records, can give the position the event records, compared on `dust` and `activating`. When it cannot, a log is missing between the two events, and the attempt stops with `position-history-broken`.
 
-These checks catch a walk whose first answer differs from the newest event discovery read, or sits on another branch. They compare no older answer of the walk with anything, and they cannot see:
+Against a node that answers wrongly or leaves logs out, these checks catch a first answer of the walk that differs from the newest event discovery read or sits on another branch, and logs left out between two events of the walk whose positions then do not match. They miss these faults of such a node:
 
 - a supply that a lagging answer left out: discovery never finds its position, and the heartbeat then attests it unscreened;
 - a position reused from an earlier attempt's `work`, which is not walked: if a lagging answer hides the position's newest event from discovery, the position keeps the anchors of a lot that has since activated or drained;
-- a log that an answer omitted below a position's newest event, in this attempt's walk or, for a reused position, in the earlier attempt's reads: it stays omitted.
+- a log that an answer omitted below a position's newest event while the positions still match without it, in this attempt's walk or, for a reused position, in the earlier attempt's walk. Examples are the dust supply right before the top-up that absorbed it, a top-up together with a seizure of the same amount, and a maturity together with a new lot of the same size. Such a log stays omitted.
 
 Only `logQuorum` guards against these cases, and only while the answers of a quorum do not lack the same log.
 

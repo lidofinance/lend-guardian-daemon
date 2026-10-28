@@ -106,8 +106,12 @@ async function workOf(script: Script, parts: Partial<GuardianSetup> & { maxLogBl
   return { work: await guardian.reconstructWork(await guardian.discoverCandidatePositions(planned)), node };
 }
 
-async function assertStops(script: Script, reason: StopReason): Promise<void> {
-  const { guardian } = guardianOver(script);
+async function assertStops(
+  script: Script,
+  reason: StopReason,
+  parts: Partial<GuardianSetup> & { maxLogBlockRange?: number } = {},
+): Promise<void> {
+  const { guardian } = guardianOver(script, parts);
   const planned = await guardian.buildScanPlan();
   assert.ok(planned.kind === 'plan', 'the script should produce a plan');
   await assert.rejects(
@@ -370,6 +374,185 @@ test('an activation whose supply and preceding dust do not add up stops the atte
     { head: HEAD, guardianAddedAt: CORE_DEPLOYED, lots: [dusted, { ...absorbing, supplied: 4n }] },
     'position-history-broken',
   );
+});
+
+/** An event inside the lot that `activation(80_000, …)` started, under that lot's timer. */
+function lotEvent(
+  kind: Lot['kind'],
+  blockNumber: number,
+  amount: bigint,
+  after: { readonly dust: bigint; readonly activating: bigint },
+): Lot {
+  return {
+    kind,
+    blockNumber,
+    logIndex: 2,
+    amount,
+    position: { ...after, activatingStart: blockAt(80_000).timestamp, activatingDelay: DAY },
+  };
+}
+
+/**
+ * A top-up at `blockNumber` that restarted the timer and left `activating` in the lot. Its supply is `amount`
+ * unless `supplied` says how much of it was a new supply rather than absorbed dust.
+ */
+function topUpActivation(
+  blockNumber: number,
+  topUp: { readonly amount: bigint; readonly activating: bigint; readonly supplied?: bigint },
+): Lot {
+  return {
+    kind: 'activating',
+    blockNumber,
+    logIndex: 4,
+    amount: topUp.amount,
+    position: {
+      dust: 0n,
+      activating: topUp.activating,
+      activatingStart: blockAt(blockNumber).timestamp,
+      activatingDelay: DAY,
+    },
+    supplied: topUp.supplied ?? topUp.amount,
+  };
+}
+
+// Each history lacks one or two events, so the position of the event before the gap cannot precede the event
+// after it.
+const gappedHistories: readonly { readonly gap: string; readonly lots: readonly Lot[] }[] = [
+  {
+    // The top-up of 3 at 90_000 that grew the lot from 5 to 8.
+    gap: 'a top-up between two activations',
+    lots: [activation(80_000, 5n, 5n), topUpActivation(100_000, { amount: 2n, activating: 10n })],
+  },
+  {
+    // The seizure of the 4 of dust at 90_000, so the top-up of 3 absorbed none. Such a history needs the activation
+    // threshold lowered before the top-up: a dust supply of 4 stays below it, and a top-up of 3 that absorbs no dust
+    // reaches it.
+    gap: 'a drain of dust before the top-up said to absorb it',
+    lots: [
+      activation(80_000, 5n, 5n),
+      { ...lotEvent('dusted', 85_000, 4n, { dust: 4n, activating: 5n }), supplied: 4n },
+      topUpActivation(100_000, { amount: 3n, activating: 8n }),
+    ],
+  },
+  {
+    // The top-up of 3 at 85_000 that grew the lot from 5 to 8.
+    gap: 'a top-up before a dust supply',
+    lots: [
+      activation(80_000, 5n, 5n),
+      { ...lotEvent('dusted', 90_000, 2n, { dust: 2n, activating: 8n }), supplied: 2n },
+      topUpActivation(100_000, { amount: 4n, activating: 12n, supplied: 2n }),
+    ],
+  },
+  {
+    // The seizure of the first 3 of dust at 87_000, before the second dust supply of 2.
+    gap: 'a drain of dust between two dust supplies',
+    lots: [
+      activation(80_000, 5n, 5n),
+      { ...lotEvent('dusted', 85_000, 3n, { dust: 3n, activating: 5n }), supplied: 3n },
+      { ...lotEvent('dusted', 90_000, 2n, { dust: 2n, activating: 5n }), supplied: 2n },
+      topUpActivation(100_000, { amount: 6n, activating: 11n, supplied: 4n }),
+    ],
+  },
+  {
+    // The top-up of 3 at 85_000 that grew the lot from 5 to 8; the instant supply equals the lot before it.
+    gap: 'a top-up before an instant supply',
+    lots: [
+      activation(80_000, 5n, 5n),
+      { ...lotEvent('activated', 90_000, 5n, { dust: 0n, activating: 8n }), supplied: 5n },
+      topUpActivation(100_000, { amount: 2n, activating: 10n }),
+    ],
+  },
+  {
+    // The seizure of the 3 of dust at 88_000.
+    gap: 'a drain of dust before an instant supply',
+    lots: [
+      activation(80_000, 5n, 5n),
+      { ...lotEvent('dusted', 85_000, 3n, { dust: 3n, activating: 5n }), supplied: 3n },
+      { ...lotEvent('activated', 90_000, 4n, { dust: 0n, activating: 5n }), supplied: 4n },
+      topUpActivation(100_000, { amount: 2n, activating: 7n }),
+    ],
+  },
+  {
+    // The top-up of 3 at 85_000 that grew the lot from 5 to 8 before a seizure of 4.
+    gap: 'a top-up before a partial drain',
+    lots: [
+      activation(80_000, 5n, 5n),
+      lotEvent('drained', 90_000, 4n, { dust: 0n, activating: 4n }),
+      topUpActivation(100_000, { amount: 2n, activating: 6n }),
+    ],
+  },
+  {
+    // The top-up at 84_000 that absorbed the 3 of dust and grew the lot to 20, and the dust supply of 3 at
+    // 86_000 that the last activation absorbed.
+    gap: 'a top-up and a dust supply before a maturity',
+    lots: [
+      activation(80_000, 10n, 10n),
+      { ...lotEvent('dusted', 82_000, 3n, { dust: 3n, activating: 10n }), supplied: 3n },
+      {
+        kind: 'activated',
+        blockNumber: 90_000,
+        logIndex: 2,
+        amount: 20n,
+        position: { dust: 3n, activating: 0n, activatingStart: 0, activatingDelay: 0 },
+      },
+      activation(100_000, 11n, 8n),
+    ],
+  },
+  {
+    // The top-up of 6 at 84_000 that absorbed the 3 of dust and grew the lot to 16, and a seizure of 3 at 86_000.
+    gap: 'a top-up and a seizure before a partial drain',
+    lots: [
+      activation(80_000, 10n, 10n),
+      { ...lotEvent('dusted', 82_000, 3n, { dust: 3n, activating: 10n }), supplied: 3n },
+      lotEvent('drained', 90_000, 2n, { dust: 0n, activating: 11n }),
+      topUpActivation(100_000, { amount: 5n, activating: 16n }),
+    ],
+  },
+  {
+    // The seizure of the 5 of dust at 84_000, and the dust supply of 3 at 86_000 that the drain left 1 of.
+    gap: 'a seizure and a dust supply before a drain of dust',
+    lots: [
+      activation(80_000, 10n, 10n),
+      { ...lotEvent('dusted', 82_000, 5n, { dust: 5n, activating: 10n }), supplied: 5n },
+      lotEvent('drained', 90_000, 2n, { dust: 1n, activating: 10n }),
+      topUpActivation(100_000, { amount: 3n, activating: 13n, supplied: 2n }),
+    ],
+  },
+];
+
+for (const { gap, lots } of gappedHistories) {
+  test(`a walk missing ${gap} stops the attempt`, async () => {
+    await assertStops({ head: HEAD, guardianAddedAt: CORE_DEPLOYED, lots }, 'position-history-broken');
+  });
+}
+
+test('a walk missing a top-up between two log spans stops the attempt', async () => {
+  // The lot start at 80_000 and the top-up at 100_000 sit in different spans, so the walk reads them in two batches.
+  await assertStops(
+    {
+      head: HEAD,
+      guardianAddedAt: CORE_DEPLOYED,
+      lots: [activation(80_000, 5n, 5n), topUpActivation(100_000, { amount: 2n, activating: 10n })],
+    },
+    'position-history-broken',
+    { maxLogBlockRange: SPAN },
+  );
+});
+
+test('an instant supply inside a lot leaves the walk to the lot start', async () => {
+  const { work } = await workOf({
+    head: HEAD,
+    guardianAddedAt: CORE_DEPLOYED,
+    lots: [
+      activation(80_000, 5n, 5n),
+      { ...lotEvent('activated', 90_000, 4n, { dust: 0n, activating: 5n }), supplied: 4n },
+      topUpActivation(100_000, { amount: 2n, activating: 7n }),
+    ],
+  });
+  assertAnchors(work, [
+    [80_000, 5],
+    [100_000, 5],
+  ]);
 });
 
 test('a plan whose report block the node no longer holds stops the attempt', async () => {
