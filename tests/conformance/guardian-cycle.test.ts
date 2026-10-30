@@ -3,11 +3,12 @@ import { signingClient } from '../core/client.ts';
 import assert from 'node:assert/strict';
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import { parseEventLogs, toFunctionSelector } from 'viem';
+import type { TransactionReceipt } from 'viem';
 import { isRecord } from '../../src/common/validation.ts';
 import { Guardian, GuardianStop } from '../../src/core/index.ts';
 import type { ScreeningProvider, ScreeningRequest, ScreeningResult } from '../../src/core/index.ts';
 import { BORROWER, DEFAULT_ACTIVATION_CONFIG, DELEGATE_KEY, deployProtocolFixture } from './fixtures/protocol.ts';
-import type { ActivationConfig, ProtocolFixture } from './fixtures/protocol.ts';
+import type { ActivationConfig, MarketFixture, ProtocolFixture } from './fixtures/protocol.ts';
 
 const deployed = deployProtocolFixture(8621);
 const snapshot: { value: `0x${string}` } = { value: '0x0' };
@@ -180,6 +181,139 @@ test('drops a fully drained old position and screens only its later supply', asy
       old: old.transactionHash,
       fresh: fresh.transactionHash,
     },
+  );
+});
+
+test('walks a liquidation that drained part of a fresh lot and screens the fresh supply', async () => {
+  const fixture = await deployed;
+  const market = fixture.primaryMarket;
+  await borrowAgainstMaturedLot(fixture, { collateral: 100n, borrowed: 50n });
+  const fresh = await market.supply(20n);
+  await market.setPrice(LIQUIDATION_PRICE);
+  // The seizure of 105 takes the 100 active first, then 5 of the activating 20.
+  assert.deepEqual(drainedAmounts(market, await market.liquidate(105n)), [5n]);
+  await becomeDue(fixture);
+  const recording = recordingProvider(cleanResult());
+
+  assert.equal((await cycleWith(fixture, recording.provider)).kind, 'attested');
+  assert.deepEqual(
+    recording.requests[0]?.anchors.map((anchor) => anchor.transactionHash),
+    [fresh.transactionHash],
+  );
+});
+
+test('walks a settlement that drained part of a fresh lot and screens the fresh supply', async () => {
+  const fixture = await deployed;
+  const market = fixture.primaryMarket;
+  await borrowAgainstMaturedLot(fixture, { collateral: 10n, borrowed: 8n });
+  const fresh = await market.supply(100n);
+  await market.setPrice(SETTLEMENT_PRICE);
+  await market.setSettlementLtv(SETTLEMENT_LTV);
+  const [personal] = await market.settlementFor();
+  // The settlement seizes 50: the 10 active first, then 40 of the activating 100.
+  assert.deepEqual(drainedAmounts(market, await market.settle(personal[1])), [40n]);
+  await becomeDue(fixture);
+  const recording = recordingProvider(cleanResult());
+
+  assert.equal((await cycleWith(fixture, recording.provider)).kind, 'attested');
+  assert.deepEqual(
+    recording.requests[0]?.anchors.map((anchor) => anchor.transactionHash),
+    [fresh.transactionHash],
+  );
+});
+
+test('walks past a liquidation of active collateral only, which drains nothing', async () => {
+  const fixture = await deployed;
+  const market = fixture.primaryMarket;
+  await borrowAgainstMaturedLot(fixture, { collateral: 100n, borrowed: 50n });
+  const first = await market.supply(20n);
+  await market.setPrice(LIQUIDATION_PRICE);
+  assert.deepEqual(drainedAmounts(market, await market.liquidate(50n)), []);
+  const second = await market.supply(30n);
+  await becomeDue(fixture);
+  const recording = recordingProvider(cleanResult());
+
+  assert.equal((await cycleWith(fixture, recording.provider)).kind, 'attested');
+  assert.deepEqual(
+    recording.requests[0]?.anchors.map((anchor) => anchor.transactionHash).sort(),
+    [first.transactionHash, second.transactionHash].sort(),
+  );
+});
+
+test('walks a liquidation of part of the dust and screens the dust with the lot that absorbed the rest', async () => {
+  const fixture = await deployed;
+  const market = fixture.primaryMarket;
+  await borrowAgainstMaturedLot(fixture, { collateral: 100n, borrowed: 50n });
+  const dust = await market.supply(5n);
+  await market.setPrice(LIQUIDATION_PRICE);
+  // The seizure of 102 takes the 100 active first, then 2 of the 5 of dust.
+  assert.deepEqual(drainedAmounts(market, await market.liquidate(102n)), [2n]);
+  const absorbing = await market.supply(20n);
+  await becomeDue(fixture);
+  const recording = recordingProvider(cleanResult());
+
+  assert.equal((await cycleWith(fixture, recording.provider)).kind, 'attested');
+  assert.deepEqual(
+    recording.requests[0]?.anchors.map((anchor) => anchor.transactionHash).sort(),
+    [dust.transactionHash, absorbing.transactionHash].sort(),
+  );
+});
+
+test('walks a liquidation that took all the dust and part of activating in one drain', async () => {
+  const fixture = await deployed;
+  const market = fixture.primaryMarket;
+  await borrowAgainstMaturedLot(fixture, { collateral: 100n, borrowed: 50n });
+  const lot = await market.supply(20n);
+  await market.supply(5n);
+  await market.setPrice(LIQUIDATION_PRICE);
+  // The seizure of 110 takes the 100 active, the 5 of dust, then 5 of the activating 20.
+  assert.deepEqual(drainedAmounts(market, await market.liquidate(110n)), [10n]);
+  await becomeDue(fixture);
+  const recording = recordingProvider(cleanResult());
+
+  assert.equal((await cycleWith(fixture, recording.provider)).kind, 'attested');
+  assert.deepEqual(
+    recording.requests[0]?.anchors.map((anchor) => anchor.transactionHash),
+    [lot.transactionHash],
+  );
+});
+
+test('walks past an instant supply inside a lot to the lot start', async () => {
+  const fixture = await deployed;
+  const market = fixture.primaryMarket;
+  await market.setActivationConfig(fixedDelay(60));
+  const lot = await market.supply(20n);
+  await market.setInstantActivation(fixture.admin.address, true);
+  await market.supply(7n);
+  await market.setInstantActivation(fixture.admin.address, false);
+  const topUp = await market.supply(10n);
+  await becomeDue(fixture);
+  const recording = recordingProvider(cleanResult());
+
+  assert.equal((await cycleWith(fixture, recording.provider)).kind, 'attested');
+  assert.deepEqual(
+    recording.requests[0]?.anchors.map((anchor) => anchor.transactionHash).sort(),
+    [lot.transactionHash, topUp.transactionHash].sort(),
+  );
+});
+
+test('walks through a maturity that left dust to the dust supply that a new lot absorbed', async () => {
+  const fixture = await deployed;
+  const market = fixture.primaryMarket;
+  await market.setActivationConfig(fixedDelay(60));
+  await market.supply(20n);
+  const dust = await market.supply(5n);
+  await fixture.anvil.testClient.increaseTime({ seconds: 61 });
+  await fixture.anvil.testClient.mine({ blocks: 1 });
+  // The supply's hook matures the first lot and leaves the dust, which the new lot then absorbs.
+  const absorbing = await market.supply(20n);
+  await becomeDue(fixture);
+  const recording = recordingProvider(cleanResult());
+
+  assert.equal((await cycleWith(fixture, recording.provider)).kind, 'attested');
+  assert.deepEqual(
+    recording.requests[0]?.anchors.map((anchor) => anchor.transactionHash).sort(),
+    [dust.transactionHash, absorbing.transactionHash].sort(),
   );
 });
 
@@ -391,6 +525,47 @@ function fixedDelay(seconds: number): ActivationConfig {
     minActivationDelay: seconds,
     maxActivationDelay: seconds,
   };
+}
+
+/** An oracle price at which the borrow of 50 against the matured lot of 100 can be liquidated. */
+const LIQUIDATION_PRICE = 380_000_000_000_000_000_000_000_000_000_000_000n;
+
+/** An oracle price at which the settlement test's borrow can be settled in part. */
+const SETTLEMENT_PRICE = 100_000_000_000_000_000_000_000_000_000_000_000n;
+
+/** The borrower's settlement LTV in that test: 50 %, in WAD. */
+const SETTLEMENT_LTV = 500_000_000_000_000_000n;
+
+/** A lot of `collateral` that matured under a 60-second delay and backs a borrow of `borrowed`. */
+async function borrowAgainstMaturedLot(
+  fixture: ProtocolFixture,
+  amounts: { readonly collateral: bigint; readonly borrowed: bigint },
+): Promise<void> {
+  const market = fixture.primaryMarket;
+  await market.setActivationConfig(fixedDelay(60));
+  await market.supplyLoan(1_000n);
+  await market.supply(amounts.collateral);
+  await fixture.anvil.testClient.increaseTime({ seconds: 61 });
+  await fixture.anvil.testClient.mine({ blocks: 1 });
+  // The borrow's hook matures the lot before it checks the active collateral.
+  await market.borrow(amounts.borrowed);
+}
+
+/** The amount of each `CollateralDrained` that the transaction emitted. */
+function drainedAmounts(market: MarketFixture, receipt: TransactionReceipt): bigint[] {
+  const drained = parseEventLogs({
+    abi: market.controllerAbi,
+    logs: receipt.logs,
+    eventName: 'CollateralDrained',
+    strict: true,
+  });
+  return drained.map((log) => {
+    const amount = arrayOf(log.args, 'drained arguments')[1];
+    if (typeof amount !== 'bigint') {
+      throw new TypeError('The drained amount is not an integer');
+    }
+    return amount;
+  });
 }
 
 async function suspectedBy(fixture: ProtocolFixture): Promise<string[]> {

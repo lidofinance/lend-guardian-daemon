@@ -94,6 +94,7 @@ test('an orphaned first report stops Guardian before its second batch or heartbe
       discoveryRange: { from: reportBlock, to: reportBlock },
     },
     new Map(),
+    new Map(),
   );
   const screened = new Screened(
     work,

@@ -51,6 +51,7 @@ function workFor(count: number, reportsSince: number | null = null): Work {
       discoveryRange: { from: blockAt(99_600), to: blockAt(HEAD - 2) },
     },
     new Map(entries),
+    new Map(),
   );
 }
 

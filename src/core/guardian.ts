@@ -318,13 +318,14 @@ export class Guardian {
    * Rebuild the contributing supplies: [scan phase 3](../../docs/guardian-specification.md#scan-cycle)
    * and [Appendix C](../../docs/guardian-specification.md#c-reconstruct-the-contributors).
    *
-   * A position of `earlierWork`, such as a stale attempt's, keeps its anchors when that work was
-   * reconstructed from the plan's previous heartbeat at a report block that is still canonical, and the
-   * newest lifecycle event that discovery read for the position is not after that block. That block's hash
-   * fixes the history below it, and every change of a lot is such an event, so with complete reads the work
-   * is the one a full reconstruction finds, and a retry walks only what changed. The decision rests on the
-   * events discovery read, not on another read that a lagging endpoint could answer without them. A reused
-   * position is not walked, so a lagging answer in discovery's read is not compared with a walk.
+   * A position of `earlierWork`, such as a stale attempt's, keeps that work's anchors without a new walk
+   * when all of these hold:
+   * - that work was reconstructed from the plan's previous heartbeat;
+   * - its report block is not after the plan's and is still canonical, so the history below it has not changed;
+   * - the newest lifecycle event that discovery read for the position is the event the earlier walk
+   *   started from (`Work.newestEvents()`). Every change of a lot is such an event.
+   *
+   * Every other position is walked, so the result equals a full reconstruction.
    *
    * The report block is checked canonical before and after the walks, as around discovery, so an
    * endpoint that moved to another branch meanwhile stops the attempt instead of feeding it a history.
@@ -335,14 +336,21 @@ export class Guardian {
     const reusableWork =
       earlierWork !== undefined && (await this.#canReuse(earlierWork, plan)) ? earlierWork : undefined;
     await this.#requireCanonicalBlock(plan.discoveryRange.to);
+    const candidates = discovered.candidates();
     const byPosition = await markets.reconstructWork(
       plan,
-      discovered.candidates(),
+      candidates,
       this.#setup.historyReadConcurrency,
       reusableWork,
     );
     await this.#requireCanonicalBlock(plan.discoveryRange.to);
-    return new Work(plan, byPosition);
+    // A walk starts from this event or stops, and a reused position has the event its earlier walk started from.
+    const newestEventByPosition = new Map(
+      candidates
+        .filter(({ position }) => byPosition.has(position))
+        .map(({ position, newestEvent }) => [position, newestEvent] as const),
+    );
+    return new Work(plan, byPosition, newestEventByPosition);
   }
 
   /**
