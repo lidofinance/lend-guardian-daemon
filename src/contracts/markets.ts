@@ -69,7 +69,16 @@ interface Activation {
   readonly log: LifecycleLog;
 }
 
-type LifecycleEventStream = AsyncGenerator<LifecycleEvent>;
+/**
+ * A lifecycle event as the history walk reads it. An activation carries the assets of the `SupplyCollateral`
+ * paired with it, or `null` when the read found no paired supply or more than one. The walk stops on that
+ * where it uses the supply, so the checks of the walk's first event come first.
+ */
+type WalkedEvent =
+  | (LifecycleEvent & { readonly kind: 'activating'; readonly supplied: bigint | null })
+  | (LifecycleEvent & { readonly kind: Exclude<LifecycleKind, 'activating'> });
+
+type LifecycleEventStream = AsyncGenerator<WalkedEvent>;
 
 /** A reconstructed anchor and the block where it entered `activating`. */
 interface AnchorActivation {
@@ -282,34 +291,9 @@ export class Markets {
   }
 
   /**
-   * Appendix C reads the previous event to learn whether a lot started from zero absorbed dust. Here the
-   * walk first reads the supply paired with the activation and stops when it carries the whole amount.
-   * The anchors are the same: the activated amount is that supply plus any absorbed dust, so there was none.
-   */
-  async supplyAfter(position: PositionKey, activation: LifecycleEvent): Promise<SupplyLog> {
-    const block = Number(activation.at.blockNumber);
-    const raw = await this.#rpc.getLogs({
-      address: this.#core,
-      topics: encodeEventTopics({
-        abi: SUPPLY_COLLATERAL_ABI,
-        eventName: 'SupplyCollateral',
-        args: { id: position.marketId, onBehalf: position.borrower },
-      }),
-      fromBlock: block,
-      toBlock: block,
-    });
-    const supplies = decodeLogs(SUPPLY_COLLATERAL_ABI, raw).map((log) => this.#supplyOf(log));
-    const paired = supplies.filter((supply) => this.#isPairedWith(supply, activation, position));
-    const supply = paired.length === 1 ? paired[0] : undefined;
-    if (supply === undefined) {
-      throw new GuardianStop('position-history-broken');
-    }
-    return supply;
-  }
-
-  /**
    * The controller's lifecycle events for one borrower, newest first. Logs are read back from `until` one range
-   * at a time, only as far as the walk asks.
+   * at a time, only as far as the walk asks. Each activation comes with the assets of its paired `SupplyCollateral`;
+   * the supplies of all activations in a range come in one read, however many activations the range holds.
    *
    * Each event after the first is also checked against the event yielded before it: when the position it records
    * cannot directly precede that event, the walk stops with `position-history-broken`. The check defends against
@@ -319,7 +303,7 @@ export class Markets {
    * always passes, so the check costs no reads and changes no work; an inconsistent one stops, as
    * [Failure handling](../../docs/guardian-specification.md#failure-handling) requires.
    */
-  async *lifecycleBack(position: PositionKey, until: BlockRef): AsyncGenerator<LifecycleEvent> {
+  async *lifecycleBack(position: PositionKey, until: BlockRef): AsyncGenerator<WalkedEvent> {
     const floor = this.#deploymentBlock;
     const borrower = pad(position.borrower, { size: 32 });
     let newer: LifecycleEvent | null = null;
@@ -335,14 +319,62 @@ export class Markets {
       const events = decodeLogs(MARKET_CONTROLLER_ABI, logs)
         .map((log) => this.#lifecycleOf(log))
         .sort((left, right) => byLogPosition(right.at, left.at));
+      const suppliesByLog = await this.#readActivationSupplies(position, events);
       for (const event of events) {
         if (newer !== null && !this.#canPrecede(event.position, newer)) {
           throw new GuardianStop('position-history-broken');
         }
-        yield event;
+        yield this.#attachSupply(event, suppliesByLog, position);
         newer = event;
       }
     }
+  }
+
+  /**
+   * The position's `SupplyCollateral` logs across the blocks of these events' activations, in one read, by the
+   * transaction and log index where each sits.
+   */
+  async #readActivationSupplies(
+    position: PositionKey,
+    events: readonly LifecycleEvent[],
+  ): Promise<ReadonlyMap<string, readonly SupplyLog[]>> {
+    const activationBlocks = events
+      .filter((event) => event.kind === 'activating')
+      .map((event) => Number(event.at.blockNumber));
+    if (activationBlocks.length === 0) {
+      return new Map();
+    }
+    const raw = await this.#rpc.getLogs({
+      address: this.#core,
+      topics: encodeEventTopics({
+        abi: SUPPLY_COLLATERAL_ABI,
+        eventName: 'SupplyCollateral',
+        args: { id: position.marketId, onBehalf: position.borrower },
+      }),
+      fromBlock: activationBlocks.reduce((oldest, block) => Math.min(oldest, block)),
+      toBlock: activationBlocks.reduce((newest, block) => Math.max(newest, block)),
+    });
+    const suppliesByLog = new Map<string, SupplyLog[]>();
+    for (const supply of decodeLogs(SUPPLY_COLLATERAL_ABI, raw).map((log) => this.#supplyOf(log))) {
+      const key = `${supply.transactionHash}:${supply.logIndex}`;
+      suppliesByLog.set(key, [...(suppliesByLog.get(key) ?? []), supply]);
+    }
+    return suppliesByLog;
+  }
+
+  /** An activation with the assets of the one supply paired with it, if there is one; any other event unchanged. */
+  #attachSupply(
+    event: LifecycleEvent,
+    suppliesByLog: ReadonlyMap<string, readonly SupplyLog[]>,
+    position: PositionKey,
+  ): WalkedEvent {
+    if (event.kind !== 'activating') {
+      return { ...event, kind: event.kind };
+    }
+    const candidates = suppliesByLog.get(`${event.at.transactionHash}:${event.at.logIndex + 1}`) ?? [];
+    const paired = candidates.filter((supply) => this.#isPairedWith(supply, event, position));
+    const supply = paired.length === 1 ? paired[0] : undefined;
+    return { ...event, kind: event.kind, supplied: supply?.assets ?? null };
   }
 
   /** Keep the supplies to markets whose controller reports to the target registry, each with that controller. */
@@ -479,7 +511,7 @@ export class Markets {
     const events = this.lifecycleBack(position, plan.discoveryRange.to);
     const activationBlockByAnchor = new Map<string, AnchorActivation>();
     let positionAtPreviousHeartbeat: Position | null = null;
-    let current: LifecycleEvent | null = await this.#readNewestLifecycleEvent(events, candidate.newestEvent);
+    let current: WalkedEvent | null = await this.#readNewestLifecycleEvent(events, candidate.newestEvent);
     if (!this.#isBaseActivationDeadlineReached(current.position, plan.discoveryRange.to.timestamp)) {
       return [];
     }
@@ -503,14 +535,21 @@ export class Markets {
           anchor: directAnchor,
           activationBlock,
         });
+        const supplied = current.supplied;
+        if (supplied === null) {
+          throw new GuardianStop('position-history-broken');
+        }
+        // Appendix C reads the previous event to learn whether a lot started from zero absorbed dust. The paired
+        // supply shows it too: when it carries the whole amount there was no dust, and the walk ends here.
         const startedFromZero = current.position.activating === current.amount;
-        const pairedSupply = startedFromZero ? await this.supplyAfter(position, current) : null;
-        if (pairedSupply?.assets === current.amount) {
+        if (startedFromZero && supplied === current.amount) {
           break;
         }
 
+        // `credit` records the supply plus all the dust before it as `amount`, so a dust supply left out of the
+        // history right before this activation stops the walk here.
         const previousEvent = await this.#readOlderLifecycleEvent(events);
-        if (pairedSupply !== null && current.amount !== pairedSupply.assets + (previousEvent?.position.dust ?? 0n)) {
+        if (current.amount !== supplied + (previousEvent?.position.dust ?? 0n)) {
           throw new GuardianStop('position-history-broken');
         }
         const hasAbsorbedDust = previousEvent !== null && previousEvent.position.dust > 0n;
@@ -563,10 +602,7 @@ export class Markets {
    * differs, or came from a branch the chain does not hold, read another history, so no decision is
    * taken from it.
    */
-  async #readNewestLifecycleEvent(
-    events: LifecycleEventStream,
-    newestEvent: LifecycleEventRef,
-  ): Promise<LifecycleEvent> {
+  async #readNewestLifecycleEvent(events: LifecycleEventStream, newestEvent: LifecycleEventRef): Promise<WalkedEvent> {
     const newest = await this.#readOlderLifecycleEvent(events);
     if (newest === null) {
       throw new GuardianStop('position-without-history');
@@ -581,7 +617,7 @@ export class Markets {
     return newest;
   }
 
-  async #readOlderLifecycleEvent(events: LifecycleEventStream): Promise<LifecycleEvent | null> {
+  async #readOlderLifecycleEvent(events: LifecycleEventStream): Promise<WalkedEvent | null> {
     const next = await events.next();
     return next.done === true ? null : next.value;
   }

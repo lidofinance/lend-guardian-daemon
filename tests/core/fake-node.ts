@@ -169,7 +169,7 @@ export interface Script {
   readonly walksLagBehind?: number;
   /**
    * The log queries whose answers arrive broken: indexed arguments and data cut off. `supply` breaks
-   * every supply query, `pairedSupply` only the one-block query phase C sends for an activation.
+   * every supply query, `pairedSupply` only the supply reads phase C sends for the activations of a range.
    */
   readonly undecodable?: readonly (LogKind | 'pairedSupply')[];
 }
@@ -414,7 +414,7 @@ function logAnswer(script: Script, params: readonly unknown[], queries: Queries)
   queries.ranges.push({ address: text(filter, 'address'), fromBlock: from, toBlock: to, topics });
 
   const logs = selectedLogs(script, kind, from, to).filter((log) => isServedToWalk(script, log, topics));
-  return isBroken(script, kind, from === to) ? logs.map(undecodable) : logs;
+  return isBroken(script, kind, topics) ? logs.map(undecodable) : logs;
 }
 
 /** A walk names the borrower in a topic; a lagging replica answers it without the newest events. */
@@ -423,14 +423,15 @@ function isServedToWalk(script: Script, log: LogRecord, topics: readonly unknown
   return !isWalk || Number(BigInt(text(log, 'blockNumber'))) <= (script.walksLagBehind ?? 0);
 }
 
-function isBroken(script: Script, kind: LogKind, isOneBlock: boolean): boolean {
+function isBroken(script: Script, kind: LogKind, topics: readonly unknown[]): boolean {
   const broken = script.undecodable ?? [];
   if (broken.includes(kind)) {
     return true;
   }
 
-  const isPairedLookup = kind === 'supply' && isOneBlock;
-  return isPairedLookup && broken.includes('pairedSupply');
+  // Discovery's supply reads name no market or borrower; phase C's name both.
+  const isWalkSupplyRead = kind === 'supply' && topics.length > 1;
+  return isWalkSupplyRead && broken.includes('pairedSupply');
 }
 
 function kindOf(topic: string): LogKind {

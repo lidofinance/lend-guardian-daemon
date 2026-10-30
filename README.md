@@ -131,12 +131,13 @@ The SDK checks some answers itself and stops the attempt when they disagree. The
 - The first event of each position's history walk must be the newest event that discovery read for that position; otherwise the attempt stops with `position-history-broken`.
 - That event must be in the canonical block at its number; otherwise the attempt stops with `log-not-canonical`.
 - A node that leaves lifecycle logs out of a position's history breaks the chain of events the walk reads. Each lifecycle event records the position after its change, so going back the walk checks that each event's change, applied to the position that the next older event records, can give the position the event records, compared on `dust` and `activating`. When it cannot, a log is missing between the two events, and the attempt stops with `position-history-broken`.
+- Each `CollateralActivating` must have its `SupplyCollateral` right after it in the same transaction, and its `amount` must equal that supply plus the dust that the next older event records. The walk reads the borrower's supplies once for all activations in a range of lifecycle logs. A missing supply or a different sum stops the attempt with `position-history-broken`.
 
-Against a node that answers wrongly or leaves logs out, these checks catch a first answer of the walk that differs from the newest event discovery read or sits on another branch, and logs left out between two events of the walk whose positions then do not match. They miss these faults of such a node:
+Against a node that answers wrongly or leaves logs out, these checks catch a first answer of the walk that differs from the newest event discovery read or sits on another branch, logs left out between two events of the walk whose positions then do not match, and a dust supply left out right before the activation that absorbed it. They miss these faults of such a node:
 
 - a supply that a lagging answer left out: discovery never finds its position, and the heartbeat then attests it unscreened;
 - a position reused from an earlier attempt's `work`, which is not walked: if a lagging answer hides the position's newest event from discovery, the position keeps the anchors of a lot that has since activated or drained;
-- a log that an answer omitted below a position's newest event while the positions still match without it, in this attempt's walk or, for a reused position, in the earlier attempt's walk. Examples are the dust supply right before the top-up that absorbed it, a top-up together with a seizure of the same amount, and a maturity together with a new lot of the same size. Such a log stays omitted.
+- a log that an answer omitted below a position's newest event while the positions and the activations' supplies still match without it, in this attempt's walk or, for a reused position, in the earlier attempt's walk. Examples are a top-up together with a seizure of the same amount, and a maturity together with a new lot of the same size. Such a log stays omitted.
 
 Only `logQuorum` guards against these cases, and only while the answers of a quorum do not lack the same log.
 

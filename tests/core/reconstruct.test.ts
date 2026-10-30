@@ -10,7 +10,7 @@ import { GuardianStop } from '../../src/core/stop.ts';
 import type { StopReason } from '../../src/core/stop.ts';
 import { isRecord } from '../../src/common/validation.ts';
 import type { NodeRequest } from './client.ts';
-import { blockAt, BORROWER, CONTROLLER, fakeNode, MARKET } from './fake-node.ts';
+import { blockAt, BORROWER, CONTROLLER, CORE, fakeNode, MARKET } from './fake-node.ts';
 import type { LogsCap } from './fake-node.ts';
 import type { Lot, Script } from './fake-node.ts';
 import { CORE_DEPLOYED, guardianOver } from './setup.ts';
@@ -613,7 +613,7 @@ test('a lifecycle log that does not decode stops the attempt rather than droppin
 });
 
 test('a paired supply that does not decode at the activation block stops the attempt rather than reading as unpaired', async () => {
-  // Discovery reads the supplies fine, and only phase C's one-block lookup of the paired supply breaks.
+  // Discovery reads the supplies fine, and only phase C's read of the activations' supplies breaks.
   await assertStops(
     {
       head: HEAD,
@@ -1044,3 +1044,63 @@ function stopsWith(reason: StopReason): (error: unknown) => boolean {
     return true;
   };
 }
+
+test('a walk without the dust event that a top-up absorbed stops the attempt', async () => {
+  const topUp = topUpActivation(100_000, { amount: 6n, activating: 11n, supplied: 3n });
+  await assertStops(
+    { head: HEAD, guardianAddedAt: CORE_DEPLOYED, lots: [activation(80_000, 5n, 5n), topUp] },
+    'position-history-broken',
+  );
+});
+
+test('a lot start without its supply stops the attempt', async () => {
+  const startedWithoutSupply = lotEvent('activating', 80_000, 5n, { dust: 0n, activating: 5n });
+  await assertStops(
+    {
+      head: HEAD,
+      guardianAddedAt: CORE_DEPLOYED,
+      lots: [startedWithoutSupply, topUpActivation(100_000, { amount: 6n, activating: 11n })],
+    },
+    'position-history-broken',
+  );
+});
+
+test('a top-up without its supply stops the attempt', async () => {
+  const topUpWithoutSupply = lotEvent('activating', 100_000, 6n, { dust: 0n, activating: 11n });
+  await assertStops(
+    { head: HEAD, guardianAddedAt: CORE_DEPLOYED, lots: [activation(80_000, 5n, 5n), topUpWithoutSupply] },
+    'position-history-broken',
+  );
+});
+
+test('a supply read across several activation blocks that does not decode stops the attempt', async () => {
+  // The lot start and the top-up sit in different blocks of one span, so one read covers both.
+  await assertStops(
+    {
+      head: HEAD,
+      guardianAddedAt: CORE_DEPLOYED,
+      lots: [activation(80_000, 5n, 5n), topUpActivation(80_100, { amount: 6n, activating: 11n })],
+      undecodable: ['pairedSupply'],
+    },
+    'log-undecodable',
+    { maxLogBlockRange: SPAN },
+  );
+});
+
+test('the supplies of all activations in one span are read at once', async () => {
+  const topUps = Array.from({ length: 20 }, (_, index) =>
+    topUpActivation(80_010 + index * 10, { amount: 2n, activating: 5n + 2n * BigInt(index + 1) }),
+  );
+  const { work, node } = await workOf(
+    { head: HEAD, guardianAddedAt: CORE_DEPLOYED, lots: [activation(80_000, 5n, 5n), ...topUps] },
+    { maxLogBlockRange: SPAN },
+  );
+  assert.equal(work.anchors, 21);
+  // Discovery's supply reads name no market, so the walk's are the ones with more than one topic.
+  const supplyReads = node.logQueries.filter((query) => query.address === CORE && query.topics.length > 1);
+  assert.deepEqual(
+    supplyReads.map((query) => [query.fromBlock, query.toBlock]),
+    [[80_000, 80_200]],
+    'one read covers the lot start and every top-up of the span',
+  );
+});

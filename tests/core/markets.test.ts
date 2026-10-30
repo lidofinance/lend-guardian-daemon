@@ -97,12 +97,6 @@ test('supply classification rejects duplicate adjacent events', () => {
   });
 });
 
-const ACTIVATION = {
-  kind: 'activating',
-  amount: 5n,
-  position: { dust: 0n, activating: 5n, activatingStart: BLOCK.timestamp, activatingDelay: 60 },
-  at: CLASSIFICATION,
-} as const;
 const SUPPLY_EVENT: ChainLog = {
   ...CLASSIFICATION,
   address: CORE,
@@ -117,25 +111,49 @@ const SUPPLY_EVENT: ChainLog = {
 };
 const POSITION = { controller: CONTROLLER, marketId: MARKET, borrower: BORROWER };
 
-test('the zero-boundary shortcut uses the exact paired core supply', async () => {
-  const markets = new Markets(new EvidenceProvider([SUPPLY_EVENT]), { address: CORE, deploymentBlock: 1_000 });
-  assert.deepEqual(await markets.supplyAfter(POSITION, ACTIVATION), SUPPLY);
+/** Serves the walk's lifecycle read with `lifecycle`, and every supply read with `supplies`. */
+class WalkEvidenceProvider extends EvidenceProvider {
+  readonly #lifecycle: ChainLog[];
+
+  constructor(lifecycle: ChainLog[], supplies: ChainLog[]) {
+    super(supplies);
+    this.#lifecycle = lifecycle;
+  }
+
+  override async *logBatches(): AsyncGenerator<ChainLog[]> {
+    yield await Promise.resolve(this.#lifecycle);
+  }
+}
+
+async function walkedEvents(provider: EvidenceProvider) {
+  const markets = new Markets(provider, { address: CORE, deploymentBlock: 1_000 });
+  const events = [];
+  for await (const event of markets.lifecycleBack(POSITION, blockAt(101_000))) {
+    events.push(event);
+  }
+  return events;
+}
+
+test('the walk pairs an activation with the exact core supply after it', async () => {
+  const [event] = await walkedEvents(new WalkEvidenceProvider([CLASSIFICATION], [SUPPLY_EVENT]));
+  assert.ok(event?.kind === 'activating');
+  assert.equal(event.supplied, SUPPLY.assets);
 });
 
 for (const [condition, logs] of [
   ['missing', []],
   ['duplicated', [SUPPLY_EVENT, SUPPLY_EVENT]],
 ] as const) {
-  test(`the zero-boundary shortcut rejects a ${condition} supply`, async () => {
-    const markets = new Markets(new EvidenceProvider([...logs]), { address: CORE, deploymentBlock: 1_000 });
-    await assert.rejects(markets.supplyAfter(POSITION, ACTIVATION), { reason: 'position-history-broken' });
+  test(`the walk gives an activation with a ${condition} supply no supply`, async () => {
+    const [event] = await walkedEvents(new WalkEvidenceProvider([CLASSIFICATION], [...logs]));
+    assert.ok(event?.kind === 'activating');
+    assert.equal(event.supplied, null);
   });
 }
 
-test("the zero-boundary shortcut asks only for the position's supplies in the activation block", async () => {
-  const provider = new EvidenceProvider([SUPPLY_EVENT]);
-  const markets = new Markets(provider, { address: CORE, deploymentBlock: 1_000 });
-  await markets.supplyAfter(POSITION, ACTIVATION);
+test("the walk asks only for the position's supplies in the blocks of a range's activations", async () => {
+  const provider = new WalkEvidenceProvider([CLASSIFICATION], [SUPPLY_EVENT]);
+  await walkedEvents(provider);
   assert.deepEqual(provider.filters, [
     {
       address: CORE,
