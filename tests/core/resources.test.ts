@@ -147,7 +147,7 @@ test('thousands of targets preserve positional decisions and complete report cov
     };
     return [key, [anchor]] as const;
   });
-  const work = new Work(plan, new Map(entries));
+  const work = new Work(plan, new Map(entries), new Map());
   const screened = await guardian.screenWork(work);
   assert.deepEqual(
     screened.results.map((entry) => entry.anchor),

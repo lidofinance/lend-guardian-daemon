@@ -1,7 +1,7 @@
 // What the five phases hand back. Each value says what the cycle established and what the caller
 // may do next, so the loop around them is a decision over values rather than over exceptions.
 
-import type { DiscoveredPosition, PositionKey, SignalTarget, SupplyAnchor } from './types.ts';
+import type { DiscoveredPosition, LifecycleEventRef, PositionKey, SignalTarget, SupplyAnchor } from './types.ts';
 import type { ScreeningResult } from './screening-provider.ts';
 import type { Address, BlockRef, Bytes32, TxHash } from '../common/types.ts';
 import { frozenCopy } from '../common/immutable.ts';
@@ -101,14 +101,31 @@ export class Work {
 
   readonly #byPosition: ReadonlyMap<PositionKey, readonly SupplyAnchor[]>;
 
-  constructor(plan: ScanPlan, byPosition: ReadonlyMap<PositionKey, readonly SupplyAnchor[]>) {
+  readonly #newestEventByPosition: ReadonlyMap<PositionKey, LifecycleEventRef>;
+
+  /** A position without an entry in `newestEventByPosition` is walked again by an attempt given this work. */
+  constructor(
+    plan: ScanPlan,
+    byPosition: ReadonlyMap<PositionKey, readonly SupplyAnchor[]>,
+    newestEventByPosition: ReadonlyMap<PositionKey, LifecycleEventRef>,
+  ) {
     this.reportBlock = frozenCopy(plan.discoveryRange.to);
     this.previousHeartbeatBlock = frozenCopy(plan.previousHeartbeatBlock);
     this.heartbeatTimestampAtStart = plan.heartbeatTimestampAtStart;
     this.reportsSince = plan.reportsSince;
-    this.#byPosition = new Map(
-      [...byPosition].map(([position, anchors]) => [frozenCopy(position), frozenCopy(anchors)]),
-    );
+    // One frozen copy per position serves both maps, so a key from `entries()` finds its event in `newestEvents()`.
+    const anchorsByFrozenPosition = new Map<PositionKey, readonly SupplyAnchor[]>();
+    const newestEventByFrozenPosition = new Map<PositionKey, LifecycleEventRef>();
+    for (const [position, anchors] of byPosition) {
+      const frozenPosition = frozenCopy(position);
+      anchorsByFrozenPosition.set(frozenPosition, frozenCopy(anchors));
+      const newestEvent = newestEventByPosition.get(position);
+      if (newestEvent !== undefined) {
+        newestEventByFrozenPosition.set(frozenPosition, frozenCopy(newestEvent));
+      }
+    }
+    this.#byPosition = anchorsByFrozenPosition;
+    this.#newestEventByPosition = newestEventByFrozenPosition;
     this.positions = byPosition.size;
     this.anchors = [...byPosition.values()].reduce((total, list) => total + list.length, 0);
     Object.freeze(this);
@@ -117,6 +134,14 @@ export class Work {
   entries(): ReadonlyMap<PositionKey, readonly SupplyAnchor[]> {
     // Freezing a Map does not disable set/delete/clear; expose a separate map instead.
     return new Map(this.#byPosition);
+  }
+
+  /**
+   * The newest event each position's reconstruction started from. A later attempt keeps a position's
+   * anchors only when its discovery reads the same event. The digest does not commit these.
+   */
+  newestEvents(): ReadonlyMap<PositionKey, LifecycleEventRef> {
+    return new Map(this.#newestEventByPosition);
   }
 
   /** Every anchor the cycle found, flag-skipped ones included: what the digest commits. */
