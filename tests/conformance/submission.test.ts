@@ -61,7 +61,7 @@ async function prepared(
   await fixture.anvil.testClient.mine({ blocks: 2 });
   const plan = await guardian.buildScanPlan();
   assert.equal(plan.kind, 'plan');
-  const work = new Work(plan, new Map());
+  const work = new Work(plan, new Map(), new Map());
   const screened = new Screened(
     work,
     { results: [], skipped: [] },

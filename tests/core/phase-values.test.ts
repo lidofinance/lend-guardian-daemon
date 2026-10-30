@@ -71,7 +71,7 @@ test('Discovered owns its plan and positions without freezing constructor inputs
 test('Work owns its blocks, keys, anchors and map without freezing constructor inputs', () => {
   const source = inputs();
   const expected = structuredClone(source);
-  const work = new Work(source.plan, source.entries);
+  const work = new Work(source.plan, source.entries, new Map());
   assert.ok(source.plan.previousHeartbeatBlock !== null);
   Object.assign(source.plan.discoveryRange.to, { number: 1 });
   Object.assign(source.plan.previousHeartbeatBlock, { number: 2 });
@@ -126,9 +126,18 @@ test('Work owns the newest events of its positions without freezing constructor 
   assert.throws(() => Object.assign(event, { logIndex: 0 }), TypeError);
 });
 
+test('a key from Work.entries() finds its newest event', () => {
+  const source = inputs();
+  const newestEvent = { blockNumber: 100_000, logIndex: 3, blockHash: blockAt(100_000).hash };
+  const work = new Work(source.plan, source.entries, new Map([[source.key, newestEvent]]));
+  const [position] = [...work.entries().keys()];
+  assert.ok(position !== undefined);
+  assert.deepEqual(work.newestEvents().get(position), newestEvent);
+});
+
 test('Screened owns its decisions, skipped entries and report targets', () => {
   const source = inputs();
-  const work = new Work(source.plan, source.entries);
+  const work = new Work(source.plan, source.entries, new Map());
   const result = { status: 'judged', requiresSuspect: true, requiresFlag: true } as const;
   const target = { marketId: MARKET, borrower: BORROWER };
   const results = [{ anchor: source.anchor, result }];

@@ -207,6 +207,7 @@ function batches(size = 1, useFixedReceipt = false) {
         discoveryRange: { from: reportBlock, to: reportBlock },
       },
       new Map(),
+      new Map(),
     );
     const screened = new Screened(
       work,

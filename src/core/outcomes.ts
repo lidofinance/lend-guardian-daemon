@@ -107,18 +107,25 @@ export class Work {
   constructor(
     plan: ScanPlan,
     byPosition: ReadonlyMap<PositionKey, readonly SupplyAnchor[]>,
-    newestEventByPosition: ReadonlyMap<PositionKey, LifecycleEventRef> = new Map(),
+    newestEventByPosition: ReadonlyMap<PositionKey, LifecycleEventRef>,
   ) {
     this.reportBlock = frozenCopy(plan.discoveryRange.to);
     this.previousHeartbeatBlock = frozenCopy(plan.previousHeartbeatBlock);
     this.heartbeatTimestampAtStart = plan.heartbeatTimestampAtStart;
     this.reportsSince = plan.reportsSince;
-    this.#byPosition = new Map(
-      [...byPosition].map(([position, anchors]) => [frozenCopy(position), frozenCopy(anchors)]),
-    );
-    this.#newestEventByPosition = new Map(
-      [...newestEventByPosition].map(([position, newestEvent]) => [frozenCopy(position), frozenCopy(newestEvent)]),
-    );
+    // One frozen copy per position serves both maps, so a key from `entries()` finds its event in `newestEvents()`.
+    const anchorsByFrozenPosition = new Map<PositionKey, readonly SupplyAnchor[]>();
+    const newestEventByFrozenPosition = new Map<PositionKey, LifecycleEventRef>();
+    for (const [position, anchors] of byPosition) {
+      const frozenPosition = frozenCopy(position);
+      anchorsByFrozenPosition.set(frozenPosition, frozenCopy(anchors));
+      const newestEvent = newestEventByPosition.get(position);
+      if (newestEvent !== undefined) {
+        newestEventByFrozenPosition.set(frozenPosition, frozenCopy(newestEvent));
+      }
+    }
+    this.#byPosition = anchorsByFrozenPosition;
+    this.#newestEventByPosition = newestEventByFrozenPosition;
     this.positions = byPosition.size;
     this.anchors = [...byPosition.values()].reduce((total, list) => total + list.length, 0);
     Object.freeze(this);
