@@ -38,7 +38,7 @@ try {
   const installed = join(consumer, 'node_modules', 'guardian-daemon-sdk');
   await Promise.all([
     access(join(installed, 'docs', 'guardian-specification.md')),
-    access(join(installed, 'example', 'daemon.ts')),
+    access(join(installed, 'example', 'main.ts')),
     access(join(installed, 'src', 'core', 'guardian.ts')),
   ]);
   await assert.rejects(access(join(installed, 'tests')), { code: 'ENOENT' });

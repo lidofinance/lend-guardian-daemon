@@ -2,20 +2,44 @@
 
 TypeScript reference implementation of the Guardian offchain logic for `GuardianSignals`.
 
-The SDK reconstructs collateral supplies that require screening, passes them to an application-provided screening service, derives the required suspect and flag reports, and submits those reports before a confirmed heartbeat. It is designed to be embedded in a Guardian application; scheduling, provider integration and production operations remain with that application.
+A Guardian screens collateral supplies before the collateral activates. In each cycle it selects a recent block, finds the collateral that must be screened by that block, screens its supply transactions, submits the required `suspect` and `flag` reports and sends a heartbeat for that block. The [Guardian specification](docs/guardian-specification.md) defines this behavior.
 
-The [Guardian specification](docs/guardian-specification.md) defines the required behavior. A runnable integration is provided under [`example/`](example/README.md).
+## Ways to run a Guardian
 
-## Start here
+- **Your own implementation.** You write the whole Guardian from the [specification](docs/guardian-specification.md), in any language.
+- **The SDK in your application.** The SDK is a TypeScript library that runs the Guardian cycle. Your application calls it on a schedule and provides RPC endpoints, the signing key and screening. The [example](example/main.ts) is a runnable application to start from.
+- **The daemon image.** The [daemon](daemon/) is a ready-to-run application built on the SDK and packaged as a Docker image. You configure and run it, and provide RPC endpoints, the signing key and a screening service that the daemon calls over HTTP.
 
-- Read the [Guardian specification](docs/guardian-specification.md) for protocol requirements and illustrative pseudocode.
-- Read the [example guide](example/README.md) for configuration, observe mode, signal mode and provider integration.
-- Follow `Guardian.cycle` for one complete iteration and [`createGuardian`](example/daemon.ts) for viem client and transport setup.
-- Replace the placeholder in [`example/screening-adapter.ts`](example/screening-adapter.ts) with your screening provider.
+The table shows who does what in each case.
 
-The example starts in observe mode, creates no signer and submits no transactions. Its bundled screening provider deliberately returns `incomplete` for every requested anchor.
+|                                           | Your own implementation | The SDK in your application    | The daemon image                  |
+| ----------------------------------------- | ----------------------- | ------------------------------ | --------------------------------- |
+| Scan cycle, reports and heartbeat         | you                     | the SDK                        | the daemon                        |
+| Screening decisions                       | you                     | your `ScreeningProvider`       | your screening service, over HTTP |
+| Schedule and retries between cycles       | you                     | you; the example shows one way | the daemon                        |
+| Monitoring and alerts                     | you                     | your `onEvent` handler         | your event receiver               |
+| RPC endpoints, signing key and deployment | you                     | you                            | you                               |
 
-## Package
+### Your own implementation
+
+- The main body of the specification states the requirements. Its appendix describes one possible implementation in pseudocode; your algorithm may differ as long as it meets the requirements.
+- Implement the five phases of the [scan cycle](docs/guardian-specification.md#scan-cycle) and the coverage digest of [Appendix D](docs/guardian-specification.md#d-submit-signals-and-send-the-heartbeat), and meet the [heartbeat requirements](docs/guardian-specification.md#heartbeat-requirements).
+- Check your coverage digest against [`digest-vectors.json`](tests/conformance/fixtures/digest-vectors.json): example inputs with digests computed by Foundry's `cast`, independently of the SDK. Monitoring can recompute the digest of every heartbeat, so yours must match byte for byte.
+
+### The SDK in your application
+
+- Install the [SDK package](#sdk-package) and follow [SDK integration](#sdk-integration).
+- Start from the [example](example/README.md#read-and-adapt-the-example): [`example/main.ts`](example/main.ts) runs the Guardian on the schedule. In [`example/guardian.ts`](example/guardian.ts), `createGuardian` sets up the viem clients and transport, and `runCycles` runs the cycles and recovers from failed and stale ones; the daemon runs the same code.
+- Replace the placeholder screening provider in [`example/screening.ts`](example/screening.ts) with yours. The placeholder answers `incomplete` for every anchor, so a cycle with work ends incomplete, without a heartbeat.
+- The example starts in observe mode: it creates no signer and sends no transactions.
+
+### The daemon image
+
+- Build the image and run it as the [daemon guide](daemon/README.md#run) describes, in observe mode first.
+- Provide the [configuration](daemon/README.md#configuration) and a screening service that answers the [screening request](daemon/README.md#screening-service). RPC endpoints and the container must meet the [requirements](daemon/README.md#requirements). For monitoring, run an event receiver as [Events and liveness](daemon/README.md#events-and-liveness) describes.
+- Run one instance per delegate key. The daemon sends no credentials to the screening service or the receiver, so keep both on a private network with the daemon.
+
+## SDK package
 
 Install a pinned commit from the public repository:
 
@@ -23,7 +47,7 @@ Install a pinned commit from the public repository:
 npm install git+https://github.com/lidofinance/lend-guardian-daemon.git#<commit>
 ```
 
-Node.js 24 or newer is required. The package currently uses `private: true` to disable npm registry publication; installation from Git is supported.
+Node.js 24.22.1 or newer is required. The package currently uses `private: true` to disable npm registry publication; installation from Git is supported.
 
 Both entry points need viem at run time. The package declares it as a peer dependency, `^2.55.19`, so the application and the SDK share one viem installation; the SDK is tested with viem 2.55.19. npm installs a missing peer automatically. With a package manager that does not, add viem to the application.
 
@@ -32,7 +56,7 @@ The package is named `guardian-daemon-sdk` and exposes two entry points:
 - `guardian-daemon-sdk/core` contains `Guardian`, the screening interface, phase outcomes, shared types and the generic RPC interfaces.
 - `guardian-daemon-sdk/clients` contains `ViemRpcClient`, `createViemRpcTransport` and `LogsNotConfirmedError` for applications using viem.
 
-## Integration
+## SDK integration
 
 An application supplies:
 
@@ -44,7 +68,7 @@ An application supplies:
 
 The SDK does not read or check a market's `maxGuardiansQuorumDelay`; the [specification](docs/guardian-specification.md) states what a zero value means.
 
-The reference implementation for both modes is in [`example/daemon.ts`](example/daemon.ts).
+The reference implementation for both modes is in [`example/main.ts`](example/main.ts).
 
 ### Running cycles
 
@@ -96,7 +120,7 @@ Two of the settings that `Guardian` checks when it is constructed bound the conf
 
 ### Clearing pending nonces
 
-- `Guardian.clearPendingNonces()` is an explicit signal-mode recovery operation; `cycle` does not run it. Call it before the next cycle when an attempt may have left a transaction pending, as [`example/daemon.ts`](example/daemon.ts) does after a failed attempt that reached sending. Use it only for a dedicated signer: one that no other application uses.
+- `Guardian.clearPendingNonces()` is an explicit signal-mode recovery operation; `cycle` does not run it. Call it before the next cycle when an attempt may have left a transaction pending; [`example/guardian.ts`](example/guardian.ts) calls it before every signal-mode cycle. Use it only for a dedicated signer: one that no other application uses.
 - A cancellation the node does not accept is repriced at once by `replacementFeeBumpBps`, until the node accepts one, the fee would exceed `maxFeePerGas`, or `sendTimeoutMs` runs out. `sendAttempts` bounds only `send`.
 - Each clearing decision reports the signer's `latest` and `pending` transaction counts as `nonce.checked`. Equal counts mean that the answering node reports no pending transaction. The SDK cannot verify this: a provider that ignores the `pending` tag always answers with equal counts.
 
@@ -184,8 +208,9 @@ Useful targeted commands:
 ```bash
 npm run test:core
 npm run test:example
+npm run test:daemon
 npm run test:conformance
-node example/daemon.ts
+node example/main.ts
 ```
 
 Tests use scripted nodes and isolated local Anvil processes; they make no external RPC requests.
@@ -196,8 +221,9 @@ Tests use scripted nodes and isolated local Anvil processes; they make no extern
 - [`src/contracts/`](src/contracts/): core, market-controller and `GuardianSignals` access.
 - [`src/chain/`](src/chain/): generic RPC reads, viem transport and transaction delivery.
 - [`abi/`](abi/): minimal ABI fragments used by the SDK.
-- [`example/`](example/README.md): reference Guardian application.
-- [`tests/`](tests/): core, example and contract-conformance tests.
+- [`example/`](example/README.md): the SDK example: the Guardian setup and schedule that the daemon also runs, with a placeholder screening provider.
+- [`daemon/`](daemon/README.md): the deployable daemon built on the example: HTTP screening, event forwarding and a Docker image.
+- [`tests/`](tests/): core, example, daemon and contract-conformance tests.
 - [`docs/guardian-specification.md`](docs/guardian-specification.md): Guardian specification 0.3.0.
 
 ## License

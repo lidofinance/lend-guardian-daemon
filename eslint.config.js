@@ -136,10 +136,47 @@ export default defineConfig([
     },
   },
   {
-    // Keep the example's Guardian configuration and observe/signal client setup in one factory.
-    files: ['example/daemon.ts'],
+    // The library is what the applications import, never the other way round.
+    files: ['src/**/*.ts'],
     rules: {
-      'max-lines-per-function': ['error', { max: 70, skipBlankLines: true, skipComments: true }],
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/daemon/**', '**/example/**', '**/tests/**', '**/scripts/**'],
+              message: 'src/ imports nothing from daemon/, example/, tests/ or scripts/.',
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    // The example shows the SDK on its own; the daemon builds on it, not the other way round.
+    files: ['example/**/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        { patterns: [{ group: ['**/daemon/**'], message: 'The example does not import the daemon.' }] },
+      ],
+    },
+  },
+  {
+    // The daemon runs the example's Guardian and schedule, never its entry point or placeholder.
+    files: ['daemon/**/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/example/main.ts', '**/example/screening.ts'],
+              message: 'The daemon takes only guardian.ts and env.ts from the example.',
+            },
+          ],
+        },
+      ],
     },
   },
   {
