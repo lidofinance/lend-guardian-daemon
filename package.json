@@ -48,10 +48,12 @@
     "test:core": "node --test 'tests/core/**/*.test.ts'",
     "test:example": "node --test 'tests/example/**/*.test.ts'",
     "test:daemon": "node --test 'tests/daemon/**/*.test.ts'",
+    "test:monitoring": "node --test 'tests/monitoring/**/*.test.ts'",
     "test:conformance": "node --test 'tests/conformance/*.test.ts'"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
+    "@prometheus-io/client": "0.16.1",
     "@types/node": "24.10.1",
     "eslint": "10.10.0",
     "ethers": "6.17.0",

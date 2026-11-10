@@ -209,6 +209,7 @@ Useful targeted commands:
 npm run test:core
 npm run test:example
 npm run test:daemon
+npm run test:monitoring
 npm run test:conformance
 node example/main.ts
 ```
@@ -223,7 +224,8 @@ Tests use scripted nodes and isolated local Anvil processes; they make no extern
 - [`abi/`](abi/): minimal ABI fragments used by the SDK.
 - [`example/`](example/README.md): the SDK example: the Guardian setup and schedule that the daemon also runs, with a placeholder screening provider.
 - [`daemon/`](daemon/README.md): the deployable daemon built on the example: HTTP screening, event forwarding and a Docker image.
-- [`tests/`](tests/): core, example, daemon and contract-conformance tests.
+- [`monitoring/`](monitoring/README.md): the receiver Lido runs beside the daemon: it turns the daemon's events into Prometheus metrics, in its own image.
+- [`tests/`](tests/): core, example, daemon, monitoring and contract-conformance tests.
 - [`docs/guardian-specification.md`](docs/guardian-specification.md): Guardian specification 0.3.0.
 
 ## License

@@ -1,0 +1,6 @@
+# The build context is the repository root; the image needs the receiver's modules and package files only.
+*
+!monitoring/*.ts
+!monitoring/package.json
+!monitoring/package-lock.json
+**/.env

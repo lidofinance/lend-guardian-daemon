@@ -7,8 +7,8 @@
 
 import { pathToFileURL } from 'node:url';
 import type { CycleOutcome, SdkEvent } from '../src/core/index.ts';
-import * as env from './env.ts';
-import { createGuardian, GUARDIAN_SETTINGS, runCycles } from './guardian.ts';
+import { Configuration } from './configuration.ts';
+import { createGuardian, GUARDIAN_SETTINGS, readDeployment, runCycles } from './guardian.ts';
 import type { ScheduleEvent } from './guardian.ts';
 import { screening } from './screening.ts';
 
@@ -19,9 +19,18 @@ const RPC_USER_AGENT = 'guardian-daemon-sdk-example';
  * The intervals are example policy and must be chosen for the operator's agreed SLA.
  */
 async function main(): Promise<void> {
-  const mode = env.mode('MODE');
-  const settings = env.readSettings(GUARDIAN_SETTINGS);
-  const guardian = createGuardian({ mode, onEvent: logEvent, screening, settings, userAgent: RPC_USER_AGENT });
+  const config = Configuration.read(process.env);
+  const mode = config.mode('MODE');
+  const settings = config.readSettings(GUARDIAN_SETTINGS);
+  const deployment = readDeployment(config, mode);
+  const guardian = createGuardian({
+    deployment,
+    mode,
+    onEvent: logEvent,
+    screening,
+    settings,
+    userAgent: RPC_USER_AGENT,
+  });
   await runCycles({
     guardian,
     mode,

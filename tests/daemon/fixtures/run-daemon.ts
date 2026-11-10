@@ -62,7 +62,23 @@ mock.module('node:http', {
   namedExports: {
     createServer: (handler: HealthHandler) => {
       health = handler;
-      return { listen: () => ({ unref: () => undefined }) };
+      let onError: ((error: Error) => void) | undefined;
+      const server = {
+        on: (event: string, listener: (error: Error) => void) => {
+          if (event === 'error') {
+            onError = listener;
+          }
+          return server;
+        },
+        listen: () => {
+          // A port another process holds fails the listen after the call, as Node reports it.
+          if (scenario === 'busy-port') {
+            setImmediate(() => onError?.(new Error('listen EADDRINUSE: address already in use :::8080')));
+          }
+          return { unref: () => undefined };
+        },
+      };
+      return server;
     },
   },
 });
@@ -90,13 +106,14 @@ function finish(): void {
   process.exit(0);
 }
 
-/** Observe and an RPC error end with the first cycle; a signal failure ends when the next cycle starts. */
+/**
+ * Observe and an RPC error end with the post totals that follow the first cycle's end; a signal failure
+ * ends when the next cycle starts.
+ */
 function isEnd(event: string): boolean {
-  if (scenario === 'observe') {
-    return event === 'cycle.finished';
-  }
-  if (scenario === 'rpc-error') {
-    return event === 'cycle.failed';
+  const isFirstCycleRun = scenario === 'observe' || scenario === 'rpc-error';
+  if (isFirstCycleRun) {
+    return event === 'daemon.forwardsCounted';
   }
   return startedCycles === 2;
 }

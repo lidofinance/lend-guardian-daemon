@@ -1,0 +1,12 @@
+{
+  "name": "guardian-monitoring",
+  "private": true,
+  "description": "Runtime dependencies of the Guardian monitoring image, which receives the daemon's events and serves Prometheus metrics.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@prometheus-io/client": "0.16.1"
+  }
+}

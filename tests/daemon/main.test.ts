@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
-import { padHex } from 'viem';
-import { reportEvent, toRecord } from '../../daemon/main.ts';
+import { getAddress, padHex } from 'viem';
+import { privateKeyToAddress } from 'viem/accounts';
+import { EventReporter, readBuildInfo, toRecord } from '../../daemon/main.ts';
 import { HttpScreening } from '../../daemon/screening.ts';
 import type { ScreeningRequestFinishedEvent } from '../../daemon/screening.ts';
 import { runCycle } from '../../example/guardian.ts';
@@ -15,6 +19,7 @@ import type { SdkEvent } from '../../src/core/index.ts';
 import { blockAt, CORE, GUARDIAN, REGISTRY } from '../core/fake-node.ts';
 import type { Script } from '../core/fake-node.ts';
 import { guardianOver } from '../core/setup.ts';
+import { readInstalledVersions } from '../lock-files.ts';
 
 const CONFIGURATION = {
   RPC_URLS: 'http://rpc.invalid/v3/SECRET-KEY',
@@ -34,7 +39,10 @@ type SignalScenario = 'failed-send';
 /** The delegate's key; the scripted registry names its address as the Guardian's delegate. */
 const SIGNAL = { MODE: 'signal', SIGNER_KEY: padHex('0x02', { size: 32 }) };
 
-function runDaemon(scenario: 'observe' | 'rpc-error' | SignalScenario, settings: Record<string, string> = {}) {
+function runDaemon(
+  scenario: 'observe' | 'rpc-error' | 'busy-port' | SignalScenario,
+  settings: Record<string, string> = {},
+) {
   const isSignal = scenario === 'failed-send';
   return spawnSync(
     process.execPath,
@@ -59,13 +67,16 @@ test('an observe cycle screens over HTTP, prints its events and forwards every e
   assert.match(child.stdout, anchorId);
   assert.match(
     child.stdout,
-    /^Forwarded events: cycle\.discovered, cycle\.finished, cycle\.planned, cycle\.reconstructed, cycle\.screened, cycle\.started, rpc\.requestFinished, rpc\.requestStarted, screening\.requestFinished$/m,
+    /^Forwarded events: cycle\.discovered, cycle\.finished, cycle\.planned, cycle\.reconstructed, cycle\.screened, cycle\.started, daemon\.forwardsCounted, daemon\.started, rpc\.requestFinished, rpc\.requestStarted, screening\.requestFinished$/m,
   );
   assert.match(
     child.stdout,
-    /^Printed events: cycle\.discovered, cycle\.finished, cycle\.planned, cycle\.reconstructed, cycle\.screened, cycle\.started, screening\.requestFinished$/m,
+    /^Printed events: cycle\.discovered, cycle\.finished, cycle\.planned, cycle\.reconstructed, cycle\.screened, cycle\.started, daemon\.forwardsCounted, daemon\.started, screening\.requestFinished$/m,
   );
-  assert.match(child.stdout, /^\{"event":"screening\.requestFinished","anchors":1,"judged":1,"incomplete":0\}$/m);
+  assert.match(
+    child.stdout,
+    /^\{"event":"screening\.requestFinished","anchors":1,"judged":1,"incomplete":0,"startedAt":\d+,"finishedAt":\d+,"httpStatus":200\}$/m,
+  );
   assert.match(child.stdout, /^Health: 200$/m);
 });
 
@@ -75,6 +86,11 @@ test('an RPC error reaches the log and the receiver without the endpoint URL', (
   assert.equal(child.status, 0, child.stderr);
   assert.match(child.stdout, /^\{"event":"cycle\.failed".*synthetic log outage/m);
   assert.match(child.stdout, /URL: \[url\]/);
+  // The node's JSON-RPC error code stays in the record, for the receiver's `rpc_error_code`.
+  assert.match(
+    child.stdout,
+    /^\{"event":"rpc\.requestFinished".*"error":\{"name":"RpcRequestError",.*"code":-32000\}\}$/m,
+  );
   assert.doesNotMatch(`${child.stdout}${child.stderr}`, /SECRET-KEY/);
   assert.match(child.stdout, /^Forwarded bodies naming an endpoint: 0$/m);
 });
@@ -87,6 +103,62 @@ test('every signal cycle clears the pending nonces before it starts, the one aft
   // Clearing reads the latest and the pending nonce, before the first cycle and before the next one.
   assert.match(child.stdout, /^Nonce reads before each cycle: 2, 2$/m);
   assert.match(child.stdout, /^Sent reports: $/m);
+  // The failed cycle ends with the totals of the posts the receiver has answered so far.
+  assert.match(child.stdout, /^\{"event":"daemon\.forwardsCounted","posts":\{"204":[1-9]\d*\},"durationMs":\d+\}$/m);
+});
+
+test('the daemon starts with a record of its build, deployment and settings that names no key and no URL', () => {
+  const child = runDaemon('failed-send');
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  const line = child.stdout.split('\n').find((text) => text.startsWith('{"event":"daemon.started"'));
+  assert.ok(line !== undefined, child.stdout);
+  const record: unknown = JSON.parse(line);
+  assert.ok(isRecord(record) && isRecord(record.settings));
+  const { settings, ...rest } = record;
+  assert.deepEqual(rest, {
+    event: 'daemon.started',
+    build: { version: 'unknown', branch: 'unknown', commit: 'unknown' },
+    configFile: null,
+    mode: 'signal',
+    chainId: 1,
+    guardian: getAddress(GUARDIAN),
+    lidoLend: { address: getAddress(CORE), deploymentBlock: 1000 },
+    guardianSignals: { address: getAddress(REGISTRY), deploymentBlock: 900 },
+    signer: privateKeyToAddress(SIGNAL.SIGNER_KEY),
+    rpcUrlCount: 1,
+    rpcLogQuorum: null,
+    rpcUserAgent: 'lend-guardian-daemon/unknown',
+    hasEventsUrl: true,
+  });
+  assert.equal(settings.CYCLE_INTERVAL_MS, 360_000);
+  assert.equal(settings.SCREENING_TIMEOUT_MS, 1_210_000);
+  assert.equal(settings.HEALTH_PORT, 8080);
+  assert.doesNotMatch(line, /SECRET-KEY|rpc\.invalid|screening\.invalid|receiver\.invalid/);
+  assert.ok(!line.includes(SIGNAL.SIGNER_KEY.slice(2)));
+});
+
+test('RPC_USER_AGENT follows the application name in the RPC User-Agent instead of replacing it', () => {
+  const child = runDaemon('failed-send', { RPC_USER_AGENT: 'operator-17' });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(
+    child.stdout,
+    /^\{"event":"daemon\.started".*"rpcUserAgent":"lend-guardian-daemon\/unknown operator-17"/m,
+  );
+});
+
+test('a health port the daemon cannot listen on ends it through the same record as any other failure', () => {
+  const child = runDaemon('busy-port');
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 1);
+  // The fixture's module mocks add Node's warnings to standard error; the daemon's own lines are JSON.
+  assert.deepEqual(
+    child.stderr.split('\n').filter((line) => line.startsWith('{')),
+    [
+      '{"event":"daemon.failed","error":{"name":"Error","message":"listen EADDRINUSE: address already in use :::8080"}}',
+    ],
+  );
 });
 
 test('the daemon refuses to start without a screening service URL', () => {
@@ -306,17 +378,42 @@ test('a record keeps the reason of a Guardian stop as its message', () => {
   );
 });
 
-test('reporting logs and posts the record once and ignores a receiver that fails', async (context) => {
+test('a record keeps the numeric code of an error, such as a JSON-RPC error code, and drops any other', () => {
+  const limited = Object.assign(new Error('limit exceeded'), { code: -32005 });
+  const refused = Object.assign(new Error('connect refused'), { code: 'ECONNREFUSED' });
+  assert.equal(
+    toRecord({ event: 'rpc.requestFinished', limited, refused }),
+    '{"event":"rpc.requestFinished","limited":{"name":"Error","message":"limit exceeded","code":-32005},"refused":{"name":"Error","message":"connect refused"}}',
+  );
+});
+
+/** Let every settled fetch run its handlers. */
+function settle(): Promise<unknown> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+test('reporting logs and posts the record once with the user agent and ignores a receiver that fails', async (context) => {
   const request = context.mock.method(globalThis, 'fetch', () => Promise.reject(new Error('receiver down')));
   const log = context.mock.method(console, 'log', () => undefined);
-  reportEvent(
-    { event: 'screening.requestFinished', anchors: 2, judged: 1, incomplete: 1 },
-    'http://receiver.invalid/events',
-    5_000,
-  );
+  const reporter = new EventReporter({
+    eventsUrl: 'http://receiver.invalid/events',
+    timeoutMs: 5_000,
+    userAgent: 'lend-guardian-daemon/test',
+  });
+  const event = {
+    event: 'screening.requestFinished',
+    anchors: 2,
+    judged: 1,
+    incomplete: 1,
+    startedAt: 1_000,
+    finishedAt: 1_500,
+    httpStatus: 200,
+  } as const;
+  reporter.report(event);
   // A rejection the daemon did not handle would fail this test once the fetch settles.
-  await new Promise((resolve) => setImmediate(resolve));
-  const record = '{"event":"screening.requestFinished","anchors":2,"judged":1,"incomplete":1}';
+  await settle();
+  const record =
+    '{"event":"screening.requestFinished","anchors":2,"judged":1,"incomplete":1,"startedAt":1000,"finishedAt":1500,"httpStatus":200}';
   assert.deepEqual(
     log.mock.calls.map((call) => call.arguments),
     [[record]],
@@ -328,22 +425,97 @@ test('reporting logs and posts the record once and ignores a receiver that fails
   const { signal: _timeout, ...options } = init;
   assert.deepEqual(options, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', 'user-agent': 'lend-guardian-daemon/test' },
     body: record,
   });
 });
 
-/** The version of each package a lock file installs, by its path under `node_modules`. */
-async function readInstalledVersions(lockPath: string): Promise<Map<string, unknown>> {
-  const lock: unknown = JSON.parse(await readFile(new URL(`../../${lockPath}`, import.meta.url), 'utf8'));
-  const packages = isRecord(lock) && isRecord(lock.packages) ? lock.packages : {};
-  return new Map(
-    Object.entries(packages)
-      .filter(([path]) => path.startsWith('node_modules/'))
-      .map(([path, entry]) => [path, isRecord(entry) ? entry.version : undefined]),
+test('after each cycle end the reporter posts the totals of the posts answered so far, a failed one as 0', async (context) => {
+  const answers = [Promise.reject(new Error('receiver down')), Promise.resolve(new Response(null, { status: 204 }))];
+  const request = context.mock.method(
+    globalThis,
+    'fetch',
+    () => answers.shift() ?? Promise.resolve(new Response(null, { status: 503 })),
   );
+  context.mock.method(console, 'log', () => undefined);
+  const reporter = new EventReporter({
+    eventsUrl: 'http://receiver.invalid/events',
+    timeoutMs: 5_000,
+    userAgent: 'test',
+  });
+  reporter.report({ event: 'cycle.started', cycleId: 'one', startedAt: 1 });
+  await settle();
+  reporter.report({
+    event: 'cycle.planned',
+    cycleId: 'one',
+    result: { kind: 'nothing-due', previousHeartbeatBlock: null, reason: 'no-work-and-idle-heartbeat-not-due' },
+  });
+  await settle();
+  reporter.report({ event: 'schedule.cycleNotStarted', error: new Error('nonce') });
+  await settle();
+  const posted = request.mock.calls.map((call) => {
+    const body = call.arguments[1]?.body;
+    assert.ok(typeof body === 'string');
+    const record: unknown = JSON.parse(body);
+    assert.ok(isRecord(record));
+    return record;
+  });
+  assert.deepEqual(
+    posted.map((record) => record.event),
+    ['cycle.started', 'cycle.planned', 'schedule.cycleNotStarted', 'daemon.forwardsCounted'],
+  );
+  const totals = posted[3];
+  assert.ok(totals !== undefined);
+  assert.deepEqual(totals.posts, { 0: 1, 204: 1 });
+  assert.equal(typeof totals.durationMs, 'number');
+});
+
+for (const end of [
+  {
+    event: 'cycle.finished',
+    cycleId: 'one',
+    startedAt: 1,
+    finishedAt: 2,
+    outcome: { kind: 'stale', reason: 'report-block-reorged' },
+  },
+  { event: 'cycle.failed', cycleId: 'one', startedAt: 1, finishedAt: 2, error: new Error('node down') },
+] as const) {
+  test(`a ${end.event} is followed by the post totals, printed and posted`, async (context) => {
+    const request = context.mock.method(globalThis, 'fetch', () =>
+      Promise.resolve(new Response(null, { status: 204 })),
+    );
+    const log = context.mock.method(console, 'log', () => undefined);
+    const reporter = new EventReporter({
+      eventsUrl: 'http://receiver.invalid/events',
+      timeoutMs: 5_000,
+      userAgent: 'test',
+    });
+    reporter.report({ event: 'cycle.started', cycleId: 'one', startedAt: 1 });
+    await settle();
+    reporter.report(end);
+    await settle();
+    const printed = log.mock.calls.map((call) => String(call.arguments[0]));
+    // The totals count the posts answered so far: the cycle's start, not its end posted just before them.
+    assert.match(printed.at(-1) ?? '', /^\{"event":"daemon\.forwardsCounted","posts":\{"204":1\},"durationMs":\d+\}$/);
+    const posted = request.mock.calls.map((call) => call.arguments[1]?.body);
+    assert.equal(posted.length, 3);
+    assert.equal(posted[2], printed.at(-1));
+  });
 }
 
+test('without a receiver the reporter only prints, and reports no totals', (context) => {
+  const request = context.mock.method(globalThis, 'fetch', () => Promise.resolve(new Response(null, { status: 204 })));
+  const log = context.mock.method(console, 'log', () => undefined);
+  const reporter = new EventReporter({ eventsUrl: undefined, timeoutMs: 5_000, userAgent: 'test' });
+  reporter.report({ event: 'schedule.cycleNotStarted', error: new Error('nonce') });
+  assert.equal(request.mock.callCount(), 0);
+  assert.deepEqual(
+    log.mock.calls.map((call) => call.arguments),
+    [['{"event":"schedule.cycleNotStarted","error":{"name":"Error","message":"nonce"}}']],
+  );
+});
+
+/** The version of each package a lock file installs, by its path under `node_modules`. */
 test('the daemon image installs the dependency versions the tests run against', async () => {
   const tested = await readInstalledVersions('package-lock.json');
   const image = await readInstalledVersions('daemon/package-lock.json');
@@ -351,4 +523,46 @@ test('the daemon image installs the dependency versions the tests run against', 
   for (const [path, version] of image) {
     assert.equal(version, tested.get(path), `${path} in daemon/package-lock.json`);
   }
+});
+
+const UNKNOWN_BUILD = { version: 'unknown', branch: 'unknown', commit: 'unknown' };
+
+/** A `build-info.json` holding the text, in a directory removed after the test. */
+function writeBuildInfo(context: TestContext, text: string): URL {
+  const directory = mkdtempSync(join(tmpdir(), 'daemon-build-'));
+  context.after(() => {
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const file = join(directory, 'build-info.json');
+  writeFileSync(file, text);
+  return pathToFileURL(file);
+}
+
+test('build info is read from the image file', (context) => {
+  const text = JSON.stringify({ version: 'dev', branch: 'feat/develop-build', commit: 'c0ffee' });
+  assert.deepEqual(readBuildInfo(writeBuildInfo(context, text)), {
+    version: 'dev',
+    branch: 'feat/develop-build',
+    commit: 'c0ffee',
+  });
+});
+
+test('a build field that is empty, absent or not text reads as unknown', (context) => {
+  assert.deepEqual(readBuildInfo(writeBuildInfo(context, JSON.stringify({ version: '', commit: 7 }))), UNKNOWN_BUILD);
+});
+
+test('without the build file, as in a run from a checkout, every field is unknown', (context) => {
+  assert.deepEqual(readBuildInfo(new URL('missing.json', writeBuildInfo(context, '{}'))), UNKNOWN_BUILD);
+});
+
+for (const text of ['"dev"', '[1]']) {
+  test(`a build file holding ${text}, not a JSON object, stops the start`, (context) => {
+    assert.throws(() => readBuildInfo(writeBuildInfo(context, text)), {
+      message: 'build-info.json must hold a JSON object',
+    });
+  });
+}
+
+test('a build file that is not JSON stops the start', (context) => {
+  assert.throws(() => readBuildInfo(writeBuildInfo(context, '{')), SyntaxError);
 });

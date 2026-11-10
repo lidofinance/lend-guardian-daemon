@@ -2,18 +2,20 @@
 // the log and to an optional receiver, and a liveness endpoint. README.md in this directory describes
 // its configuration, contracts and limits.
 
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
-import * as env from '../example/env.ts';
-import type { Setting } from '../example/env.ts';
-import { createGuardian, GUARDIAN_SETTINGS, MAX_TIMER_MS, runCycles } from '../example/guardian.ts';
-import type { ScheduleEvent } from '../example/guardian.ts';
-import type { SdkEvent } from '../src/core/index.ts';
+import { Configuration } from '../example/configuration.ts';
+import type { Mode, Setting, Settings } from '../example/configuration.ts';
+import { createGuardian, GUARDIAN_SETTINGS, MAX_TIMER_MS, readDeployment, runCycles } from '../example/guardian.ts';
+import type { GuardianDeployment, ScheduleEvent } from '../example/guardian.ts';
+import type { Address, SdkEvent } from '../src/core/index.ts';
 import {
   DEFAULT_SCREENING_BATCH_SIZE,
   DEFAULT_SCREENING_BUDGET_MS,
   DEFAULT_SCREENING_CONCURRENCY,
   HttpScreening,
+  isRecord,
   MAX_SCREENING_TIMEOUT_MS,
 } from './screening.ts';
 import type { ScreeningRequestFinishedEvent } from './screening.ts';
@@ -40,43 +42,110 @@ const DAEMON_SETTINGS = {
   HEALTH_WINDOW_MS: { default: 10 * 60_000, min: 1 },
 } satisfies Record<string, Setting>;
 
-const DEFAULT_RPC_USER_AGENT = 'guardian-daemon';
+type DaemonSettings = Settings<typeof DAEMON_SETTINGS>;
 
-type DaemonEvent = SdkEvent | ScheduleEvent | ScreeningRequestFinishedEvent;
+/** The name of the application in the `User-Agent` of every request it sends. */
+const APPLICATION_NAME = 'lend-guardian-daemon';
 
-/** Any URL, which may carry an endpoint's credentials in its path or query. */
+/** Written next to `daemon/` by the image build; a run from a checkout has none. */
+const BUILD_INFO_FILE = new URL('../build-info.json', import.meta.url);
+
+/** The image's build, as `Dockerfile` records it. */
+export interface BuildInfo {
+  readonly version: string;
+  readonly branch: string;
+  readonly commit: string;
+}
+
+const UNKNOWN_BUILD: BuildInfo = { version: 'unknown', branch: 'unknown', commit: 'unknown' };
+
+/** What the daemon reports of its own, beside the SDK's, the schedule's and the screening's events. */
+export type DaemonOwnEvent =
+  | {
+      /** The configuration the daemon runs with; it names no key and no URL. */
+      readonly event: 'daemon.started';
+      readonly build: BuildInfo;
+      /** The JSON configuration file, when `CONFIG_FILE` names one. */
+      readonly configFile: string | null;
+      readonly mode: Mode;
+      readonly chainId: number;
+      readonly guardian: Address;
+      readonly lidoLend: GuardianDeployment['lidoLend'];
+      readonly guardianSignals: GuardianDeployment['guardianSignals'];
+      /** The delegate's address in signal mode. */
+      readonly signer: Address | null;
+      readonly rpcUrlCount: number;
+      readonly rpcLogQuorum: number | null;
+      readonly rpcUserAgent: string;
+      readonly hasEventsUrl: boolean;
+      readonly settings: Readonly<Record<string, number>>;
+    }
+  | {
+      /**
+       * The posts to the receiver since the start, by the HTTP status of their answer, `0` without one,
+       * and their total duration; a post the receiver lost is counted here.
+       */
+      readonly event: 'daemon.forwardsCounted';
+      readonly posts: Readonly<Record<string, number>>;
+      readonly durationMs: number;
+    };
+
+export type DaemonEvent = SdkEvent | ScheduleEvent | ScreeningRequestFinishedEvent | DaemonOwnEvent;
+
+/** The events after which the daemon reports its post totals: each ends a scheduled cycle. */
+const CYCLE_ENDS: ReadonlySet<DaemonEvent['event']> = new Set([
+  'cycle.finished',
+  'cycle.failed',
+  'schedule.cycleNotStarted',
+]);
+
+/** Any URL, which may carry an endpoint's credentials in its path or query; `monitoring/events.ts` keeps a copy. */
 const URL_PATTERN = /https?:\/\/[^\s"'<>]+/g;
 
 /** Schedule [scan attempts](../docs/guardian-specification.md#scan-cycle) with HTTP screening and liveness. */
 async function main(): Promise<void> {
-  const mode = env.mode('MODE');
-  const settings = env.readSettings(DAEMON_SETTINGS);
-  const eventsUrl = env.url('EVENTS_URL', { default: undefined });
+  const config = Configuration.read(process.env);
+  const mode = config.mode('MODE');
+  const settings = config.readSettings(DAEMON_SETTINGS);
+  const eventsUrl = config.url('EVENTS_URL', { default: undefined });
   // A shorter window would mark a working daemon as stuck while it waits for a cycle or a request.
   const healthWindowMs = settings('HEALTH_WINDOW_MS');
   if (healthWindowMs <= Math.max(settings('CYCLE_INTERVAL_MS'), settings('SCREENING_REQUEST_TIMEOUT_MS'))) {
     throw new Error('HEALTH_WINDOW_MS must be longer than CYCLE_INTERVAL_MS and SCREENING_REQUEST_TIMEOUT_MS');
   }
+  const deployment = readDeployment(config, mode);
+  const build = readBuildInfo(BUILD_INFO_FILE);
+  const userAgent = `${APPLICATION_NAME}/${build.version}`;
+  const reporter = new EventReporter({ eventsUrl, timeoutMs: settings('FORWARD_TIMEOUT_MS'), userAgent });
   let lastEventAt = Date.now();
   const onEvent = (event: DaemonEvent): void => {
     lastEventAt = Date.now();
-    reportEvent(event, eventsUrl, settings('FORWARD_TIMEOUT_MS'));
+    reporter.report(event);
   };
-  const screening = new HttpScreening(env.url('SCREENING_URL'), {
+  const screening = new HttpScreening(config.url('SCREENING_URL'), {
     batchSize: settings('SCREENING_BATCH_SIZE'),
     concurrency: settings('SCREENING_CONCURRENCY'),
     timeoutMs: settings('SCREENING_REQUEST_TIMEOUT_MS'),
     budgetMs: settings('SCREENING_TIMEOUT_MS') - SCREENING_SETTLE_MARGIN_MS,
+    userAgent,
     onEvent,
   });
-  const userAgent = env.userAgent('RPC_USER_AGENT', { default: DEFAULT_RPC_USER_AGENT });
-  const guardian = createGuardian({ mode, onEvent, screening, settings, userAgent });
+  const rpcUserAgent = composeRpcUserAgent(config, userAgent);
+  const guardian = createGuardian({ deployment, mode, onEvent, screening, settings, userAgent: rpcUserAgent });
+  const hasEventsUrl = eventsUrl !== undefined;
+  onEvent(
+    describeStart({ build, configFile: config.configFile, deployment, mode, settings, rpcUserAgent, hasEventsUrl }),
+  );
   // Liveness for Docker or Kubernetes. The server does not keep the process alive, so an error that
-  // ends the cycles also ends the process.
+  // ends the cycles also ends the process; a port it cannot listen on ends it too.
   createServer((_request, response) => {
     const isActive = Date.now() - lastEventAt < healthWindowMs;
     response.writeHead(isActive ? 200 : 503).end();
   })
+    .on('error', (error) => {
+      printFailure(error);
+      process.exit(1);
+    })
     .listen(settings('HEALTH_PORT'))
     .unref();
   await runCycles({
@@ -88,32 +157,161 @@ async function main(): Promise<void> {
   });
 }
 
-/** Print and forward one event; routine RPC events go only to the optional receiver. */
-export function reportEvent(event: DaemonEvent, eventsUrl: string | undefined, forwardTimeoutMs: number): void {
-  const record = toRecord(event);
-  const isRpcStarted = event.event === 'rpc.requestStarted';
-  const isRpcSucceeded = event.event === 'rpc.requestFinished' && event.error === undefined;
-  if (!isRpcStarted && !isRpcSucceeded) {
-    console.log(record);
-  }
-  if (eventsUrl === undefined) {
-    return;
-  }
-  // Delivery is best effort, with no queue or retries; README.md, Limitations, describes the loss.
-  void fetch(eventsUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: record,
-    signal: AbortSignal.timeout(forwardTimeoutMs),
-  })
-    // Only a read or cancelled body returns the connection to undici's pool.
-    .then((response) => response.body?.cancel())
-    .catch(() => {
-      // The receiver answers for its own availability; delivery failures do not stop the cycle.
-    });
+/** The application's name first, so a provider always sees which program sends, then `RPC_USER_AGENT` when set. */
+function composeRpcUserAgent(config: Configuration, userAgent: string): string {
+  const operatorUserAgent = config.userAgent('RPC_USER_AGENT', { default: undefined });
+  return operatorUserAgent === undefined ? userAgent : `${userAgent} ${operatorUserAgent}`;
 }
 
-/** JSON with decimal amounts, error names and messages, and URLs replaced to hide endpoint credentials. */
+/**
+ * `build-info.json` of the image, or `unknown` for each field without one; a broken file stops the start.
+ * `readBuildInfo` in `monitoring/main.ts` reads the receiver's by the same rule.
+ */
+export function readBuildInfo(location: URL): BuildInfo {
+  let text: string;
+  try {
+    text = readFileSync(location, 'utf8');
+  } catch (error) {
+    const isMissing = error instanceof Error && 'code' in error && error.code === 'ENOENT';
+    if (isMissing) {
+      return UNKNOWN_BUILD;
+    }
+    throw error;
+  }
+  const info: unknown = JSON.parse(text);
+  if (!isRecord(info)) {
+    throw new Error('build-info.json must hold a JSON object');
+  }
+  return { version: readText(info, 'version'), branch: readText(info, 'branch'), commit: readText(info, 'commit') };
+}
+
+function readText(info: Readonly<Record<string, unknown>>, name: string): string {
+  const value = info[name];
+  return typeof value === 'string' && value !== '' ? value : 'unknown';
+}
+
+/** The start record of what the daemon read: endpoints are counted, never named, and the signer appears by its address. */
+function describeStart(options: {
+  readonly build: BuildInfo;
+  readonly configFile: string | undefined;
+  readonly deployment: GuardianDeployment;
+  readonly mode: Mode;
+  readonly settings: DaemonSettings;
+  readonly rpcUserAgent: string;
+  readonly hasEventsUrl: boolean;
+}): DaemonOwnEvent {
+  const { deployment, settings } = options;
+  const names = Object.keys(DAEMON_SETTINGS).filter(isSettingName);
+  return {
+    event: 'daemon.started',
+    build: options.build,
+    configFile: options.configFile ?? null,
+    mode: options.mode,
+    chainId: deployment.chain.id,
+    guardian: deployment.guardian,
+    lidoLend: deployment.lidoLend,
+    guardianSignals: deployment.guardianSignals,
+    signer: deployment.signer?.address ?? null,
+    rpcUrlCount: deployment.rpcUrls.length,
+    rpcLogQuorum: deployment.rpcLogQuorum ?? null,
+    rpcUserAgent: options.rpcUserAgent,
+    hasEventsUrl: options.hasEventsUrl,
+    settings: Object.fromEntries(names.map((name) => [name, settings(name)])),
+  };
+}
+
+function isSettingName(name: string): name is keyof typeof DAEMON_SETTINGS {
+  return Object.hasOwn(DAEMON_SETTINGS, name);
+}
+
+/** Where the daemon posts its records and how. */
+interface ForwardOptions {
+  /** The operator's receiver; without one the daemon only prints. */
+  readonly eventsUrl: string | undefined;
+  readonly timeoutMs: number;
+  readonly userAgent: string;
+}
+
+/**
+ * Prints each event and posts it to the optional receiver, counting the posts by the status of their
+ * answer. After each cycle it reports the totals, so the receiver learns of the posts it lost.
+ */
+export class EventReporter {
+  readonly #options: ForwardOptions;
+
+  readonly #postsByStatus = new Map<number, number>();
+
+  #postDurationMs = 0;
+
+  constructor(options: ForwardOptions) {
+    this.#options = options;
+  }
+
+  /**
+   * Print and forward one event, and after a cycle end the post totals. Routine RPC events go only to the
+   * optional receiver; `isRoutine` in `monitoring/events.ts` leaves the same events out of its log.
+   */
+  report(event: DaemonEvent): void {
+    const record = toRecord(event);
+    const isRpcStarted = event.event === 'rpc.requestStarted';
+    const isRpcSucceeded = event.event === 'rpc.requestFinished' && event.error === undefined;
+    if (!isRpcStarted && !isRpcSucceeded) {
+      console.log(record);
+    }
+    if (this.#options.eventsUrl === undefined) {
+      return;
+    }
+    this.#post(this.#options.eventsUrl, record);
+    if (CYCLE_ENDS.has(event.event)) {
+      const totals = toRecord(this.#describeForwards());
+      console.log(totals);
+      this.#post(this.#options.eventsUrl, totals);
+    }
+  }
+
+  #post(eventsUrl: string, record: string): void {
+    const startedAt = performance.now();
+    const count = (status: number): void => {
+      this.#postsByStatus.set(status, (this.#postsByStatus.get(status) ?? 0) + 1);
+      this.#postDurationMs += performance.now() - startedAt;
+    };
+    // Delivery is best effort, with no queue or retries; README.md, Limitations, describes the loss.
+    void fetch(eventsUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'user-agent': this.#options.userAgent },
+      body: record,
+      signal: AbortSignal.timeout(this.#options.timeoutMs),
+    })
+      .then(
+        (response) => {
+          count(response.status);
+          // Only a read or cancelled body returns the connection to undici's pool.
+          return response.body?.cancel();
+        },
+        () => {
+          // The receiver answers for its own availability; a failed post is counted and the cycle goes on.
+          count(0);
+        },
+      )
+      .catch(() => {
+        // A body that fails to cancel leaves only its connection unused.
+      });
+  }
+
+  #describeForwards(): DaemonOwnEvent {
+    const statuses = [...this.#postsByStatus.keys()].sort((left, right) => left - right);
+    return {
+      event: 'daemon.forwardsCounted',
+      posts: Object.fromEntries(statuses.map((status) => [String(status), this.#postsByStatus.get(status) ?? 0])),
+      durationMs: Math.round(this.#postDurationMs),
+    };
+  }
+}
+
+/**
+ * JSON with decimal amounts, errors as their name, message and numeric code, such as a JSON-RPC error
+ * code, and URLs replaced to hide endpoint credentials.
+ */
 export function toRecord(event: object): string {
   return JSON.stringify(event, (_key, value: unknown) => {
     if (typeof value === 'bigint') {
@@ -123,19 +321,24 @@ export function toRecord(event: object): string {
       return value.replace(URL_PATTERN, '[url]');
     }
     if (value instanceof Error) {
-      return { name: value.name, message: value.message };
+      const code = 'code' in value ? value.code : undefined;
+      return { name: value.name, message: value.message, ...(typeof code === 'number' ? { code } : {}) };
     }
     return value;
   });
+}
+
+/** An error that ends the process; an RPC error names its endpoint, so it goes through the same redaction as the events. */
+function printFailure(error: unknown): void {
+  console.error(toRecord({ event: 'daemon.failed', error }));
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     await main();
   } catch (error) {
-    // A configuration or recovery error ends the process. An RPC error names its endpoint, so it is
-    // printed through the same redaction as the events.
-    console.error(toRecord({ event: 'daemon.failed', error }));
+    // A configuration or recovery error ends the process.
+    printFailure(error);
     process.exitCode = 1;
   }
 }
