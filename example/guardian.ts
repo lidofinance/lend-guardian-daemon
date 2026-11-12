@@ -44,8 +44,8 @@ export const GUARDIAN_SETTINGS = {
   HISTORY_READ_CONCURRENCY: { default: 8, min: 1 },
   INTER_BATCH_CONFIRMATION_BLOCKS: { default: 2, min: 1 },
   CONFIRMATION_POLL_INTERVAL_MS: { default: 12_000, min: 1, max: MAX_TIMER_MS },
-  // A report costs up to about 156,000 gas per borrower, so 50 borrowers stay under half of the
-  // 16,777,216 gas one transaction may use.
+  // A batch of this size fits in one transaction, unless a suspect batch also prunes many expired reports on
+  // its borrowers, which can push it over the transaction gas limit.
   MAX_SIGNAL_BATCH_SIZE: { default: 50, min: 1 },
   IDLE_HEARTBEAT_INTERVAL_SECONDS: { default: 12 * 60 * 60, min: 1 },
   HEARTBEAT_RESERVE_BLOCKS: { default: 8, min: 1 },

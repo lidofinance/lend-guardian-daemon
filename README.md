@@ -99,12 +99,18 @@ if ('previousHeartbeatBlock' in outcome) {
 - An incomplete result withholds the heartbeat, not the reports: the attempt sends and confirms the reports its complete results require, then ends as `incomplete`, with the work for the next attempt.
 - RPC and provider failures propagate to the application.
 - `cycle` emits typed phase and terminal events through the same `onEvent` handler as RPC, transaction and report events.
+- **A delayed lot can wait for the idle heartbeat.** Report delays can put a lot's unlock time after the heartbeat that covered it. Without other work, the next heartbeats are idle ones, so the lot matures once a quorum of them passes its unlock time, or at the quorum fallback. A shorter `idleHeartbeatInterval` shortens that wait.
+
+> [!NOTE]
+> **Reports name the account a supply is booked on, not its sender.** The Guardian reports the `onBehalf` account of a supply. Anyone can supply collateral on behalf of another account, including an innocent borrower or a shared contract such as a bundler adapter, so a third party's tainted supply can get that account flagged and banned ([Guardian Signals](https://github.com/lidofinance/lend-markets/blob/main/docs/specs/guardian-signals.md)). The screening service makes the flag decision and has to take this into account in its assessment. A wrongful ban is lifted with `unban`.
 
 ### Clients and transactions
 
 - For viem, create one reusable transport, use it to configure the public and wallet clients, and pass those clients to `ViemRpcClient`.
 - Applications using another library may implement the exported `RpcProvider` reads and `RpcClient` preparation, broadcast and bounded-delivery methods directly.
 - A registry report costs more gas when another guardian reports the same account between the estimate and inclusion, so preparation should add headroom to the node's gas estimate. `ViemRpcClient` adds `transactionPolicy.gasHeadroomBps`, none when it is omitted.
+- **A heartbeat can run out of gas.** If another guardian's heartbeat moves the quorum frontier between this heartbeat's estimate and its inclusion, the frontier recomputation this heartbeat then pays for can need more gas than `gasHeadroomBps` adds at a quorum of two or more. The attempt fails, and the next cycle sends the heartbeat again.
+- **A refused replacement fails the send.** If the original transaction lands after the client's last receipt read, the node refuses its replacement, for example with `nonce too low`, and the attempt fails although its transaction succeeded. The next cycle finds the landed transaction on chain.
 - Before the heartbeat, `Guardian` reads every report's receipt and transaction again through the client's plain reads. It requires the transaction to be its signer calling the registry with that report's calldata, in a block after the report block. A client that confirms the wrong transaction, such as an identical earlier call, stops the attempt with `report-receipt-foreign`.
 
 Two of the settings that `Guardian` checks when it is constructed bound the confirmation waits:
@@ -115,6 +121,7 @@ Two of the settings that `Guardian` checks when it is constructed bound the conf
 ### Time limits
 
 - **Signing.** The client waits for a signature no longer than the remaining send budget; `broadcastTransaction` starts a full budget of its own. A key service that never answers therefore does not hold a cycle: the wait fails with an error named `DeliveryLimit` whose `reason` is `signing-timeout`, and `send` also reports it in `transaction.failed`.
+- **Confirmation reads.** After a broadcast, each receipt, head and block read is bounded by the transport's `timeoutMs` and `retryCount`, not by `sendTimeoutMs`, so stalled endpoints can hold `send` past its budget. Keep those two small enough for the reads to fit `sendTimeoutMs`, and always set a request timeout.
 - **Screening.** `screeningTimeoutMs` bounds the wait for the provider's answer in `screenWork`. When it ends first, the anchors asked about are incomplete, and a later answer is dropped.
 - **`Retry-After`.** The transport passes a numeric `Retry-After` on to viem bounded by its `timeoutMs`, in whole seconds as viem reads it, and drops a date form or a bound below one second. Each pause that a provider's `Retry-After` causes therefore lasts at most `timeoutMs`. The finished-request event reports the bounded value as `retryAfterMs`.
 
@@ -170,6 +177,8 @@ Only `logQuorum` guards against these cases, and only while the answers of a quo
 Without `logQuorum`, `createViemRpcTransport` sends each request to the first endpoint that answers and falls back to the next one. A read that a node rejects with an error is reported by the transport and retried by viem on the next endpoint.
 
 With `logQuorum`, the transport asks every provider for logs and compares their answers. Requests other than `eth_getLogs` go to the first endpoint that answers, as without the option.
+
+**A hung endpoint slows every request.** In both modes, an endpoint listed first that accepts requests and never answers costs the whole `timeoutMs` on every request it gets. Watch each endpoint's response time, for example in the [monitoring receiver](monitoring/README.md#metrics)'s `http_rpc_response_seconds` by `provider`, and replace an endpoint that hangs regularly.
 
 ```ts
 createViemRpcTransport({
