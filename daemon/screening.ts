@@ -257,7 +257,8 @@ function readResult(entry: unknown, id: string): ScreeningResult {
   if (!isScreeningResult(entry)) {
     throw new Error(`Screening response has a malformed result for anchor ${id}`);
   }
-  return entry;
+  // An empty reference says no more than none, and the SDK refuses it, so it is read as none.
+  return entry.evidenceReference === '' ? { ...entry, evidenceReference: null } : entry;
 }
 
 /** A known status, both decisions when judged, and an evidence reference that is text or absent. */

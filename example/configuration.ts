@@ -1,12 +1,11 @@
 // The application's configuration, read once at start: each value from its environment variable or else
-// from the JSON file `CONFIG_FILE` names, and each key or URL, which may carry a credential, from its
-// variable or from the file `<NAME>_FILE` names. Importing this module reads nothing.
+// from the JSON file `CONFIG_FILE` names. Keys and URLs, which may carry a credential, are read apart by
+// `secrets.ts`. Importing this module reads nothing.
 import { readFileSync } from 'node:fs';
-import { getAddress, isAddress, isHex, size } from 'viem';
+import { getAddress, isAddress } from 'viem';
 import type { Chain } from 'viem';
-import { privateKeyToAddress } from 'viem/accounts';
 import { hoodi, mainnet } from 'viem/chains';
-import type { Address, Hex } from '../src/core/index.ts';
+import type { Address } from '../src/core/index.ts';
 
 export type Mode = 'observe' | 'signal';
 
@@ -87,44 +86,13 @@ export class Configuration {
     return getAddress(value);
   }
 
-  privateKey(name: string): Hex {
-    const value = required(name, this.#secret(name));
-    const isPrivateKey = isHex(value, { strict: true }) && size(value) === 32;
-    if (!isPrivateKey) {
-      throw new Error(`${name} is not a 32-byte hex value`);
-    }
-    try {
-      privateKeyToAddress(value);
-    } catch {
-      // Do not retain a cryptographic error that may print the supplied key.
-      throw new Error(`${name} is not a valid secp256k1 key`);
-    }
-    return value;
-  }
-
-  rpcUrls(name: string): string[] {
-    const urls = required(name, this.#secret(name))
-      .split(',')
-      .map((url) => url.trim());
-    if (urls.some((url) => url.length === 0)) {
-      throw new Error(`${name} contains an empty URL`);
-    }
-    if (!urls.every(isHttpUrl)) {
-      throw new Error(`${name} must contain HTTP or HTTPS URLs`);
-    }
-    return urls;
-  }
-
-  /** An HTTP or HTTPS service URL, which may carry a credential in its path or query. */
+  /** An HTTP or HTTPS service URL; one that carries no credential, such as the screening service's. */
   url<Default = never>(name: string, fallback?: Fallback<Default>): string | Default {
-    const value = this.#secret(name);
+    const value = this.#value(name);
     if (value === undefined) {
       return readDefault(name, fallback);
     }
-    if (!isHttpUrl(value)) {
-      throw new Error(`${name} must be an HTTP or HTTPS URL`);
-    }
-    return value;
+    return httpUrl(name, value);
   }
 
   /**
@@ -188,31 +156,6 @@ export class Configuration {
   #value(name: string): string | undefined {
     return this.#variables[name] ?? this.#fileValues.get(name);
   }
-
-  /**
-   * A value that may carry a credential: its variable, or the trimmed text of the file `<NAME>_FILE`
-   * names, as an orchestrator mounts a secret. The configuration file is no secret, so it must not hold
-   * the value, but it may hold the path.
-   */
-  #secret(name: string): string | undefined {
-    if (this.#fileValues.has(name)) {
-      throw new Error(`${name} must not be in ${CONFIG_FILE}; set ${name} or ${name}_FILE`);
-    }
-    const value = this.#variables[name];
-    const path = this.#value(`${name}_FILE`);
-    if (path === undefined) {
-      return value;
-    }
-    if (value !== undefined) {
-      throw new Error(`${name} and ${name}_FILE are both set`);
-    }
-    try {
-      return readFileSync(path, 'utf8').trim();
-    } catch (cause) {
-      // The error names the variable, never what the file holds.
-      throw new Error(`${name}_FILE cannot be read`, { cause });
-    }
-  }
 }
 
 /** The entries of the configuration file: one JSON object whose values are strings or numbers. */
@@ -266,7 +209,16 @@ function readDefault<Default>(name: string, fallback: Fallback<Default> | undefi
   return fallback.default;
 }
 
-function isHttpUrl(value: string): boolean {
+/** An HTTP or HTTPS URL. */
+function httpUrl(name: string, value: string): string {
+  if (!isHttpUrl(value)) {
+    throw new Error(`${name} must be an HTTP or HTTPS URL`);
+  }
+  return value;
+}
+
+/** Whether the text is an HTTP or HTTPS URL. */
+export function isHttpUrl(value: string): boolean {
   const protocol = URL.parse(value)?.protocol;
   return protocol === 'http:' || protocol === 'https:';
 }

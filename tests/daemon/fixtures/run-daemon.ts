@@ -160,7 +160,8 @@ async function answerRpc(body: object): Promise<Response> {
   const params: unknown = 'params' in body ? body.params : [];
   assert.ok(Array.isArray(params));
   if (scenario === 'rpc-error' && body.method === 'eth_getLogs') {
-    return rpcError(body.id, 'synthetic log outage');
+    // A provider can repeat the key of the URL it was called at, here the key every test URL holds.
+    return rpcError(body.id, 'synthetic log outage for key SECRET-KEY-0123456789abcdef');
   }
   if (scenario === 'failed-send' && body.method === 'eth_sendRawTransaction') {
     return rpcError(body.id, 'synthetic broadcast failure');

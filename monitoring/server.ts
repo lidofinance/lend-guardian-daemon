@@ -16,8 +16,8 @@ export interface EndpointOptions {
   readonly version: string;
 }
 
-/** The daemon posts one event per request; `cycle.screened` lists every anchor of a cycle. */
-export const MAX_BODY_BYTES = 8 * 1024 * 1024;
+/** The daemon posts one event per request, and some events list every anchor of a cycle, so a large cycle needs room. */
+export const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 /** A request refused: its status, the reason it is counted by, and any header the answer needs. */
 interface Refusal {

@@ -7,8 +7,16 @@ import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { Configuration } from '../example/configuration.ts';
 import type { Mode, Setting, Settings } from '../example/configuration.ts';
-import { createGuardian, GUARDIAN_SETTINGS, MAX_TIMER_MS, readDeployment, runCycles } from '../example/guardian.ts';
+import {
+  createGuardian,
+  GUARDIAN_SECRET_NAMES,
+  GUARDIAN_SETTINGS,
+  MAX_TIMER_MS,
+  readDeployment,
+  runCycles,
+} from '../example/guardian.ts';
 import type { GuardianDeployment, ScheduleEvent } from '../example/guardian.ts';
+import { Secrets } from '../example/secrets.ts';
 import type { Address, SdkEvent } from '../src/core/index.ts';
 import {
   DEFAULT_SCREENING_BATCH_SIZE,
@@ -99,11 +107,8 @@ const CYCLE_ENDS: ReadonlySet<DaemonEvent['event']> = new Set([
   'schedule.cycleNotStarted',
 ]);
 
-/** Any URL, which may carry an endpoint's credentials in its path or query; `monitoring/events.ts` keeps a copy. */
-const URL_PATTERN = /https?:\/\/[^\s"'<>]+/g;
-
 /** Schedule [scan attempts](../docs/guardian-specification.md#scan-cycle) with HTTP screening and liveness. */
-async function main(): Promise<void> {
+async function main(secrets: Secrets): Promise<void> {
   const config = Configuration.read(process.env);
   const mode = config.mode('MODE');
   const settings = config.readSettings(DAEMON_SETTINGS);
@@ -113,10 +118,10 @@ async function main(): Promise<void> {
   if (healthWindowMs <= Math.max(settings('CYCLE_INTERVAL_MS'), settings('SCREENING_REQUEST_TIMEOUT_MS'))) {
     throw new Error('HEALTH_WINDOW_MS must be longer than CYCLE_INTERVAL_MS and SCREENING_REQUEST_TIMEOUT_MS');
   }
-  const deployment = readDeployment(config, mode);
+  const deployment = readDeployment(config, secrets, mode);
   const build = readBuildInfo(BUILD_INFO_FILE);
   const userAgent = `${APPLICATION_NAME}/${build.version}`;
-  const reporter = new EventReporter({ eventsUrl, timeoutMs: settings('FORWARD_TIMEOUT_MS'), userAgent });
+  const reporter = new EventReporter({ eventsUrl, timeoutMs: settings('FORWARD_TIMEOUT_MS'), userAgent, secrets });
   let lastEventAt = Date.now();
   const onEvent = (event: DaemonEvent): void => {
     lastEventAt = Date.now();
@@ -143,7 +148,7 @@ async function main(): Promise<void> {
     response.writeHead(isActive ? 200 : 503).end();
   })
     .on('error', (error) => {
-      printFailure(error);
+      printFailure(error, secrets);
       process.exit(1);
     })
     .listen(settings('HEALTH_PORT'))
@@ -230,6 +235,8 @@ interface ForwardOptions {
   readonly eventsUrl: string | undefined;
   readonly timeoutMs: number;
   readonly userAgent: string;
+  /** What each record masks. */
+  readonly secrets: Secrets;
 }
 
 /**
@@ -252,7 +259,7 @@ export class EventReporter {
    * optional receiver; `isRoutine` in `monitoring/events.ts` leaves the same events out of its log.
    */
   report(event: DaemonEvent): void {
-    const record = toRecord(event);
+    const record = toRecord(event, this.#options.secrets);
     const isRpcStarted = event.event === 'rpc.requestStarted';
     const isRpcSucceeded = event.event === 'rpc.requestFinished' && event.error === undefined;
     if (!isRpcStarted && !isRpcSucceeded) {
@@ -263,7 +270,7 @@ export class EventReporter {
     }
     this.#post(this.#options.eventsUrl, record);
     if (CYCLE_ENDS.has(event.event)) {
-      const totals = toRecord(this.#describeForwards());
+      const totals = toRecord(this.#describeForwards(), this.#options.secrets);
       console.log(totals);
       this.#post(this.#options.eventsUrl, totals);
     }
@@ -310,15 +317,15 @@ export class EventReporter {
 
 /**
  * JSON with decimal amounts, errors as their name, message and numeric code, such as a JSON-RPC error
- * code, and URLs replaced to hide endpoint credentials.
+ * code, and each secret masked, since an RPC error names its endpoint and a provider may repeat its key.
  */
-export function toRecord(event: object): string {
+export function toRecord(event: object, secrets: Secrets): string {
   return JSON.stringify(event, (_key, value: unknown) => {
     if (typeof value === 'bigint') {
       return value.toString();
     }
     if (typeof value === 'string') {
-      return value.replace(URL_PATTERN, '[url]');
+      return secrets.mask(value);
     }
     if (value instanceof Error) {
       const code = 'code' in value ? value.code : undefined;
@@ -328,17 +335,19 @@ export function toRecord(event: object): string {
   });
 }
 
-/** An error that ends the process; an RPC error names its endpoint, so it goes through the same redaction as the events. */
-function printFailure(error: unknown): void {
-  console.error(toRecord({ event: 'daemon.failed', error }));
+/** An error that ends the process; an RPC error names its endpoint, so it goes through the same mask as the events. */
+function printFailure(error: unknown, secrets: Secrets): void {
+  console.error(toRecord({ event: 'daemon.failed', error }, secrets));
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // A failure to read the secrets ends the process as Node prints it, and its error names the variable, never the value.
+  const secrets = Secrets.read(GUARDIAN_SECRET_NAMES, process.env);
   try {
-    await main();
+    await main(secrets);
   } catch (error) {
-    // A configuration or recovery error ends the process.
-    printFailure(error);
+    // A configuration or recovery error ends the process, printed through the mask.
+    printFailure(error, secrets);
     process.exitCode = 1;
   }
 }

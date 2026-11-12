@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import { toRecord } from '../../daemon/main.ts';
 import type { DaemonEvent } from '../../daemon/main.ts';
+import { Secrets } from '../../example/secrets.ts';
 import { readEvent } from '../../monitoring/events.ts';
 import type { ReceivedEvent } from '../../monitoring/events.ts';
 import { Metrics } from '../../monitoring/metrics.ts';
@@ -125,7 +126,7 @@ export function parseEvent(value: Readonly<Record<string, unknown>>): ReceivedEv
  * its `toRecord`, so a renamed field the receiver reads fails the typecheck.
  */
 export function parsePosted(event: DaemonEvent): ReceivedEvent {
-  const parsed = readEvent(toRecord(event));
+  const parsed = readEvent(toRecord(event, new Secrets(new Map())));
   assert.ok(parsed.kind === 'event', JSON.stringify(parsed));
   return parsed.event;
 }

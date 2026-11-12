@@ -8,9 +8,10 @@
 import { pathToFileURL } from 'node:url';
 import type { CycleOutcome, SdkEvent } from '../src/core/index.ts';
 import { Configuration } from './configuration.ts';
-import { createGuardian, GUARDIAN_SETTINGS, readDeployment, runCycles } from './guardian.ts';
+import { createGuardian, GUARDIAN_SECRET_NAMES, GUARDIAN_SETTINGS, readDeployment, runCycles } from './guardian.ts';
 import type { ScheduleEvent } from './guardian.ts';
 import { screening } from './screening.ts';
+import { Secrets } from './secrets.ts';
 
 const RPC_USER_AGENT = 'guardian-daemon-sdk-example';
 
@@ -20,9 +21,10 @@ const RPC_USER_AGENT = 'guardian-daemon-sdk-example';
  */
 async function main(): Promise<void> {
   const config = Configuration.read(process.env);
+  const secrets = Secrets.read(GUARDIAN_SECRET_NAMES, process.env);
   const mode = config.mode('MODE');
   const settings = config.readSettings(GUARDIAN_SETTINGS);
-  const deployment = readDeployment(config, mode);
+  const deployment = readDeployment(config, secrets, mode);
   const guardian = createGuardian({
     deployment,
     mode,

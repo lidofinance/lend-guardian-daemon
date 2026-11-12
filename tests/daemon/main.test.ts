@@ -20,9 +20,13 @@ import { blockAt, CORE, GUARDIAN, REGISTRY } from '../core/fake-node.ts';
 import type { Script } from '../core/fake-node.ts';
 import { guardianOver } from '../core/setup.ts';
 import { readInstalledVersions } from '../lock-files.ts';
+import { Secrets } from '../../example/secrets.ts';
+
+/** A record with no secret to mask. */
+const NO_SECRETS = new Secrets(new Map());
 
 const CONFIGURATION = {
-  RPC_URLS: 'http://rpc.invalid/v3/SECRET-KEY',
+  RPC_URLS: 'http://rpc.invalid/v3/SECRET-KEY-0123456789abcdef',
   GUARDIAN,
   LIDO_LEND: CORE,
   LIDO_LEND_DEPLOYMENT_BLOCK: '1000',
@@ -85,7 +89,7 @@ test('an RPC error reaches the log and the receiver without the endpoint URL', (
   assert.equal(child.error, undefined);
   assert.equal(child.status, 0, child.stderr);
   assert.match(child.stdout, /^\{"event":"cycle\.failed".*synthetic log outage/m);
-  assert.match(child.stdout, /URL: \[url\]/);
+  assert.match(child.stdout, /URL: \*\*\*/);
   // The node's JSON-RPC error code stays in the record, for the receiver's `rpc_error_code`.
   assert.match(
     child.stdout,
@@ -93,6 +97,23 @@ test('an RPC error reaches the log and the receiver without the endpoint URL', (
   );
   assert.doesNotMatch(`${child.stdout}${child.stderr}`, /SECRET-KEY/);
   assert.match(child.stdout, /^Forwarded bodies naming an endpoint: 0$/m);
+});
+
+test('a configured URL is masked in records whatever its spelling', () => {
+  const spellings = [
+    'HTTPS://rpc.invalid/v3/SECRET-KEY-0123456789abcdef',
+    'https:/rpc.invalid/v3/SECRET-KEY-0123456789abcdef',
+    'https:\\\\rpc.invalid\\v3\\SECRET-KEY-0123456789abcdef',
+    "https://rpc.invalid/v3/a'b/SECRET-KEY-0123456789abcdef",
+    "https://rpc.invalid/rpc?label='x'&apiKey=SECRET-KEY-0123456789abcdef",
+  ];
+  for (const url of spellings) {
+    const child = runDaemon('rpc-error', { RPC_URLS: url });
+    assert.equal(child.status, 0, child.stderr);
+    assert.match(child.stdout, /URL: \*\*\*/, url);
+    assert.doesNotMatch(`${child.stdout}${child.stderr}`, /SECRET-KEY/, url);
+    assert.match(child.stdout, /^Forwarded bodies naming an endpoint: 0$/m, url);
+  }
 });
 
 test('every signal cycle clears the pending nonces before it starts, the one after a failed send included', () => {
@@ -358,22 +379,25 @@ test('scheduled cycles reach the heartbeat through a service that answers incomp
   assert.equal(start.previousHeartbeatBlock?.number, HEAD + 30 - 2);
 });
 
-test('a record carries amounts as decimal strings and errors as their name and message without URLs', () => {
-  const error = new Error('HTTP request failed.\n\nURL: https://rpc.example/v3/secret-key?token=1\nRequest body: {}');
+test('a record carries amounts as decimal strings, errors as their name and message, and each secret masked', () => {
+  const secrets = Secrets.read(['RPC_URLS'], { RPC_URLS: 'https://rpc.example/v3/secret-key-0123456789' });
+  const error = new Error(
+    'HTTP request failed.\n\nURL: https://rpc.example/v3/secret-key-0123456789\nRequest body: {}',
+  );
   assert.equal(
-    toRecord({ event: 'nonce.cleared', blockNumber: 12n, note: 'see http://host.example/key now', error }),
+    toRecord({ event: 'nonce.cleared', blockNumber: 12n, note: 'see http://docs.example/limits now', error }, secrets),
     JSON.stringify({
       event: 'nonce.cleared',
       blockNumber: '12',
-      note: 'see [url] now',
-      error: { name: 'Error', message: 'HTTP request failed.\n\nURL: [url]\nRequest body: {}' },
+      note: 'see http://docs.example/limits now',
+      error: { name: 'Error', message: 'HTTP request failed.\n\nURL: ***\nRequest body: {}' },
     }),
   );
 });
 
 test('a record keeps the reason of a Guardian stop as its message', () => {
   assert.equal(
-    toRecord({ event: 'cycle.failed', error: new GuardianStop('screening-result-malformed') }),
+    toRecord({ event: 'cycle.failed', error: new GuardianStop('screening-result-malformed') }, NO_SECRETS),
     '{"event":"cycle.failed","error":{"name":"GuardianStop","message":"screening-result-malformed"}}',
   );
 });
@@ -382,7 +406,7 @@ test('a record keeps the numeric code of an error, such as a JSON-RPC error code
   const limited = Object.assign(new Error('limit exceeded'), { code: -32005 });
   const refused = Object.assign(new Error('connect refused'), { code: 'ECONNREFUSED' });
   assert.equal(
-    toRecord({ event: 'rpc.requestFinished', limited, refused }),
+    toRecord({ event: 'rpc.requestFinished', limited, refused }, NO_SECRETS),
     '{"event":"rpc.requestFinished","limited":{"name":"Error","message":"limit exceeded","code":-32005},"refused":{"name":"Error","message":"connect refused"}}',
   );
 });
@@ -399,6 +423,7 @@ test('reporting logs and posts the record once with the user agent and ignores a
     eventsUrl: 'http://receiver.invalid/events',
     timeoutMs: 5_000,
     userAgent: 'lend-guardian-daemon/test',
+    secrets: NO_SECRETS,
   });
   const event = {
     event: 'screening.requestFinished',
@@ -442,6 +467,7 @@ test('after each cycle end the reporter posts the totals of the posts answered s
     eventsUrl: 'http://receiver.invalid/events',
     timeoutMs: 5_000,
     userAgent: 'test',
+    secrets: NO_SECRETS,
   });
   reporter.report({ event: 'cycle.started', cycleId: 'one', startedAt: 1 });
   await settle();
@@ -489,6 +515,7 @@ for (const end of [
       eventsUrl: 'http://receiver.invalid/events',
       timeoutMs: 5_000,
       userAgent: 'test',
+      secrets: NO_SECRETS,
     });
     reporter.report({ event: 'cycle.started', cycleId: 'one', startedAt: 1 });
     await settle();
@@ -506,7 +533,12 @@ for (const end of [
 test('without a receiver the reporter only prints, and reports no totals', (context) => {
   const request = context.mock.method(globalThis, 'fetch', () => Promise.resolve(new Response(null, { status: 204 })));
   const log = context.mock.method(console, 'log', () => undefined);
-  const reporter = new EventReporter({ eventsUrl: undefined, timeoutMs: 5_000, userAgent: 'test' });
+  const reporter = new EventReporter({
+    eventsUrl: undefined,
+    timeoutMs: 5_000,
+    userAgent: 'test',
+    secrets: NO_SECRETS,
+  });
   reporter.report({ event: 'schedule.cycleNotStarted', error: new Error('nonce') });
   assert.equal(request.mock.callCount(), 0);
   assert.deepEqual(

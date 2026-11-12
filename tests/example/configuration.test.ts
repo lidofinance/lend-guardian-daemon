@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
-import { padHex } from 'viem';
 import { Configuration } from '../../example/configuration.ts';
 
 const TABLE = {
@@ -133,55 +132,13 @@ test('a configuration file that cannot be read is refused', (context) => {
   assert.throws(() => Configuration.read({ CONFIG_FILE: path }), { message: 'CONFIG_FILE cannot be read' });
 });
 
-test('a key, the RPC URLs and a service URL are read trimmed from the files their _FILE variables name', (context) => {
-  const key = padHex('0x02', { size: 32 });
+test('a service URL is an HTTP or HTTPS URL, from its variable or the configuration file', (context) => {
   const config = Configuration.read({
-    GUARDIAN_TEST_KEY_FILE: withFile(context, `${key}\n`),
-    GUARDIAN_TEST_RPC_URLS_FILE: withFile(context, 'https://rpc.example/v3/key-1, https://rpc.example/v3/key-2\n'),
-    GUARDIAN_TEST_URL_FILE: withFile(context, ' https://screening.example/key \n'),
+    CONFIG_FILE: withFile(context, '{"GUARDIAN_TEST_URL": "https://screening.example/screen"}'),
+    GUARDIAN_TEST_OTHER_URL: 'ftp://receiver.example/events',
   });
-  assert.equal(config.privateKey('GUARDIAN_TEST_KEY'), key);
-  assert.deepEqual(config.rpcUrls('GUARDIAN_TEST_RPC_URLS'), [
-    'https://rpc.example/v3/key-1',
-    'https://rpc.example/v3/key-2',
-  ]);
-  assert.equal(config.url('GUARDIAN_TEST_URL'), 'https://screening.example/key');
-});
-
-test('a secret set both in its variable and in its file is refused', (context) => {
-  const config = Configuration.read({
-    GUARDIAN_TEST_URL: 'https://screening.example/a',
-    GUARDIAN_TEST_URL_FILE: withFile(context, 'https://screening.example/b'),
-  });
-  assert.throws(() => config.url('GUARDIAN_TEST_URL'), {
-    message: 'GUARDIAN_TEST_URL and GUARDIAN_TEST_URL_FILE are both set',
-  });
-});
-
-test('a secret file that cannot be read is refused by its variable name', (context) => {
-  const config = Configuration.read({ GUARDIAN_TEST_URL_FILE: join(withFile(context, ''), 'missing') });
-  assert.throws(() => config.url('GUARDIAN_TEST_URL'), { message: 'GUARDIAN_TEST_URL_FILE cannot be read' });
-});
-
-test('a secret in the configuration file is refused, even with its variable set', (context) => {
-  const config = Configuration.read({
-    CONFIG_FILE: withFile(context, '{"GUARDIAN_TEST_URL": "https://screening.example/key"}'),
-    GUARDIAN_TEST_URL: 'https://screening.example/key',
-  });
-  assert.throws(() => config.url('GUARDIAN_TEST_URL'), {
-    message: 'GUARDIAN_TEST_URL must not be in CONFIG_FILE; set GUARDIAN_TEST_URL or GUARDIAN_TEST_URL_FILE',
-  });
-});
-
-test('the path of a secret file may come from the configuration file, but not beside a set variable', (context) => {
-  const path = withFile(context, 'https://receiver.example/key\n');
-  const configFile = withFile(context, JSON.stringify({ GUARDIAN_TEST_URL_FILE: path }));
-  assert.equal(
-    Configuration.read({ CONFIG_FILE: configFile }).url('GUARDIAN_TEST_URL'),
-    'https://receiver.example/key',
-  );
-  const config = Configuration.read({ CONFIG_FILE: configFile, GUARDIAN_TEST_URL: 'https://receiver.example/other' });
-  assert.throws(() => config.url('GUARDIAN_TEST_URL'), {
-    message: 'GUARDIAN_TEST_URL and GUARDIAN_TEST_URL_FILE are both set',
+  assert.equal(config.url('GUARDIAN_TEST_URL'), 'https://screening.example/screen');
+  assert.throws(() => config.url('GUARDIAN_TEST_OTHER_URL'), {
+    message: 'GUARDIAN_TEST_OTHER_URL must be an HTTP or HTTPS URL',
   });
 });

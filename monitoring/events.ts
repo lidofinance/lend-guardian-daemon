@@ -62,8 +62,8 @@ const MAX_DEPTH = 12;
 
 const MAX_MESSAGE_LENGTH = 500;
 
-/** The pattern `URL_PATTERN` of `daemon/main.ts`; the receiver imports no daemon code, so it keeps a copy. */
-const URL_PATTERN = /https?:\/\/[^\s"'<>]+/g;
+/** Any URL, which may carry an endpoint's credentials; the receiver replaces it in any text, whatever the sender masked. */
+const URL_PATTERN = /https?:\/\/[^\s"<>]+/gi;
 
 /** A key that may name a credential, whatever the daemon redacts upstream. */
 const SECRET_KEY = /key|secret|token|pass|private|credential|authorization/i;

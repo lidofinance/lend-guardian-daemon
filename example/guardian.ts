@@ -21,6 +21,7 @@ import type {
   Work,
 } from '../src/core/index.ts';
 import type { Configuration, Mode, Setting, Settings } from './configuration.ts';
+import type { Secrets } from './secrets.ts';
 
 /** Mainnet and Hoodi both use 12-second slots; Guardian derives a seven-day lookback from this. */
 const SLOT_SECONDS = 12;
@@ -93,12 +94,15 @@ export interface GuardianDeployment {
   readonly signer: PrivateKeyAccount | undefined;
 }
 
+/** The secrets the Guardian reads: the nodes, whose URLs may carry provider keys, and the delegate's key. */
+export const GUARDIAN_SECRET_NAMES = ['RPC_URLS', 'SIGNER_KEY'];
+
 /**
  * The deployment from `CHAIN_ID`, `GUARDIAN`, `LIDO_LEND`, `GUARDIAN_SIGNALS` and their deployment
- * blocks, the nodes from `RPC_URLS` and `RPC_LOG_QUORUM`, and in signal mode the delegate from
- * `SIGNER_KEY`. A missing or invalid value throws before any RPC request.
+ * blocks, the nodes from the `RPC_URLS` secret and `RPC_LOG_QUORUM`, and in signal mode the delegate from
+ * the `SIGNER_KEY` secret. A missing or invalid value throws before any RPC request.
  */
-export function readDeployment(config: Configuration, mode: Mode): GuardianDeployment {
+export function readDeployment(config: Configuration, secrets: Secrets, mode: Mode): GuardianDeployment {
   const chain = config.chain('CHAIN_ID');
   const guardian = config.address('GUARDIAN');
   return {
@@ -112,20 +116,20 @@ export function readDeployment(config: Configuration, mode: Mode): GuardianDeplo
       address: config.address('GUARDIAN_SIGNALS'),
       deploymentBlock: config.integer('GUARDIAN_SIGNALS_DEPLOYMENT_BLOCK', { min: 1 }),
     },
-    rpcUrls: config.rpcUrls('RPC_URLS'),
+    rpcUrls: secrets.urlList('RPC_URLS'),
     // Signal mode requires a quorum of at least 2 when an endpoint can answer a log range beyond its head
     // without an error: [RPC requirements](../README.md#rpc-requirements). This launcher does not check it.
     rpcLogQuorum: config.integer('RPC_LOG_QUORUM', { min: 1 }, { default: undefined }),
-    signer: readSigner(config, mode, guardian),
+    signer: readSigner(secrets, mode, guardian),
   };
 }
 
 /** The delegate that signs in signal mode; observe reads no signing material. */
-function readSigner(config: Configuration, mode: Mode, guardian: Address): PrivateKeyAccount | undefined {
+function readSigner(secrets: Secrets, mode: Mode, guardian: Address): PrivateKeyAccount | undefined {
   if (mode === 'observe') {
     return undefined;
   }
-  const signer = privateKeyToAccount(config.privateKey('SIGNER_KEY'));
+  const signer = privateKeyToAccount(secrets.privateKey('SIGNER_KEY'));
   // Application policy: a hot delegate signs, so the Guardian's own key stays cold, even though the SDK
   // also permits the Guardian to sign.
   if (isAddressEqual(signer.address, guardian)) {

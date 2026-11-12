@@ -91,6 +91,14 @@ test('URLs in any text are replaced and long messages are bounded', () => {
   assert.ok(text.endsWith('…'));
 });
 
+test('a URL is replaced whatever the case of its scheme, a quote in its path included', () => {
+  const message = "node HTTPS://rpc.example/a'b/secret said no";
+  const event = parseEvent({ event: 'cycle.failed', cycleId: 'c1', error: { name: 'Error', message } });
+  const error = event.payload.error;
+  assert.ok(isRecord(error));
+  assert.equal(error.message, 'node [url] said no');
+});
+
 test('only RPC starts and successful RPC finishes are routine', () => {
   assert.equal(isRoutine(parseEvent({ event: 'rpc.requestStarted' })), true);
   assert.equal(isRoutine(parseEvent({ event: 'rpc.requestFinished' })), true);
