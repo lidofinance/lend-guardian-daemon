@@ -136,10 +136,78 @@ export default defineConfig([
     },
   },
   {
-    // Keep the example's Guardian configuration and observe/signal client setup in one factory.
-    files: ['example/daemon.ts'],
+    // The library is what the applications import, never the other way round.
+    files: ['src/**/*.ts'],
     rules: {
-      'max-lines-per-function': ['error', { max: 70, skipBlankLines: true, skipComments: true }],
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/daemon/**', '**/example/**', '**/monitoring/**', '**/tests/**', '**/scripts/**'],
+              message: 'src/ imports nothing from daemon/, example/, monitoring/, tests/ or scripts/.',
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    // The example shows the SDK on its own; the daemon builds on it, not the other way round.
+    files: ['example/**/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/daemon/**', '**/monitoring/**'],
+              message: 'The example imports neither the daemon nor the receiver.',
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    // The daemon runs the example's Guardian and schedule, never its entry point or placeholder.
+    files: ['daemon/**/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/example/main.ts', '**/example/screening.ts'],
+              message: 'The daemon takes only guardian.ts and configuration.ts from the example.',
+            },
+            { group: ['**/monitoring/**'], message: 'The daemon does not import the receiver.' },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    // The receiver's image holds only monitoring/: it takes the event types of the daemon and the SDK,
+    // which Node erases, and no code of theirs.
+    files: ['monitoring/**/*.ts'],
+    rules: {
+      '@typescript-eslint/no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/daemon/**', '**/src/**', '**/example/**'],
+              allowTypeImports: true,
+              message: 'The receiver imports only types from the daemon and the SDK.',
+            },
+            {
+              group: ['**/tests/**', '**/scripts/**'],
+              message: 'The receiver imports nothing from tests/ or scripts/.',
+            },
+          ],
+        },
+      ],
     },
   },
   {

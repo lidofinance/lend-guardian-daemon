@@ -34,13 +34,10 @@ const node = fakeNode({
 /** What the example has shown so far; the scripted RPC and screening fail by it. */
 const seen = { startedCycles: 0, failedCycles: 0, nonceReadsAfterLastFailure: 0 };
 
-/** The attempt whose start ends the run: the one after the last scripted failure. */
-const lastAttempt = scenario === 'failed-send-then-screening' ? 3 : 2;
+/** The attempt whose start ends the run: the one after the scripted failure. */
+const lastAttempt = 2;
 
 function failsBroadcast(): boolean {
-  if (scenario === 'failed-send-then-screening') {
-    return seen.startedCycles === 1;
-  }
   return scenario === 'failed-send' || scenario === 'failed-clearing';
 }
 
@@ -48,13 +45,15 @@ function rpcFailure(method: string): string | undefined {
   if (method === 'eth_sendRawTransaction' && failsBroadcast()) {
     return 'synthetic broadcast failure';
   }
-  // Between a failed attempt and the next one only the clearing of pending nonces reads them.
+  // Before an attempt starts only the clearing of pending nonces reads them.
   const isBetweenAttempts = seen.failedCycles === seen.startedCycles;
   if (method !== 'eth_getTransactionCount' || !isBetweenAttempts) {
     return undefined;
   }
   seen.nonceReadsAfterLastFailure += 1;
-  return scenario === 'failed-clearing' ? 'synthetic nonce outage' : undefined;
+  // The first clearing succeeds; the one after the failed send cannot read the counts.
+  const isAfterFailure = seen.failedCycles > 0;
+  return scenario === 'failed-clearing' && isAfterFailure ? 'synthetic nonce outage' : undefined;
 }
 
 // No HTTP request can leave this process, even if the example unexpectedly changes its endpoint.
@@ -104,6 +103,11 @@ function print(...values: unknown[]): void {
     assert.deepEqual(node.sent.calls, []);
     process.exit(0);
   }
+  if (scenario === 'failed-clearing' && message.startsWith('cycle not started:')) {
+    assert.deepEqual(node.sent.calls, []);
+    process.stdout.write('The cycle after the failed send did not start.\n');
+    process.exit(0);
+  }
   if (scenario === 'lagging-endpoint' && message.startsWith('cycle failed:')) {
     assert.deepEqual(node.sent.calls, []);
     process.exit(0);
@@ -122,7 +126,7 @@ if (scenario !== 'unconfigured') {
     screen: (request) => {
       assert.equal(request.chainId, chainId);
       assert.equal(request.anchors.length, 1);
-      const failsScreening = scenario === 'failed-signal' || seen.startedCycles === 2;
+      const failsScreening = scenario === 'failed-signal';
       if (failsScreening) {
         return Promise.reject(new Error('synthetic provider outage'));
       }
@@ -130,7 +134,7 @@ if (scenario !== 'unconfigured') {
     },
   };
   // Substitute the provider module, without an injection API in the executable example.
-  mock.module('../../../example/screening-adapter.ts', {
+  mock.module('../../../example/screening.ts', {
     namedExports: { screening },
   });
 }
@@ -140,6 +144,6 @@ mock.module('node:timers/promises', {
   namedExports: { setTimeout: () => new Promise((resolve) => setImmediate(resolve)) },
 });
 
-// Execute the same entry point as `node example/daemon.ts`, with this fixture's scripted RPC.
-process.argv[1] = fileURLToPath(new URL('../../../example/daemon.ts', import.meta.url));
-await import('../../../example/daemon.ts');
+// Execute the same entry point as `node example/main.ts`, with this fixture's scripted RPC.
+process.argv[1] = fileURLToPath(new URL('../../../example/main.ts', import.meta.url));
+await import('../../../example/main.ts');

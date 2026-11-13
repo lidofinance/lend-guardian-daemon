@@ -17,6 +17,7 @@ import {
   HttpRequestError,
   InvalidParamsRpcError,
   keccak256,
+  RpcRequestError,
   SocketClosedError,
   TimeoutError,
   TransactionReceiptNotFoundError,
@@ -790,4 +791,73 @@ test('a signature that never returns stops at the send deadline and releases the
   );
   // The send is released: the next one is not refused as concurrent.
   await assert.rejects(delivery.sendSuspects([TARGET], 1), { name: 'DeliveryLimit', reason: 'signing-timeout' });
+});
+
+// After the broadcast, single reads that confirm the inclusion are bounded by the transport, not by the send budget,
+// so a slow endpoint holds the send past `sendTimeoutMs`.
+test('a slow block read after inclusion holds the send past its budget', async () => {
+  const slowBlock = harness({
+    node: {
+      getBlock: implemented(
+        (_request: { readonly blockNumber: bigint }) =>
+          new Promise<{ readonly hash: typeof BLOCK_HASH }>((resolve) => {
+            setTimeout(() => {
+              resolve({ hash: BLOCK_HASH });
+            }, 200);
+          }),
+      ),
+    },
+    policy: { sendTimeoutMs: 50 },
+  });
+  const startedAt = performance.now();
+  const hash = await registryDelivery(slowBlock.options, slowBlock.observe).sendHeartbeat(REPORT_BLOCK, DIGEST, 1);
+  assert.equal(hash, TRANSACTION_HASH);
+  assert.ok(performance.now() - startedAt > 150, 'the send outlasted its 50 ms budget');
+});
+
+// The original transaction can land between the last receipt read and its replacement's broadcast. The node then
+// refuses the replacement with `nonce too low`, and the send fails at the broadcast stage without reading the
+// earlier hash again, although that transaction succeeded.
+test('a replacement refused because the original landed fails the send', async () => {
+  let hasOriginalLanded = false;
+  let receiptReadsAtRefusal = -1;
+  const fake = harness({
+    policy: { replacementTimeoutMs: 1, sendAttempts: 5 },
+    node: {
+      getBlockNumber: answering(value(12n)),
+      sendRawTransaction: implemented((_broadcast: { readonly serializedTransaction: Hex }) => {
+        if (fake.node.sendRawTransaction.calls.length === 1) {
+          return Promise.resolve(TRANSACTION_HASH);
+        }
+        hasOriginalLanded = true;
+        receiptReadsAtRefusal = fake.node.getTransactionReceipt.calls.length;
+        return Promise.reject(
+          new RpcRequestError({
+            body: {},
+            url: 'https://rpc.invalid',
+            error: { code: -32000, message: 'nonce too low' },
+          }),
+        );
+      }),
+      getTransactionReceipt: implemented(({ hash }) => {
+        const isOriginal = hash === TRANSACTION_HASH;
+        if (hasOriginalLanded && isOriginal) {
+          return Promise.resolve({ ...RECEIPT, blockNumber: 11n });
+        }
+        return Promise.reject(notFound());
+      }),
+    },
+    signer: { signTransaction: answering(value(RAW_TRANSACTION), value(SECOND_RAW)) },
+  });
+
+  await assert.rejects(registryDelivery(fake.options, fake.observe).sendSuspects([TARGET], 1), /nonce too low/);
+
+  assert.equal(fake.node.sendRawTransaction.calls.length, 2);
+  assert.equal(fake.node.getTransactionReceipt.calls.length, receiptReadsAtRefusal);
+  assert.deepEqual(
+    ofKind(fake.events, 'failed').map((event) => ('stage' in event ? event.stage : undefined)),
+    ['broadcast'],
+  );
+  const original = await fake.node.getTransactionReceipt({ hash: TRANSACTION_HASH });
+  assert.equal(original.status, 'success');
 });

@@ -1,0 +1,10 @@
+# The build context holds only what the image copies; the local configuration with its keys stays out.
+*
+!abi
+!src
+!example/guardian.ts
+!example/configuration.ts
+!daemon/*.ts
+!daemon/package.json
+!daemon/package-lock.json
+**/.env

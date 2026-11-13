@@ -23,11 +23,14 @@
     "abi",
     "dist",
     "docs/guardian-specification.md",
-    "example",
+    "daemon/*.ts",
+    "daemon/README.md",
+    "example/*.ts",
+    "example/README.md",
     "src"
   ],
   "engines": {
-    "node": ">=24"
+    "node": ">=24.22.1"
   },
   "scripts": {
     "test": "node --test 'tests/**/*.test.ts'",
@@ -44,10 +47,13 @@
     "check:package": "node scripts/check-package.ts",
     "test:core": "node --test 'tests/core/**/*.test.ts'",
     "test:example": "node --test 'tests/example/**/*.test.ts'",
+    "test:daemon": "node --test 'tests/daemon/**/*.test.ts'",
+    "test:monitoring": "node --test 'tests/monitoring/**/*.test.ts'",
     "test:conformance": "node --test 'tests/conformance/*.test.ts'"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
+    "@prometheus-io/client": "0.16.1",
     "@types/node": "24.10.1",
     "eslint": "10.10.0",
     "ethers": "6.17.0",

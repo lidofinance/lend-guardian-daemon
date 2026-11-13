@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { padHex } from 'viem';
-import { UnconfiguredScreening } from '../../example/screening-adapter.ts';
+import { UnconfiguredScreening } from '../../example/screening.ts';
 import type { SupplyAnchor } from '../../src/core/types.ts';
 import type { ScreeningRequest } from '../../src/core/screening-provider.ts';
 import type { TxHash } from '../../src/common/types.ts';
