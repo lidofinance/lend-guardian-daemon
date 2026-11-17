@@ -629,3 +629,44 @@ test('asynchronous observer failures cannot change a successful request', async 
     setImmediate(resolve);
   });
 });
+
+// The fallback asks the endpoints in their configured order on every request and keeps no record of one that
+// hangs, so a first endpoint that accepts every request and never answers costs the whole timeout on each of
+// them before the next endpoint answers.
+test('a first endpoint that never answers costs the whole timeout on every request', async (context) => {
+  const timeoutMs = 200;
+  let hungRequests = 0;
+  const fixture = transportFixture(
+    context,
+    (input, init) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (!url.includes('first')) {
+        return Promise.resolve(answer(init, '0x10'));
+      }
+      hungRequests += 1;
+      const signal = init?.signal;
+      assert.ok(signal !== undefined && signal !== null);
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          const reason: unknown = signal.reason;
+          reject(reason instanceof Error ? reason : new Error('request aborted'));
+        });
+      });
+    },
+    { timeoutMs, retryCount: 0 },
+  );
+
+  const durationsMs: number[] = [];
+  while (durationsMs.length < 5) {
+    const startedAt = performance.now();
+    assert.equal(await fixture.request({ method: 'eth_blockNumber' }), '0x10');
+    durationsMs.push(performance.now() - startedAt);
+  }
+
+  assert.equal(hungRequests, 5);
+  // Node's timers can fire about a millisecond early, so the bound leaves a few milliseconds of slack.
+  assert.ok(
+    durationsMs.every((durationMs) => durationMs >= timeoutMs - 5),
+    durationsMs.join(', '),
+  );
+});

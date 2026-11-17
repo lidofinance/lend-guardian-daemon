@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { padHex } from 'viem';
-import { cycle } from '../../example/daemon.ts';
-import type { CycleStart } from '../../example/daemon.ts';
-import { UnconfiguredScreening } from '../../example/screening-adapter.ts';
+import { runCycle } from '../../example/guardian.ts';
+import type { CycleStart, ScheduleEvent } from '../../example/guardian.ts';
+import { UnconfiguredScreening } from '../../example/screening.ts';
 import { BaseRpcProvider } from '../../src/core/index.ts';
-import { blockAt, CONTROLLER, CORE, fakeNode, GUARDIAN, REGISTRY } from '../core/fake-node.ts';
+import type { SdkEvent } from '../../src/core/index.ts';
+import { blockAt, CORE, fakeNode, GUARDIAN, REGISTRY } from '../core/fake-node.ts';
 import type { Script } from '../core/fake-node.ts';
 import { guardianOver } from '../core/setup.ts';
 
@@ -31,25 +32,23 @@ const DUE: Script = {
   ],
 };
 
+/** The first scheduled cycle: no heartbeat hint, no earlier work. */
 const START: CycleStart = { previousHeartbeatBlock: null };
+
+/** The schedule's own reports, kept in order. */
+function scheduleEvents(): { readonly events: ScheduleEvent[]; readonly onEvent: (event: ScheduleEvent) => void } {
+  const events: ScheduleEvent[] = [];
+  return { events, onEvent: (event) => events.push(event) };
+}
 
 test('the example never submits or advances coverage when screening is unconfigured', async () => {
   const { guardian, sent } = guardianOver(DUE, { screening: new UnconfiguredScreening() });
-  assert.equal((await cycle(guardian, START)).previousHeartbeatBlock, null);
+  const { events, onEvent } = scheduleEvents();
+  const next = await runCycle({ guardian, mode: 'signal', maxRestarts: 0, onEvent }, START);
+  assert.equal(next.previousHeartbeatBlock, null);
+  assert.ok(next.earlierWork !== undefined);
   assert.deepEqual(sent.calls, []);
-});
-
-test('an incomplete cycle hands its work to the next one, which walks no position again', async () => {
-  const { guardian, node } = guardianOver(DUE, { screening: new UnconfiguredScreening() });
-  // A walk reads the controller's history of one borrower, named in a topic.
-  const walks = () => node.logQueries.filter((query) => query.address === CONTROLLER && query.topics.length > 1);
-
-  const next = await cycle(guardian, START);
-  const walked = walks().length;
-  assert.ok(walked > 0);
-  await cycle(guardian, next);
-
-  assert.equal(walks().length, walked);
+  assert.deepEqual(events, []);
 });
 
 test('observe runs screening through a read-only client and never signals', async (context) => {
@@ -67,7 +66,9 @@ test('observe runs screening through a read-only client and never signals', asyn
   const signalAndHeartbeat = context.mock.method(guardian, 'signalAndHeartbeat', () => {
     assert.fail('observe must not signal or heartbeat');
   });
-  assert.equal((await cycle(guardian, START)).previousHeartbeatBlock, null);
+  const { onEvent } = scheduleEvents();
+  const next = await runCycle({ guardian, mode: 'observe', maxRestarts: 0, onEvent }, START);
+  assert.deepEqual(next, START);
   assert.equal(signalAndHeartbeat.mock.callCount(), 0);
   assert.deepEqual(node.sent.calls, []);
 });
@@ -78,22 +79,30 @@ test('signal submits the configured provider decisions before the heartbeat', as
       screen: () => Promise.resolve([{ status: 'judged', requiresSuspect: true, requiresFlag: true }]),
     },
   });
-  const { previousHeartbeatBlock } = await cycle(guardian, START);
-  assert.ok(previousHeartbeatBlock !== null);
+  const { onEvent } = scheduleEvents();
+  const next = await runCycle({ guardian, mode: 'signal', maxRestarts: 0, onEvent }, START);
+  assert.ok(next.previousHeartbeatBlock !== null);
   assert.deepEqual(sent.calls, ['suspects', 'flags', 'heartbeat']);
 });
 
-test('a provider exception escapes the cycle without sending reports or heartbeat', async () => {
+test('a provider exception fails the cycle without sending reports or heartbeat, and the next one starts from the same hint', async () => {
   const failure = new Error('screening service unavailable');
+  const sdkEvents: SdkEvent[] = [];
   const { guardian, sent } = guardianOver(DUE, {
     screening: { screen: () => Promise.reject(failure) },
+    onEvent: (event) => sdkEvents.push(event),
   });
-  await assert.rejects(cycle(guardian, START), (error) => error === failure);
+  const { onEvent } = scheduleEvents();
+  const next = await runCycle({ guardian, mode: 'signal', maxRestarts: 0, onEvent }, START);
+  assert.deepEqual(next, START);
   assert.deepEqual(sent.calls, []);
+  const failed = sdkEvents.find((event) => event.event === 'cycle.failed');
+  assert.ok(failed?.event === 'cycle.failed');
+  assert.equal(failed.error, failure);
 });
 
 test('CLI rejects an unknown mode before reading configuration or reaching RPC', () => {
-  const child = spawnSync(process.execPath, ['example/daemon.ts'], {
+  const child = spawnSync(process.execPath, ['example/main.ts'], {
     cwd: new URL('../../', import.meta.url),
     env: { MODE: 'typo' },
     encoding: 'utf8',
@@ -105,7 +114,7 @@ test('CLI rejects an unknown mode before reading configuration or reaching RPC',
 });
 
 test('CLI rejects unsupported networks before reading RPC configuration', () => {
-  const child = spawnSync(process.execPath, ['example/daemon.ts'], {
+  const child = spawnSync(process.execPath, ['example/main.ts'], {
     cwd: new URL('../../', import.meta.url),
     env: { CHAIN_ID: '11155111' },
     encoding: 'utf8',
@@ -119,19 +128,14 @@ test('CLI rejects unsupported networks before reading RPC configuration', () => 
 type Scenario = 'observe' | 'unconfigured' | 'lagging-endpoint' | SignalScenario;
 
 /** Signal attempts that fail: in screening, in the broadcast, and in the recovery after it. */
-type SignalScenario = 'failed-signal' | 'failed-send' | 'failed-send-then-screening' | 'failed-clearing';
+type SignalScenario = 'failed-signal' | 'failed-send' | 'failed-clearing';
 
-const SIGNAL_SCENARIOS: readonly string[] = [
-  'failed-signal',
-  'failed-send',
-  'failed-send-then-screening',
-  'failed-clearing',
-];
+const SIGNAL_SCENARIOS: readonly string[] = ['failed-signal', 'failed-send', 'failed-clearing'];
 
 function runExample(scenario: Scenario, chainId?: string, rpc: Record<string, string> = {}) {
   return spawnSync(
     process.execPath,
-    ['--experimental-test-module-mocks', 'tests/example/fixtures/run-daemon.ts', scenario, chainId ?? '1'],
+    ['--experimental-test-module-mocks', 'tests/example/fixtures/run-example.ts', scenario, chainId ?? '1'],
     {
       cwd: new URL('../../', import.meta.url),
       // Deliberately do not inherit the host environment or any real credentials.
@@ -172,12 +176,12 @@ test('default observe leaves requested screening incomplete and stops before sub
   assert.doesNotMatch(child.stdout, /attested block|observed:/);
 });
 
-test('a signal failure before sending is followed by another attempt without reading nonces', () => {
+test('every signal attempt clears the pending nonces before it starts, the one after a failure before sending included', () => {
   const child = runExample('failed-signal');
   assert.equal(child.error, undefined);
   assert.equal(child.status, 0, child.stderr);
   assert.match(child.stdout, /cycle failed: Error: synthetic provider outage/);
-  assert.match(child.stdout, /Attempt 2 started; nonces were read 0 times before it/);
+  assert.match(child.stdout, /Attempt 2 started; nonces were read 2 times before it/);
 });
 
 test('a signal failure after sending clears the pending nonces before another attempt', () => {
@@ -188,18 +192,12 @@ test('a signal failure after sending clears the pending nonces before another at
   assert.match(child.stdout, /Attempt 2 started; nonces were read 2 times before it/);
 });
 
-test('a failure before sending reads no nonces although an earlier attempt reached sending', () => {
-  const child = runExample('failed-send-then-screening');
-  assert.equal(child.error, undefined);
-  assert.equal(child.status, 0, child.stderr);
-  assert.match(child.stdout, /Attempt 3 started; nonces were read 0 times before it/);
-});
-
-test('the example ends when the pending nonces cannot be cleared', () => {
+test('a cycle whose pending nonces cannot be cleared does not start, and the schedule goes on', () => {
   const child = runExample('failed-clearing');
   assert.equal(child.error, undefined);
-  assert.equal(child.status, 1);
-  assert.match(child.stderr, /synthetic nonce outage/);
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /cycle not started: .*synthetic nonce outage/s);
+  assert.match(child.stdout, /The cycle after the failed send did not start/);
   assert.doesNotMatch(child.stdout, /Attempt 2 started/);
 });
 
@@ -228,9 +226,23 @@ test('without a log quorum an endpoint that lacks logs is not noticed', () => {
   assert.match(child.stdout, /observed: 1 screened/);
 });
 
+test('observe screens with log requests narrower than the scanned history', () => {
+  const child = runExample('observe', undefined, { MAX_LOG_BLOCK_RANGE: '1000' });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /observed: 1 screened/);
+});
+
+test('the example refuses a log block range below one before reaching RPC', () => {
+  const child = runExample('observe', undefined, { MAX_LOG_BLOCK_RANGE: '0' });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 1);
+  assert.match(child.stderr, /MAX_LOG_BLOCK_RANGE must be an integer of at least 1/);
+});
+
 for (const [name, rpc, message] of [
-  ['that is not a number', { RPC_LOG_QUORUM: 'two' }, /RPC_LOG_QUORUM is not a positive integer/],
-  ['that is empty', { RPC_LOG_QUORUM: '' }, /RPC_LOG_QUORUM is not a positive integer/],
+  ['that is not a number', { RPC_LOG_QUORUM: 'two' }, /RPC_LOG_QUORUM must be an integer of at least 1/],
+  ['that is empty', { RPC_LOG_QUORUM: '' }, /RPC_LOG_QUORUM must be an integer of at least 1/],
   ['of one', { RPC_LOG_QUORUM: '1' }, /logQuorum must be between 2 and 1/],
   ['above the number of endpoints', { RPC_LOG_QUORUM: '2' }, /logQuorum must be between 2 and 1/],
 ] as const) {
