@@ -2,7 +2,7 @@
 # repository root:
 #   docker build -f daemon/Dockerfile -t guardian-daemon .
 # Pinned by digest, so one revision builds on the same base image every time.
-FROM docker.io/lidofinance/dhi-node:24.22.1-alpine3.24-dev@sha256:7b851ff65d774343caf89450555663caef54dbd8f673658a615d256883973337 AS dependencies
+FROM docker.io/lidofinance/dhi-node:24.22-alpine3.24-dev@sha256:42930a1523f7213e7d7bcf033e2c5e26f08db09b42f77a8de68e6a26f741e264 AS dependencies
 
 WORKDIR /app
 
@@ -17,7 +17,7 @@ ARG BUILD_BRANCH=unknown
 ARG BUILD_COMMIT=unknown
 RUN node -e 'require("node:fs").writeFileSync("build-info.json", JSON.stringify({ version: process.env.BUILD_VERSION, branch: process.env.BUILD_BRANCH, commit: process.env.BUILD_COMMIT }))'
 
-FROM docker.io/lidofinance/dhi-node:24.22.1-alpine3.24@sha256:a23617dcacb063a973d6a989430a5cc007e4d5ae9042fa884a7426a6be7e0037
+FROM docker.io/lidofinance/dhi-node:24.22-alpine3.24@sha256:4544851709621aa77a18134101ef4cd6af39233cf57bdfe2adcc17e2e72866db
 
 ENV NODE_ENV=production
 WORKDIR /app

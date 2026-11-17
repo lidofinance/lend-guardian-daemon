@@ -73,12 +73,6 @@ jobs:
           username: ${{ vars.DHI_USERNAME || secrets.DHI_USERNAME }}
           password: ${{ secrets.DHI_TOKEN }}
 
-      - name: Inspect paid DHI manifests
-        run: |
-          for tag in 24.22.1-alpine3.24 24.22.1-alpine3.24-dev 24.22-alpine3.24 24.22-alpine3.24-dev; do
-            docker buildx imagetools inspect "docker.io/lidofinance/dhi-node:$tag" || true
-          done
-
       - name: Build image without publishing
         run: |
           docker build --pull -f "$COMPONENT/Dockerfile" -t "$IMAGE" \
