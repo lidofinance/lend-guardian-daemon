@@ -14,11 +14,14 @@ The daemon posts every SDK event to `EVENTS_URL` ([daemon/README.md](../daemon/R
 ## Run
 
 ```bash
+docker login docker.io --username lidofinance
 docker build -f monitoring/Dockerfile -t guardian-monitoring .
 docker run --rm -p 9464:9464 -e GUARDIAN=0x… -e MODE=signal -e CHAIN_ID=560048 guardian-monitoring
 ```
 
 The receiver takes events only on the loopback interface, so the daemon and the receiver must share one network: in Kubernetes the receiver is a second container of the daemon's pod, and with Docker the daemon runs with `--network container:<receiver>`. The daemon then posts to `EVENTS_URL=http://127.0.0.1:9465/events`.
+
+The image uses paid Docker Hardened Images and runs as UID/GID 1000 without a shell or package manager. Start `node monitoring/main.ts` directly. The [daemon guide](../daemon/README.md#ci-and-kubernetes) describes CI credentials and manual publication of both images.
 
 Or without an image, from the repository root: `node monitoring/main.ts`. The receiver imports only the event types of the daemon and the SDK, which Node erases, so the image holds `monitoring/` alone; `monitoring/package.json` lists its only runtime dependency. The build arguments `BUILD_VERSION`, `BUILD_BRANCH` and `BUILD_COMMIT` go into `build-info.json`, `unknown` when not given.
 

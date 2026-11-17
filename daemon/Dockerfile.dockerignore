@@ -4,6 +4,7 @@
 !src
 !example/guardian.ts
 !example/configuration.ts
+!example/secrets.ts
 !daemon/*.ts
 !daemon/package.json
 !daemon/package-lock.json
