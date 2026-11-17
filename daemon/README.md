@@ -10,7 +10,7 @@ This directory is the deployable daemon: the example's Guardian and schedule, [`
 
 ## Run
 
-Build from the repository root. The paid Docker Hardened Images require a read-only Docker Hub token; run `docker login docker.io --username lidofinance` first.
+Build from the repository root. Paid DHI bases require `docker login docker.io --username lidofinance`.
 
 ```bash
 docker build -f daemon/Dockerfile -t guardian-daemon .
@@ -20,13 +20,9 @@ The image holds the SDK sources, the ABI fragments, `example/guardian.ts`, `exam
 
 Start in observe mode: the daemon screens and logs the reports it would send, and sends no transactions. Switch to `MODE=signal` with the delegate's `SIGNER_KEY` once the observed reports are right. Without Docker, run `node daemon/main.ts` from a checkout after `npm ci`, on Node 24 or newer. Node does not read `daemon/.env` by itself; to take the configuration from that file, run `node --env-file=daemon/.env daemon/main.ts`.
 
-### CI and Kubernetes
+Publication is manual through separate [DEV](../.github/workflows/ci-dev-k8s.yml) and [STAGING](../.github/workflows/ci-staging-k8s.yml) workflows for both daemon and monitoring. They use `harbor_dev_release` / `HARBOR_DEV_TOKEN` and `harbor_stage_release` / `HARBOR_STAGE_TOKEN`, respectively, with `REGISTRY_USERNAME` in each environment. Docker Hub uses repository variable `DHI_USERNAME` and secret `DHI_TOKEN`.
 
-[CI](../.github/workflows/ci.yml) builds and checks both images without publishing. Authenticated image checks run for same-repository PRs and pushes; fork PRs run the application checks only. Set repository variable `DHI_USERNAME` and secret `DHI_TOKEN` for Docker Hub access.
-
-Run [Build and push guardian images to dev](../.github/workflows/ci-dev-k8s.yml) manually from the selected branch to publish `team-lend/lend-guardian-daemon:dev` and `team-lend/lend-guardian-monitoring:dev`. It uses the shared organization workflow, the `harbor_dev_release` environment, `REGISTRY_USERNAME` and `HARBOR_DEV_TOKEN`. The separate [staging workflow](../.github/workflows/ci-staging-k8s.yml) publishes the same image names with `:staging`, using `harbor_stage_release`, `REGISTRY_USERNAME` and `HARBOR_STAGE_TOKEN`. Configure that environment before running it. Pushes and releases do not publish images.
-
-The runtime runs as UID/GID 1000 and contains no shell or package manager. Before deploying it, remove any Helm `/bin/sh` command override. Start `node daemon/main.ts` directly, mount raw secret files and set `RPC_URLS_FILE` and `SIGNER_KEY_FILE`; the files must exist and be readable before startup. Shell `export` files cannot be used as raw secret files. See [secret configuration](../example/README.md).
+The runtime has no shell. Replace Helm `/bin/sh` overrides with direct Node startup and raw secret files through `RPC_URLS_FILE` and `SIGNER_KEY_FILE`. These files must be readable at startup.
 
 ### With Docker Compose
 
