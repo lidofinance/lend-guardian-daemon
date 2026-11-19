@@ -58,8 +58,8 @@ jobs:
           persist-credentials: false
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
-          registry: docker.io
-          username: ${{ vars.DHI_USERNAME }}
+          registry: dhi.io
+          username: ${{ secrets.DHI_USERNAME }}
           password: ${{ secrets.DHI_TOKEN }}
       - name: Build image without publishing
         env:
