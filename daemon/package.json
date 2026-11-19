@@ -1,0 +1,12 @@
+{
+  "name": "guardian-daemon",
+  "private": true,
+  "description": "Runtime dependencies of the Guardian daemon image, which runs the SDK sources of this repository.",
+  "type": "module",
+  "engines": {
+    "node": ">=24.22.1"
+  },
+  "dependencies": {
+    "viem": "2.55.19"
+  }
+}

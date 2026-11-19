@@ -44,3 +44,24 @@ jobs:
 
       - name: Verify clean package installation
         run: npm run check:package
+
+  build-images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [daemon, monitoring]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: docker.io
+          username: ${{ vars.DHI_USERNAME }}
+          password: ${{ secrets.DHI_TOKEN }}
+      - name: Build image without publishing
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: docker build --pull -f "$COMPONENT/Dockerfile" --build-arg BUILD_COMMIT="$GITHUB_SHA" .

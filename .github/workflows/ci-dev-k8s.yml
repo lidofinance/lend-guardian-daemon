@@ -1,0 +1,21 @@
+name: Build and push guardian images to dev
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [daemon, monitoring]
+    uses: lidofinance/actions/.github/workflows/k8s-build-push-harbor.yml@main
+    with:
+      target: dev
+      harbor_project: team-lend
+      image: lend-guardian-${{ matrix.component }}
+      dockerfile: ${{ matrix.component }}/Dockerfile
+    secrets: inherit

@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { padHex } from 'viem';
 
 import type { GuardianSetup } from '../../src/core/guardian.ts';
+import type { ScreeningProvider, ScreeningRequest } from '../../src/core/index.ts';
 import type { Work } from '../../src/core/outcomes.ts';
 import { GuardianStop } from '../../src/core/stop.ts';
 import type { StopReason } from '../../src/core/stop.ts';
@@ -1102,5 +1103,55 @@ test('the supplies of all activations in one span are read at once', async () =>
     supplyReads.map((query) => [query.fromBlock, query.toBlock]),
     [[80_000, 80_200]],
     'one read covers the lot start and every top-up of the span',
+  );
+});
+
+// A lot that started before this Guardian's first discovery window, the lookback before it joined, is never
+// screened by it. When a top-up after this Guardian's first heartbeat restarts the lot's timer while a freeze, a
+// ban or a surcharge keeps the lot from maturing, the lot waits again for the quorum frontier or the fallback, and
+// the coverage filter drops its first supply as covered by that heartbeat, so the next heartbeat attests the lot
+// with only the top-up screened.
+test('a lot from before the first discovery window, re-timed by a later top-up, is attested without its first supply', async () => {
+  const joined = 120_000;
+  const firstReport = blockAt(150_000);
+  const started = activation(60_000, 5n, 5n);
+  const toppedUp: Lot = {
+    kind: 'activating',
+    blockNumber: 160_000,
+    logIndex: 4,
+    amount: 3n,
+    position: { dust: 0n, activating: 8n, activatingStart: blockAt(160_000).timestamp, activatingDelay: DAY },
+    supplied: 3n,
+  };
+  const requests: ScreeningRequest[] = [];
+  const screening: ScreeningProvider = {
+    screen: (request) => {
+      requests.push(request);
+      return Promise.resolve(
+        request.anchors.map(() => ({ status: 'judged', requiresSuspect: false, requiresFlag: false })),
+      );
+    },
+  };
+
+  const first = guardianOver({ head: firstReport.number + 2, guardianAddedAt: joined, lots: [started] }, { screening });
+  const firstOutcome = await first.guardian.cycle();
+  const second = guardianOver(
+    {
+      head: HEAD,
+      guardianAddedAt: joined,
+      heartbeatTimestamp: firstReport.timestamp,
+      heartbeats: [{ blockNumber: firstReport.number, timestamp: firstReport.timestamp }],
+      lots: [started, toppedUp],
+    },
+    { screening },
+  );
+  const secondOutcome = await second.guardian.cycle();
+
+  assert.ok(firstOutcome.kind === 'attested');
+  assert.deepEqual(firstOutcome.previousHeartbeatBlock, firstReport);
+  assert.equal(secondOutcome.kind, 'attested');
+  assert.deepEqual(
+    requests.map((request) => request.anchors.map((anchor) => [anchor.blockHash, anchor.logIndex])),
+    [[[blockAt(160_000).hash, 5]]],
   );
 });

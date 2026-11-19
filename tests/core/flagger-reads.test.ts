@@ -28,7 +28,7 @@ const OTHER_GUARDIAN: Address = '0x0000000000000000000000000000000000000001';
 const GET_SUSPECTED_BY = toFunctionSelector(getAbiItem({ abi: GUARDIAN_SIGNALS_ABI, name: 'getSuspectedBy' }));
 
 /** Distinct targets exercise several flagger batches without relying on discovery fixtures. */
-function workFor(count: number, reportsSince: number | null = null): Work {
+function buildWork(count: number, reportsSince: number | null = null): Work {
   const entries = Array.from({ length: count }, (_unused, index): [PositionKey, SupplyAnchor[]] => {
     const marketId = padHex(numberToHex(index + 1), { size: 32 });
     const target = { controller: CONTROLLER, marketId, borrower: BORROWER };
@@ -89,7 +89,7 @@ function answer(flaggers: readonly Address[]): string {
 }
 
 test('flagger reads stay within eight concurrent calls and preserve every target in input order', async () => {
-  const work = workFor(20);
+  const work = buildWork(20);
   const node = controlledNode();
   const requests: ScreeningRequest[] = [];
   const skippedMarkets = new Set([8, 9, 20]);
@@ -173,7 +173,7 @@ test('flagger reads stay within eight concurrent calls and preserve every target
 });
 
 test('a failed flagger read stops before later batches, provider screening or submission', async () => {
-  const work = workFor(20);
+  const work = buildWork(20);
   const node = controlledNode();
   const requests: ScreeningRequest[] = [];
 
@@ -231,7 +231,7 @@ test('empty work performs no flagger reads or provider calls', async () => {
       },
     },
   );
-  const screened = await guardian.screenWork(workFor(0));
+  const screened = await guardian.screenWork(buildWork(0));
   assert.deepEqual(node.reads, []);
   assert.deepEqual(requests, []);
   assert.deepEqual(screened.results, []);
@@ -241,7 +241,7 @@ test('empty work performs no flagger reads or provider calls', async () => {
 for (const limit of [1, 3]) {
   test(`readConcurrency limits flagger reads to ${limit} at once while retaining every source`, async () => {
     const node = controlledNode();
-    const work = workFor(7);
+    const work = buildWork(7);
     const { guardian } = guardianOver(
       { head: HEAD },
       {
@@ -302,7 +302,7 @@ test('recorded suspect reads stay within readConcurrency and cover every target'
     },
   );
 
-  const outcome = await guardian.signalAndHeartbeat(await guardian.screenWork(workFor(7, joined)));
+  const outcome = await guardian.signalAndHeartbeat(await guardian.screenWork(buildWork(7, joined)));
 
   assert.equal(outcome.kind, 'attested');
   // Every suspect was recorded, so none is sent again; the targets are read before the reports and again
