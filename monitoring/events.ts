@@ -66,7 +66,7 @@ const MAX_MESSAGE_LENGTH = 500;
 const URL_PATTERN = /https?:\/\/[^\s"<>]+/gi;
 
 /** A key that may name a credential, whatever the daemon redacts upstream. */
-const SECRET_KEY = /key|secret|token|pass|private|credential|authorization/i;
+const SECRET_KEY = /key|secret|token|pass|private|credential|auth|cookie/i;
 
 /** Fields the receiver never keeps: RPC parameters are the bulk of the stream and may echo a request body. */
 const DROPPED_FIELDS = new Set(['params']);
@@ -117,12 +117,38 @@ export function isRoutine(event: ReceivedEvent): boolean {
   return event.name === 'rpc.requestFinished' && event.payload.error === undefined;
 }
 
+/** A record the receiver prints; `formatRecord` adds its `message`, so the record has none of its own. */
+export interface PrintedRecord {
+  readonly event: string;
+  readonly level: Level;
+  readonly message?: never;
+  readonly [field: string]: unknown;
+}
+
 /**
  * One line of the receiver's output, for an event's record and for the receiver's own: every line goes
- * through the same scrub, so no credential-named field, URL or unbounded text is printed.
+ * through the same scrub, so no credential-named field, URL or unbounded text is printed. The `message`
+ * is built from the scrubbed record, so it repeats nothing the scrub removed.
  */
-export function formatRecord(record: Readonly<Record<string, unknown>>): string {
-  return JSON.stringify(scrubRecord(record, 0));
+export function formatRecord(record: PrintedRecord): string {
+  const scrubbed = scrubRecord(record, 0);
+  return JSON.stringify({ ...scrubbed, message: describeRecord(scrubText(record.event), scrubbed) });
+}
+
+/**
+ * The event name, followed by the error's message when the record has an error with one: at the top, as
+ * the receiver's own records carry it, or in `details`, as an event's record carries the daemon's.
+ */
+function describeRecord(name: string, record: Payload): string {
+  const details = isRecord(record.details) ? record.details : {};
+  const errorMessage = readErrorMessage(record.error) ?? readErrorMessage(details.error);
+  return errorMessage === undefined ? name : `${name}: ${errorMessage}`;
+}
+
+/** The message of an error the daemon serialized as an object, or of one that is text itself. */
+function readErrorMessage(error: unknown): string | undefined {
+  const message = isRecord(error) ? error.message : error;
+  return typeof message === 'string' && message !== '' ? message : undefined;
 }
 
 function scrubRecord(value: Readonly<Record<string, unknown>>, depth: number): Payload {
