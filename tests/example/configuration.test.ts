@@ -60,7 +60,7 @@ test('a required positive integer that is unset is refused', () => {
   });
 });
 
-for (const text of ['0', '0x10', '1e3', ' 12 ', '5.0', '+7']) {
+for (const text of ['0', '0x10', '1e3', ' 12 ', '5.0', '+7', 'NaN', 'Infinity']) {
   test(`a required positive integer refuses ${JSON.stringify(text)} by the rule of a setting`, () => {
     const config = Configuration.read({ GUARDIAN_TEST_BLOCK: text });
     assert.throws(() => config.integer('GUARDIAN_TEST_BLOCK', { min: 1 }), {
@@ -107,6 +107,13 @@ test('a value of the configuration file follows the rule of its variable', (cont
   const config = Configuration.read({ CONFIG_FILE: withFile(context, '{"GUARDIAN_TEST_BLOCK": 1.5}') });
   assert.throws(() => config.integer('GUARDIAN_TEST_BLOCK', { min: 1 }), {
     message: 'GUARDIAN_TEST_BLOCK must be an integer of at least 1',
+  });
+});
+
+test('a number of the configuration file beyond the largest double, which JSON reads as Infinity, is refused', (context) => {
+  const config = Configuration.read({ CONFIG_FILE: withFile(context, '{"GUARDIAN_TEST_RESTARTS": 1e400}') });
+  assert.throws(() => config.readSettings(TABLE), {
+    message: 'GUARDIAN_TEST_RESTARTS must be an integer of at least 0',
   });
 });
 

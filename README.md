@@ -66,7 +66,7 @@ An application supplies:
 - a `ScreeningProvider` that returns one decision for each requested anchor, in the same order;
 - a serial cycle loop and recovery policy.
 
-The SDK does not read or check a market's `maxGuardiansQuorumDelay`; the [specification](docs/guardian-specification.md) states what a zero value means.
+In every attempt `Guardian` checks the chain id and the Guardian's membership, but it uses the configured core, registry and deployment blocks as given, without checking them against the chain. The SDK does not read or check a market's `maxGuardiansQuorumDelay`; the [specification](docs/guardian-specification.md) states what a zero value means.
 
 The reference implementation for both modes is in [`example/main.ts`](example/main.ts).
 
@@ -157,7 +157,7 @@ Recommended for production signal mode: at least three endpoints, each from a di
 
 The SDK checks some answers itself and stops the attempt when they disagree. The checks are a defense against a node that answers wrongly or leaves logs out; correct answers always pass them.
 
-- Before and after discovery, and before and after reconstruction, the node must return the report block with the plan's hash. A different hash stops the attempt with `node-behind-the-plan`; a node that does not have the block fails the attempt with the error `RPC block is missing or pending`. With `createViemRpcTransport` this block is read from one endpoint, the first in `urls` that answers, and `logQuorum` does not compare it, so the check says nothing about the heads of the other endpoints. A load balancer can also answer this check from one backend and a log read from another.
+- Before and after discovery, and before and after reconstruction, the node must return the report block with the plan's hash. A different hash stops the attempt with `node-behind-the-plan`; a node that does not have the block fails the attempt with the error `RPC block is missing or pending`. With `createViemRpcTransport` this block is read from one endpoint, the first in `urls` that answers, and `logQuorum` does not compare it, so the check says nothing about the heads of the other endpoints. A load balancer can also answer this check from one backend and a log read from another. A block read by number is used as answered: the SDK does not compare the returned block's number with the requested one.
 - A walk that finds no lifecycle event for a position stops the attempt with `position-without-history`.
 - The first event of each position's history walk must be the newest event that discovery read for that position; otherwise the attempt stops with `position-history-broken`.
 - That event must be in the canonical block at its number; otherwise the attempt stops with `log-not-canonical`.
