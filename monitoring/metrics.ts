@@ -1,7 +1,8 @@
 // The Prometheus registry. Metric names and outcome labels are those of the previous Guardian daemon, so
 // the `Guardian daemon` dashboard reads them unchanged; the receiver's own state is under
-// `lido_lend_guardian_monitor_`. Label values come from closed sets, never from the stream. Times
-// arrive in milliseconds, as the daemon sends them, and are exposed in seconds.
+// `lido_lend_guardian_monitor_`. Label values come from closed sets, never from the stream, except the
+// daemon's build, of which one series is kept. Times arrive in milliseconds, as the daemon sends them, and
+// are exposed in seconds.
 
 import { collectDefaultMetrics, Counter, Gauge, Histogram, Registry } from '@prometheus-io/client';
 import type { BuildInfo } from '../daemon/main.ts';
@@ -108,6 +109,12 @@ export class Metrics {
     'guardian',
     'chain_id',
   ]);
+
+  readonly #daemonBuild = this.#gauge(
+    `${DAEMON}build_info`,
+    'Version, branch and commit of the daemon from its last daemon.started; 1.',
+    ['version', 'branch', 'commit'],
+  );
 
   readonly #cycles = this.#counter(`${DAEMON}cycles_total`, 'Finished and failed cycles by outcome.', ['outcome']);
 
@@ -314,6 +321,12 @@ export class Metrics {
 
   setReady(isReady: boolean): void {
     this.#ready.set(isReady ? 1 : 0);
+  }
+
+  /** The daemon's build as its start reports it; the previous build's series goes, so one remains. */
+  setDaemonBuild(build: BuildInfo): void {
+    this.#daemonBuild.reset();
+    this.#daemonBuild.set({ version: build.version, branch: build.branch, commit: build.commit }, 1);
   }
 
   recordCycle(cycle: CycleSample): void {

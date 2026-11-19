@@ -113,5 +113,49 @@ test("the receiver's own lines go through the same scrub as the event records", 
     error: 'cannot reach https://user:pw@host.example/path',
     config: { port: 9464, dbPassword: 'p', signerPrivateKey: 'k' },
   });
-  assert.equal(line, '{"event":"monitor.failed","level":"error","error":"cannot reach [url]","config":{"port":9464}}');
+  assert.equal(
+    line,
+    '{"event":"monitor.failed","level":"error","error":"cannot reach [url]","config":{"port":9464},"message":"monitor.failed: cannot reach [url]"}',
+  );
+});
+
+test('a line without an error has the event name as its message', () => {
+  const line = formatRecord({ event: 'monitor.started', level: 'info', config: { port: 9464 } });
+  assert.deepEqual(JSON.parse(line), {
+    event: 'monitor.started',
+    level: 'info',
+    config: { port: 9464 },
+    message: 'monitor.started',
+  });
+});
+
+test("the message carries the message of an event's error in its details, as scrubbed", () => {
+  const error = { name: 'Error', message: 'node https://user:pw@rpc.example/key said no' };
+  const line = formatRecord({ event: 'cycle.failed', level: 'error', details: { error } });
+  assert.deepEqual(JSON.parse(line), {
+    event: 'cycle.failed',
+    level: 'error',
+    details: { error: { name: 'Error', message: 'node [url] said no' } },
+    message: 'cycle.failed: node [url] said no',
+  });
+});
+
+for (const error of [{ name: 'TimeoutError' }, { name: 'Error', message: '' }, '', 7]) {
+  test(`an error without a message, ${JSON.stringify(error)}, leaves the event name as the message`, () => {
+    const line = formatRecord({ event: 'screening.requestFinished', level: 'warn', details: { error } });
+    assert.deepEqual(JSON.parse(line), {
+      event: 'screening.requestFinished',
+      level: 'warn',
+      details: { error },
+      message: 'screening.requestFinished',
+    });
+  });
+}
+
+test('keys naming authentication or a cookie are dropped like the other credential names', () => {
+  const event = parseEvent({
+    event: 'cycle.started',
+    nested: { auth: 'a', Authorization: 'b', proxyAuthenticate: 'c', cookie: 'd', setCookie: 'e', kept: 1 },
+  });
+  assert.deepEqual(event.payload, { nested: { kept: 1 } });
 });

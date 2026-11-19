@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { DaemonEvent } from '../../daemon/main.ts';
+import type { BuildInfo, DaemonEvent } from '../../daemon/main.ts';
 import type { SupplyAnchor } from '../../src/core/index.ts';
 import {
   ADDRESS,
@@ -385,8 +385,71 @@ test('records carry a level, a sequence and the scrubbed details; routine RPC ev
     event: 'cycle.failed',
     cycleId: 'c1',
     details: { startedAt: 1, finishedAt: 2, error: { name: 'Error', message: 'see [url]' } },
+    message: 'cycle.failed: see [url]',
   });
 });
+
+test("a record's message is its event name without an error, whatever message field the payload carries", () => {
+  const { receiver, lines } = fixture();
+  receiver.receive(parseEvent({ event: 'cycle.started', cycleId: 'c1', message: 'from the stream' }));
+  assert.deepEqual(JSON.parse(lines[0] ?? ''), {
+    timestamp: new Date(1_000_000).toISOString(),
+    sequence: 1,
+    level: 'info',
+    event: 'cycle.started',
+    cycleId: 'c1',
+    details: { message: 'from the stream' },
+    message: 'cycle.started',
+  });
+});
+
+/** A daemon start as the daemon posts it, with the build given. */
+function daemonStarted(build: BuildInfo): DaemonEvent {
+  return {
+    event: 'daemon.started',
+    build,
+    configFile: null,
+    mode: 'observe',
+    chainId: 560_048,
+    guardian: ADDRESS,
+    lidoLend: { address: ADDRESS, deploymentBlock: 1 },
+    guardianSignals: { address: ADDRESS, deploymentBlock: 1 },
+    signer: null,
+    rpcUrlCount: 1,
+    rpcLogQuorum: null,
+    rpcUserAgent: 'lend-guardian-daemon/1.0.0',
+    hasEventsUrl: true,
+    settings: {},
+  };
+}
+
+test("the daemon's build is absent before its start and then follows its latest start alone", async () => {
+  const { receiver, metrics } = fixture();
+  assert.doesNotMatch(await metrics.render(), /^lido_lend_guardian_daemon_build_info\{/m);
+  receiver.receive(parsePosted(daemonStarted({ version: '1.0.0', branch: 'main', commit: 'aaa' })));
+  await expectSample(metrics, `${DAEMON}build_info`, { version: '1.0.0', branch: 'main', commit: 'aaa' }, 1);
+  receiver.receive(parsePosted(daemonStarted({ version: '1.1.0', branch: 'main', commit: 'bbb' })));
+  const exposition = await metrics.render();
+  assert.equal(sample(exposition, `${DAEMON}build_info`, { version: '1.1.0', branch: 'main', commit: 'bbb' }), 1);
+  assert.equal(
+    sample(exposition, `${DAEMON}build_info`, { version: '1.0.0', branch: 'main', commit: 'aaa' }),
+    undefined,
+  );
+});
+
+for (const build of [
+  undefined,
+  'v1',
+  { version: '1.0.0', branch: 'main' },
+  { version: 1, branch: 'main', commit: 'c' },
+]) {
+  test(`a daemon start with a malformed build, ${JSON.stringify(build)}, keeps the build it had`, async () => {
+    const { receiver, metrics } = fixture();
+    receiver.receive(parsePosted(daemonStarted({ version: '1.0.0', branch: 'main', commit: 'aaa' })));
+    receiver.receive(parseEvent({ event: 'daemon.started', build }));
+    await expectSample(metrics, `${DAEMON}build_info`, { version: '1.0.0', branch: 'main', commit: 'aaa' }, 1);
+  });
+}
 
 test('a stale reason the SDK does not send is one label value, so the stream cannot add series', async () => {
   const { receiver, metrics } = fixture();

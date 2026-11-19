@@ -2,6 +2,7 @@
 // it tracks. Every accepted event counts; a payload field that is missing or malformed leaves out only
 // what needs it, as a duration needs both times.
 
+import type { BuildInfo } from '../daemon/main.ts';
 import type { CycleOutcome, StaleReason, TransactionContext } from '../src/core/index.ts';
 import { chooseLevel, formatRecord, isRecord, isRoutine } from './events.ts';
 import type { EventName, Payload, ReceivedEvent } from './events.ts';
@@ -134,6 +135,7 @@ export class Receiver {
       ['schedule.restartBudgetExhausted', () => this.#metrics.countRestartBudgetExhausted()],
       ['schedule.cycleNotStarted', () => this.#metrics.countCycleNotStarted()],
       ['screening.requestFinished', ({ payload }) => this.#recordScreening(payload)],
+      ['daemon.started', ({ payload }) => this.#setDaemonBuild(payload)],
       ['daemon.forwardsCounted', ({ payload }) => this.#setForwardTotals(payload)],
     ]);
   }
@@ -254,6 +256,14 @@ export class Receiver {
     });
   }
 
+  /** The daemon's build from its start record; a build without its three texts skips the update. */
+  #setDaemonBuild(payload: Payload): void {
+    const build = readBuild(payload.build);
+    if (build !== undefined) {
+      this.#metrics.setDaemonBuild(build);
+    }
+  }
+
   /** The daemon's post totals, whose statuses are summed by class; a malformed entry skips the update. */
   #setForwardTotals(payload: Payload): void {
     const durationMs = readNumber(payload.durationMs);
@@ -305,6 +315,18 @@ function readBlock(value: unknown): Block | undefined {
     return undefined;
   }
   return { number, timestamp };
+}
+
+function readBuild(value: unknown): BuildInfo | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const { version, branch, commit } = value;
+  const isNamed = typeof version === 'string' && typeof branch === 'string';
+  if (!isNamed || typeof commit !== 'string') {
+    return undefined;
+  }
+  return { version, branch, commit };
 }
 
 /** The span of an event from its `startedAt` and `finishedAt`, or none without both. */
