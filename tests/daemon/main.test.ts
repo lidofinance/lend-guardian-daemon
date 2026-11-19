@@ -211,6 +211,8 @@ for (const [settings, message] of [
   [{ REPORT_BLOCK_LAG: '0' }, 'REPORT_BLOCK_LAG must be an integer of at least 1'],
   [{ RPC_RETRY_COUNT: '' }, 'RPC_RETRY_COUNT must be an integer of at least 0'],
   [{ MAX_FEE_PER_GAS_WEI: '1e11' }, 'MAX_FEE_PER_GAS_WEI must be an integer of at least 1'],
+  // A limit that is not a number would lift the transport's cap on a response.
+  [{ MAX_RPC_RESPONSE_BODY_SIZE: 'NaN' }, 'MAX_RPC_RESPONSE_BODY_SIZE must be an integer of at least 1'],
   [{ SCREENING_REQUEST_TIMEOUT_MS: '300000' }, 'SCREENING_REQUEST_TIMEOUT_MS must be an integer from 1 to 290000'],
   [{ SCREENING_TIMEOUT_MS: '10000' }, 'SCREENING_TIMEOUT_MS must be an integer from 10001 to 2147483647'],
   [{ HEALTH_PORT: '65536' }, 'HEALTH_PORT must be an integer from 1 to 65535'],

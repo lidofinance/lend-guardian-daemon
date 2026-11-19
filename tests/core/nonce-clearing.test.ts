@@ -279,6 +279,54 @@ test('climbs to the fee cap when the node rejects every cancellation, then stops
   assert.equal(fixture.events.filter((event) => event.event === 'transaction.retry').length, 14);
 });
 
+test('lets a broadcast started inside sendTimeoutMs take a budget of its own, then starts no read or broadcast', async (context) => {
+  // Only the clock is mocked. The first broadcast ends a millisecond before the budget does. The second starts then
+  // and takes the whole budget a client gives each broadcast, as a slow signature can.
+  context.mock.timers.enable({ apis: ['Date'] });
+  const fixture = recoveryFixture({
+    pending: 10,
+    broadcast: ({ state, broadcasts }) => {
+      context.mock.timers.tick(broadcasts.length === 1 ? SEND_TIMEOUT_MS - 1 : SEND_TIMEOUT_MS);
+      state.latest += 1;
+      return Promise.resolve();
+    },
+  });
+
+  await assert.rejects(fixture.guardian.clearPendingNonces(), { message: 'Nonce clearing exceeded sendTimeoutMs' });
+  // Nonce 9 is still pending: after the budget it is neither read nor cancelled.
+  assert.deepEqual(
+    fixture.broadcasts.map(({ transaction }) => transaction.nonce),
+    [7, 8],
+  );
+  assert.deepEqual(
+    fixture.events.filter((event) => event.event === 'nonce.checked').map((event) => [event.latest, event.pending]),
+    [
+      [7, 10],
+      [8, 10],
+    ],
+  );
+});
+
+test('stops repricing a rejected cancellation once sendTimeoutMs has run out', async (context) => {
+  // Only the clock is mocked. Every rejection takes two fifths of the budget, so the third ends past it.
+  context.mock.timers.enable({ apis: ['Date'] });
+  const fixture = recoveryFixture({
+    pending: 8,
+    broadcast: () => {
+      context.mock.timers.tick((SEND_TIMEOUT_MS * 2) / 5);
+      return Promise.reject(new BroadcastFailure(new Error('replacement transaction underpriced')));
+    },
+  });
+
+  await assert.rejects(fixture.guardian.clearPendingNonces(), { message: 'Nonce clearing exceeded sendTimeoutMs' });
+  // The next price, 25, is under the cap of 100: the budget stops the repricing, not the fee.
+  assert.deepEqual(
+    fixture.broadcasts.map(({ transaction }) => transaction.maxFeePerGas),
+    [16n, 19n, 22n],
+  );
+  assert.equal(fixture.prepared.length, 3);
+});
+
 test('propagates failures outside the raw broadcast boundary without retrying', async () => {
   const failure = new Error('signing failed');
   const fixture = recoveryFixture({

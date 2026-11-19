@@ -4,3 +4,6 @@ cache/
 *.tmp
 .DS_Store
 dist/
+
+# Local benchmark measurements.
+benchmarks/results/
