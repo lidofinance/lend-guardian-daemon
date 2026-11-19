@@ -5,6 +5,9 @@ import { padHex } from 'viem';
 import { HttpScreening } from '../../daemon/screening.ts';
 import type { ScreeningRequestFinishedEvent } from '../../daemon/screening.ts';
 import type { ScreeningRequest, SupplyAnchor } from '../../src/core/index.ts';
+import { blockAt } from '../core/fake-node.ts';
+import type { Lot, Script } from '../core/fake-node.ts';
+import { guardianOver } from '../core/setup.ts';
 
 const SCREENING_URL = 'http://screening.invalid/screen';
 
@@ -146,6 +149,7 @@ for (const [name, status, body, message] of [
 ] as const) {
   test(`screening leaves the anchors of a request incomplete after ${name}, and reports why`, async (context) => {
     serve(context, status, body);
+    context.mock.timers.enable({ apis: ['Date'], now: 1_000 });
     const events: ScreeningRequestFinishedEvent[] = [];
     const screening = new HttpScreening(SCREENING_URL, { onEvent: (event) => events.push(event) });
 
@@ -157,12 +161,36 @@ for (const [name, status, body, message] of [
     assert.ok(event.error instanceof Error);
     assert.equal(event.error.message, message);
     const { error: _cause, ...counts } = event;
-    assert.deepEqual(counts, { event: 'screening.requestFinished', anchors: 2, judged: 0, incomplete: 2 });
+    assert.deepEqual(counts, {
+      event: 'screening.requestFinished',
+      anchors: 2,
+      judged: 0,
+      incomplete: 2,
+      startedAt: 1_000,
+      finishedAt: 1_000,
+      httpStatus: status,
+    });
   });
 }
 
+test('the body of an error status is cancelled, so its connection returns to the pool', async (context) => {
+  let isCancelled = false;
+  const body = new ReadableStream({
+    cancel: () => {
+      isCancelled = true;
+    },
+  });
+  context.mock.method(globalThis, 'fetch', () => Promise.resolve(new Response(body, { status: 503 })));
+
+  const results = await new HttpScreening(SCREENING_URL).screen(REQUEST);
+
+  assert.deepEqual(results, [{ status: 'incomplete' }, { status: 'incomplete' }]);
+  assert.equal(isCancelled, true);
+});
+
 test('anchors are posted in batches of batchSize, and the results keep request order', async (context) => {
   const requests = serveEach(context, (ids) => Response.json({ results: ids.map(judged) }));
+  context.mock.timers.enable({ apis: ['Date'], now: 1_000 });
   const events: ScreeningRequestFinishedEvent[] = [];
   const screening = new HttpScreening(SCREENING_URL, { batchSize: 1, onEvent: (event) => events.push(event) });
 
@@ -170,10 +198,16 @@ test('anchors are posted in batches of batchSize, and the results keep request o
 
   assert.deepEqual(requests, [[FIRST_ID], [SECOND_ID]]);
   assert.deepEqual(results, [judged(FIRST_ID), judged(SECOND_ID)]);
-  assert.deepEqual(events, [
-    { event: 'screening.requestFinished', anchors: 1, judged: 1, incomplete: 0 },
-    { event: 'screening.requestFinished', anchors: 1, judged: 1, incomplete: 0 },
-  ]);
+  const finished = {
+    event: 'screening.requestFinished',
+    anchors: 1,
+    judged: 1,
+    incomplete: 0,
+    startedAt: 1_000,
+    finishedAt: 1_000,
+    httpStatus: 200,
+  };
+  assert.deepEqual(events, [finished, finished]);
 });
 
 test('a request that fails leaves only its own anchors incomplete', async (context) => {
@@ -256,6 +290,36 @@ test('a request that outlasts timeoutMs leaves its anchors incomplete, reported 
   assert.deepEqual(results, [{ status: 'incomplete' }, { status: 'incomplete' }]);
   assert.ok(events[0]?.error instanceof Error);
   assert.equal(events[0].error.name, 'TimeoutError');
+  // No answer arrived, so the event has no status.
+  assert.equal('httpStatus' in events[0], false);
+});
+
+test('every request carries the user agent it is given', async (context) => {
+  const request = context.mock.method(globalThis, 'fetch', () =>
+    Promise.resolve(Response.json({ results: [judged(FIRST_ID), judged(SECOND_ID)] })),
+  );
+  await new HttpScreening(SCREENING_URL, { userAgent: 'lend-guardian-daemon/test', timeoutMs: 5_000 }).screen(REQUEST);
+  assert.deepEqual(request.mock.calls[0]?.arguments[1]?.headers, {
+    'content-type': 'application/json',
+    'user-agent': 'lend-guardian-daemon/test',
+    'x-request-timeout-ms': '5000',
+  });
+});
+
+test('each request names its wait: timeoutMs, or the rest of the budget when that ends first', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: 1_000 });
+  const request = context.mock.method(globalThis, 'fetch', () =>
+    Promise.resolve(Response.json({ results: [judged(FIRST_ID), judged(SECOND_ID)] })),
+  );
+  await new HttpScreening(SCREENING_URL, { timeoutMs: 5_000, budgetMs: 60_000 }).screen(REQUEST);
+  await new HttpScreening(SCREENING_URL, { timeoutMs: 5_000, budgetMs: 3_000 }).screen(REQUEST);
+  assert.deepEqual(
+    request.mock.calls.map((call) => call.arguments[1]?.headers),
+    [
+      { 'content-type': 'application/json', 'x-request-timeout-ms': '5000' },
+      { 'content-type': 'application/json', 'x-request-timeout-ms': '3000' },
+    ],
+  );
 });
 
 test('a judged answer is kept for the next screening, which asks only about the other anchors', async (context) => {
@@ -379,4 +443,65 @@ test('the budget ends every request open at once', async (context) => {
     events.map((event) => (event.error instanceof Error ? event.error.name : 'no error')),
     ['TimeoutError', 'TimeoutError'],
   );
+});
+
+/** A lot of `activating` after a supply of `amount` at `blockNumber`, due a minute later. */
+function lotAt(blockNumber: number, amount: bigint, activating: bigint): Lot {
+  return {
+    kind: 'activating',
+    blockNumber,
+    logIndex: 4,
+    amount,
+    supplied: amount,
+    position: { dust: 0n, activating, activatingStart: blockAt(blockNumber).timestamp, activatingDelay: 60 },
+  };
+}
+
+/** One supply due at the report block of a node at block 200,000. */
+const ONE_DUE: Script = { head: 200_000, guardianAddedAt: 1_000, lots: [lotAt(199_000, 5n, 5n)] };
+
+/** Two supplies of one borrower due at that report block: a lot and its top-up. */
+const TWO_DUE: Script = {
+  head: 200_000,
+  guardianAddedAt: 1_000,
+  lots: [lotAt(199_000, 5n, 5n), lotAt(199_500, 3n, 8n)],
+};
+
+test('screening reads an empty evidence reference as none', async (context) => {
+  serve(context, 200, {
+    results: [
+      { ...judged(FIRST_ID), evidenceReference: '' },
+      { ...INCOMPLETE_SECOND, evidenceReference: '' },
+    ],
+  });
+
+  assert.deepEqual(await new HttpScreening(SCREENING_URL).screen(REQUEST), [
+    { ...judged(FIRST_ID), evidenceReference: null },
+    { ...INCOMPLETE_SECOND, evidenceReference: null },
+  ]);
+});
+
+test('a judged answer with an empty evidence reference is reported', async (context) => {
+  const requests = serveEach(context, (ids) =>
+    Response.json({ results: ids.map((id) => ({ ...judged(id), evidenceReference: '' })) }),
+  );
+  const { guardian, sent } = guardianOver(ONE_DUE, { screening: new HttpScreening(SCREENING_URL) });
+
+  assert.equal((await guardian.cycle()).kind, 'attested');
+
+  assert.equal(requests.length, 1);
+  assert.deepEqual(sent.calls, ['flags', 'heartbeat']);
+});
+
+test('an incomplete answer with an empty evidence reference leaves the flag another anchor requires', async (context) => {
+  serveEach(context, (ids) =>
+    Response.json({
+      results: ids.map((id, index) => (index === 0 ? judged(id) : { id, status: 'incomplete', evidenceReference: '' })),
+    }),
+  );
+  const { guardian, sent } = guardianOver(TWO_DUE, { screening: new HttpScreening(SCREENING_URL) });
+
+  assert.equal((await guardian.cycle()).kind, 'incomplete');
+
+  assert.deepEqual(sent.calls, ['flags']);
 });

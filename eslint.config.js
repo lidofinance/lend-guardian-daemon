@@ -144,8 +144,8 @@ export default defineConfig([
         {
           patterns: [
             {
-              group: ['**/daemon/**', '**/example/**', '**/tests/**', '**/scripts/**'],
-              message: 'src/ imports nothing from daemon/, example/, tests/ or scripts/.',
+              group: ['**/daemon/**', '**/example/**', '**/monitoring/**', '**/tests/**', '**/scripts/**'],
+              message: 'src/ imports nothing from daemon/, example/, monitoring/, tests/ or scripts/.',
             },
           ],
         },
@@ -158,7 +158,14 @@ export default defineConfig([
     rules: {
       'no-restricted-imports': [
         'error',
-        { patterns: [{ group: ['**/daemon/**'], message: 'The example does not import the daemon.' }] },
+        {
+          patterns: [
+            {
+              group: ['**/daemon/**', '**/monitoring/**'],
+              message: 'The example imports neither the daemon nor the receiver.',
+            },
+          ],
+        },
       ],
     },
   },
@@ -172,7 +179,31 @@ export default defineConfig([
           patterns: [
             {
               group: ['**/example/main.ts', '**/example/screening.ts'],
-              message: 'The daemon takes only guardian.ts and env.ts from the example.',
+              message: 'The daemon takes only guardian.ts and configuration.ts from the example.',
+            },
+            { group: ['**/monitoring/**'], message: 'The daemon does not import the receiver.' },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    // The receiver's image holds only monitoring/: it takes the event types of the daemon and the SDK,
+    // which Node erases, and no code of theirs.
+    files: ['monitoring/**/*.ts'],
+    rules: {
+      '@typescript-eslint/no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/daemon/**', '**/src/**', '**/example/**'],
+              allowTypeImports: true,
+              message: 'The receiver imports only types from the daemon and the SDK.',
+            },
+            {
+              group: ['**/tests/**', '**/scripts/**'],
+              message: 'The receiver imports nothing from tests/ or scripts/.',
             },
           ],
         },

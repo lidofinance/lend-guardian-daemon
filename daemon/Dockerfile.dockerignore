@@ -3,6 +3,9 @@
 !abi
 !src
 !example/guardian.ts
-!example/env.ts
-!daemon
+!example/configuration.ts
+!example/secrets.ts
+!daemon/*.ts
+!daemon/package.json
+!daemon/package-lock.json
 **/.env

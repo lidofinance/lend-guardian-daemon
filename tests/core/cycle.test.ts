@@ -1,9 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { BaseRpcProvider } from '../../src/core/index.ts';
-import type { CycleEvent, EventHandler, ScreeningResult, SdkEvent } from '../../src/core/index.ts';
+import type {
+  CycleEvent,
+  EventHandler,
+  ScreeningProvider,
+  ScreeningRequest,
+  ScreeningResult,
+  SdkEvent,
+} from '../../src/core/index.ts';
 import { rpcRequest } from './client.ts';
-import { blockAt, fakeNode } from './fake-node.ts';
+import { blockAt, BORROWER, fakeNode, MARKET } from './fake-node.ts';
 import type { Script } from './fake-node.ts';
 import { guardianOver } from './setup.ts';
 
@@ -35,6 +42,16 @@ const FLAG: ScreeningResult = {
 
 function cycleEvents(events: readonly SdkEvent[]): CycleEvent[] {
   return events.filter((event): event is CycleEvent => 'cycleId' in event);
+}
+
+/** A provider that answers `result` for every anchor and keeps each request. */
+function answeringAll(result: ScreeningResult, requests: ScreeningRequest[]): ScreeningProvider {
+  return {
+    screen: (request) => {
+      requests.push(request);
+      return Promise.resolve(request.anchors.map(() => result));
+    },
+  };
 }
 
 interface Deferred<Value> {
@@ -242,4 +259,25 @@ test('an observe cycle whose plan aged out during reconstruction is stale before
   assert.equal(outcome.kind, 'stale');
   assert.equal(outcome.reason, 'report-block-aged-out');
   assert.equal(outcome.work?.all().length, 1);
+});
+
+// The fake node books every supply as sent by the Guardian's address on behalf of `BORROWER`, a third party to the
+// account. A report names the account a supply is booked on, its `onBehalf`, whoever sent it, so a flag decision on
+// that supply flags `BORROWER`.
+test("a flag decision on a third party's supply flags the account the supply is booked on", async () => {
+  const node = fakeNode(DUE);
+  const requests: ScreeningRequest[] = [];
+  const { guardian } = guardianOver(DUE, {
+    endpoints: [{ node: node.transport }],
+    screening: answeringAll(FLAG, requests),
+  });
+
+  const outcome = await guardian.cycle();
+
+  assert.equal(outcome.kind, 'attested');
+  assert.deepEqual(
+    requests.map((request) => request.anchors.map((anchor) => anchor.borrower)),
+    [[BORROWER]],
+  );
+  assert.deepEqual(node.sent.flags, [[{ marketId: MARKET, borrower: BORROWER }]]);
 });

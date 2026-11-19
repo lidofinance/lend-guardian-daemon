@@ -8,6 +8,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { createPublicClient, createWalletClient, isAddressEqual } from 'viem';
 import type { Chain } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import type { PrivateKeyAccount } from 'viem/accounts';
 import { createViemRpcTransport, ViemRpcClient } from '../src/chain/viem-client.ts';
 import { Guardian } from '../src/core/index.ts';
 import type {
@@ -19,8 +20,8 @@ import type {
   StaleReason,
   Work,
 } from '../src/core/index.ts';
-import * as env from './env.ts';
-import type { Mode, Setting, Settings } from './env.ts';
+import type { Configuration, Mode, Setting, Settings } from './configuration.ts';
+import type { Secrets } from './secrets.ts';
 
 /** Mainnet and Hoodi both use 12-second slots; Guardian derives a seven-day lookback from this. */
 const SLOT_SECONDS = 12;
@@ -44,8 +45,8 @@ export const GUARDIAN_SETTINGS = {
   HISTORY_READ_CONCURRENCY: { default: 8, min: 1 },
   INTER_BATCH_CONFIRMATION_BLOCKS: { default: 2, min: 1 },
   CONFIRMATION_POLL_INTERVAL_MS: { default: 12_000, min: 1, max: MAX_TIMER_MS },
-  // A report costs up to about 156,000 gas per borrower, so 50 borrowers stay under half of the
-  // 16,777,216 gas one transaction may use.
+  // A batch of this size fits in one transaction, unless a suspect batch also prunes many expired reports on
+  // its borrowers, which can push it over the transaction gas limit.
   MAX_SIGNAL_BATCH_SIZE: { default: 50, min: 1 },
   IDLE_HEARTBEAT_INTERVAL_SECONDS: { default: 12 * 60 * 60, min: 1 },
   HEARTBEAT_RESERVE_BLOCKS: { default: 8, min: 1 },
@@ -75,8 +76,71 @@ export const GUARDIAN_SETTINGS = {
 
 type GuardianSettings = Settings<typeof GUARDIAN_SETTINGS>;
 
-/** What `createGuardian` builds the Guardian from besides the deployment the environment names. */
+/** A contract of the deployment and the block that deployed it, where its history starts. */
+interface DeployedContract {
+  readonly address: Address;
+  readonly deploymentBlock: number;
+}
+
+/** The deployment, nodes and signer the configuration names, read and checked once. */
+export interface GuardianDeployment {
+  readonly chain: Chain;
+  readonly guardian: Address;
+  readonly lidoLend: DeployedContract;
+  readonly guardianSignals: DeployedContract;
+  readonly rpcUrls: readonly string[];
+  readonly rpcLogQuorum: number | undefined;
+  /** The delegate that signs in signal mode; observe reads no signing material. */
+  readonly signer: PrivateKeyAccount | undefined;
+}
+
+/** The secrets the Guardian reads: the nodes, whose URLs may carry provider keys, and the delegate's key. */
+export const GUARDIAN_SECRET_NAMES = ['RPC_URLS', 'SIGNER_KEY'];
+
+/**
+ * The deployment from `CHAIN_ID`, `GUARDIAN`, `LIDO_LEND`, `GUARDIAN_SIGNALS` and their deployment
+ * blocks, the nodes from the `RPC_URLS` secret and `RPC_LOG_QUORUM`, and in signal mode the delegate from
+ * the `SIGNER_KEY` secret. A missing or invalid value throws before any RPC request.
+ */
+export function readDeployment(config: Configuration, secrets: Secrets, mode: Mode): GuardianDeployment {
+  const chain = config.chain('CHAIN_ID');
+  const guardian = config.address('GUARDIAN');
+  return {
+    chain,
+    guardian,
+    lidoLend: {
+      address: config.address('LIDO_LEND'),
+      deploymentBlock: config.integer('LIDO_LEND_DEPLOYMENT_BLOCK', { min: 1 }),
+    },
+    guardianSignals: {
+      address: config.address('GUARDIAN_SIGNALS'),
+      deploymentBlock: config.integer('GUARDIAN_SIGNALS_DEPLOYMENT_BLOCK', { min: 1 }),
+    },
+    rpcUrls: secrets.urlList('RPC_URLS'),
+    // Signal mode requires a quorum of at least 2 when an endpoint can answer a log range beyond its head
+    // without an error: [RPC requirements](../README.md#rpc-requirements). This launcher does not check it.
+    rpcLogQuorum: config.integer('RPC_LOG_QUORUM', { min: 1 }, { default: undefined }),
+    signer: readSigner(secrets, mode, guardian),
+  };
+}
+
+/** The delegate that signs in signal mode; observe reads no signing material. */
+function readSigner(secrets: Secrets, mode: Mode, guardian: Address): PrivateKeyAccount | undefined {
+  if (mode === 'observe') {
+    return undefined;
+  }
+  const signer = privateKeyToAccount(secrets.privateKey('SIGNER_KEY'));
+  // Application policy: a hot delegate signs, so the Guardian's own key stays cold, even though the SDK
+  // also permits the Guardian to sign.
+  if (isAddressEqual(signer.address, guardian)) {
+    throw new Error('SIGNER_KEY is the Guardian itself, not its delegate');
+  }
+  return signer;
+}
+
+/** What `createGuardian` builds the Guardian from. */
 interface GuardianOptions {
+  readonly deployment: GuardianDeployment;
   readonly mode: Mode;
   readonly onEvent: EventHandler;
   readonly screening: ScreeningProvider;
@@ -84,35 +148,22 @@ interface GuardianOptions {
   readonly userAgent: string;
 }
 
-/**
- * The Guardian with these options over the deployment, nodes and signer the environment names:
- * `CHAIN_ID`, `RPC_URLS`, `RPC_LOG_QUORUM`, `GUARDIAN`, `LIDO_LEND`, `GUARDIAN_SIGNALS`, their
- * deployment blocks and, in signal mode, `SIGNER_KEY`. A missing or invalid value throws before any
- * RPC request.
- */
+/** The Guardian with these options over the deployment; Guardian and its clients check the options before any RPC request. */
 export function createGuardian(options: GuardianOptions): Guardian {
-  const { mode, onEvent, settings } = options;
-  const chain = env.chain('CHAIN_ID');
-  const guardian = env.address('GUARDIAN');
-  const client = createClient(options, chain, guardian);
+  const { deployment, mode, onEvent, settings } = options;
+  const client = createClient(options);
   return new Guardian({
     mode,
     client,
     expectedDelegate: client.signer,
     onEvent,
     deployment: {
-      chainId: chain.id,
+      chainId: deployment.chain.id,
       slotSeconds: SLOT_SECONDS,
-      lidoLend: {
-        address: env.address('LIDO_LEND'),
-        deploymentBlock: env.integer('LIDO_LEND_DEPLOYMENT_BLOCK', { min: 1 }),
-      },
-      guardianSignals: {
-        address: env.address('GUARDIAN_SIGNALS'),
-        deploymentBlock: env.integer('GUARDIAN_SIGNALS_DEPLOYMENT_BLOCK', { min: 1 }),
-      },
+      lidoLend: deployment.lidoLend,
+      guardianSignals: deployment.guardianSignals,
     },
-    guardian,
+    guardian: deployment.guardian,
     screening: options.screening,
     reportBlockLag: settings('REPORT_BLOCK_LAG'),
     readConcurrency: settings('READ_CONCURRENCY'),
@@ -127,14 +178,13 @@ export function createGuardian(options: GuardianOptions): Guardian {
   });
 }
 
-/** One transport for reads and sends; observe reads no signing material and constructs no wallet. */
-function createClient(options: GuardianOptions, chain: Chain, guardian: Address): ViemRpcClient {
-  const { mode, onEvent, settings } = options;
+/** One transport for reads and sends; without a signer, as in observe mode, no wallet is constructed. */
+function createClient(options: GuardianOptions): ViemRpcClient {
+  const { deployment, onEvent, settings } = options;
+  const { chain, signer } = deployment;
   const transport = createViemRpcTransport({
-    urls: env.rpcUrls('RPC_URLS'),
-    // Signal mode requires a quorum of at least 2 when an endpoint can answer a log range beyond its head
-    // without an error: [RPC requirements](../README.md#rpc-requirements). This launcher does not check it.
-    logQuorum: env.integer('RPC_LOG_QUORUM', { min: 1 }, { default: undefined }),
+    urls: deployment.rpcUrls,
+    logQuorum: deployment.rpcLogQuorum,
     timeoutMs: settings('RPC_REQUEST_TIMEOUT_MS'),
     maxResponseBodySize: settings('MAX_RPC_RESPONSE_BODY_SIZE'),
     retryCount: settings('RPC_RETRY_COUNT'),
@@ -143,13 +193,7 @@ function createClient(options: GuardianOptions, chain: Chain, guardian: Address)
     onEvent,
   });
   const publicClient = createPublicClient({ chain, transport });
-  const account = mode === 'signal' ? privateKeyToAccount(env.privateKey('SIGNER_KEY')) : undefined;
-  // Application policy: a hot delegate signs, so the Guardian's own key stays cold, even though the SDK
-  // also permits the Guardian to sign.
-  if (account !== undefined && isAddressEqual(account.address, guardian)) {
-    throw new Error('SIGNER_KEY is the Guardian itself, not its delegate');
-  }
-  const walletClient = account === undefined ? undefined : createWalletClient({ account, chain, transport });
+  const walletClient = signer === undefined ? undefined : createWalletClient({ account: signer, chain, transport });
   return new ViemRpcClient({
     publicClient,
     walletClient,

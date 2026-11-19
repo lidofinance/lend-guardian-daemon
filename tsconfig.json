@@ -21,6 +21,7 @@
     "tests/**/*.ts",
     "example/**/*.ts",
     "daemon/**/*.ts",
+    "monitoring/**/*.ts",
     "benchmarks/**/*.ts"
   ]
 }

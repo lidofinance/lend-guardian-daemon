@@ -61,7 +61,7 @@ Sources these rules are drawn from: the [Google TypeScript Style Guide](https://
 
 ## Modules
 
-- `src/` is the library a Guardian imports through `src/core/index.ts`. `src/common/` holds the shared value types; `src/chain/` holds generic chain access and transaction delivery; `src/contracts/` holds contract calls and event interpretation. A module under `src/` never imports from `scripts/`, `tests/`, `example/` or `daemon/`. The example never imports the daemon, and the daemon takes only `guardian.ts` and `env.ts` from the example. ESLint enforces these boundaries with `no-restricted-imports`.
+- `src/` is the library a Guardian imports through `src/core/index.ts`. `src/common/` holds the shared value types; `src/chain/` holds generic chain access and transaction delivery; `src/contracts/` holds contract calls and event interpretation. A module under `src/` never imports from `scripts/`, `tests/`, `example/` or `daemon/`. The example never imports the daemon, and the daemon takes only `guardian.ts` and `configuration.ts` from the example. ESLint enforces these boundaries with `no-restricted-imports`.
 - Named exports only, and export only what another module uses. One module has one responsibility: a cycle phase, a decoder, a validator. Cross-cutting helpers live in one place rather than being copied.
 - A caller implements `ScreeningProvider` and supplies a configured RPC/signing client. Transaction deduplication and concurrency belong to each provider implementation. The SDK owns registry submission; contract encoding and generic signing stay in their respective classes. Adding a vendor does not require changing the core.
 - No circular imports.
