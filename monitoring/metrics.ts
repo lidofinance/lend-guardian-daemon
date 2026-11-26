@@ -1,8 +1,9 @@
 // The Prometheus registry. Metric names and outcome labels are those of the previous Guardian daemon, so
 // the `Guardian daemon` dashboard reads them unchanged; the receiver's own state is under
 // `lido_lend_guardian_monitor_`. Label values come from closed sets, never from the stream, except the
-// daemon's build, of which one series is kept. Times arrive in milliseconds, as the daemon sends them, and
-// are exposed in seconds.
+// daemon's build, of which one series is kept, and the deposits of the last risk decisions, of which the
+// receiver keeps a bounded number. Times arrive in milliseconds, as the daemon sends them, and are exposed
+// in seconds.
 
 import { collectDefaultMetrics, Counter, Gauge, Histogram, Registry } from '@prometheus-io/client';
 import type { BuildInfo } from '../daemon/main.ts';
@@ -36,6 +37,20 @@ export type TransactionStep =
   | 'nonce-cleared';
 
 export type AnchorResult = 'none' | 'suspect' | 'flag' | 'incomplete';
+
+/** The report that screening requires for a deposit. */
+export type RiskAction = Extract<AnchorResult, 'suspect' | 'flag'>;
+
+/** One deposit that requires a report, with the labels of its series. */
+export interface RiskDecision {
+  readonly action: RiskAction;
+  readonly marketId: string;
+  readonly borrower: string;
+  readonly transactionHash: string;
+  readonly logIndex: number;
+  /** When the receiver accepted the decision, in Unix milliseconds. */
+  readonly decidedAtMs: number;
+}
 
 /** The times of an event that took a while, in Unix milliseconds. */
 export interface Span {
@@ -183,6 +198,12 @@ export class Metrics {
     `${DAEMON}risk_decisions_total`,
     'Suspect and flag actions required by screening.',
     ['action'],
+  );
+
+  readonly #riskDecision = this.#gauge(
+    `${DAEMON}risk_decision_timestamp_seconds`,
+    'Unix time the receiver last accepted a suspect or flag decision for a deposit, for the last deposits only.',
+    ['action', 'chain_id', 'market_id', 'borrower', 'transaction_hash', 'log_index'],
   );
 
   readonly #skippedTargets = this.#counter(
@@ -385,6 +406,22 @@ export class Metrics {
     this.#anchors.inc({ result });
     if (result === 'suspect' || result === 'flag') {
       this.#decisions.inc({ action: result });
+    }
+  }
+
+  /** The deposits the receiver remembers, as they stand; the reset drops the series of a forgotten deposit. */
+  setRiskDecisions(decisions: Iterable<RiskDecision>): void {
+    this.#riskDecision.reset();
+    for (const decision of decisions) {
+      const labels = {
+        action: decision.action,
+        chain_id: this.#chainId,
+        market_id: decision.marketId,
+        borrower: decision.borrower,
+        transaction_hash: decision.transactionHash,
+        log_index: String(decision.logIndex),
+      };
+      this.#riskDecision.set(labels, toSeconds(decision.decidedAtMs));
     }
   }
 

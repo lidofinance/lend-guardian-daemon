@@ -63,7 +63,7 @@ const PORT: Range = { fallback: 9464, max: 65_535 };
 
 const EVENTS_PORT: Range = { fallback: 9465, max: 65_535 };
 
-const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
+export const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 
 export function readMonitorConfig(environment: Environment): MonitorConfig {
   const port = readInteger(environment, 'MONITOR_PORT', PORT);

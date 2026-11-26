@@ -4,9 +4,20 @@
 
 import type { BuildInfo } from '../daemon/main.ts';
 import type { CycleOutcome, StaleReason, TransactionContext } from '../src/core/index.ts';
+import { ADDRESS_PATTERN } from './config.ts';
 import { chooseLevel, formatRecord, isRecord, isRoutine } from './events.ts';
 import type { EventName, Payload, ReceivedEvent } from './events.ts';
-import type { AnchorResult, Block, Metrics, OutcomeLabel, ReportMethod, Span, TransactionStep } from './metrics.ts';
+import type {
+  AnchorResult,
+  Block,
+  Metrics,
+  OutcomeLabel,
+  ReportMethod,
+  RiskAction,
+  RiskDecision,
+  Span,
+  TransactionStep,
+} from './metrics.ts';
 
 export interface Freshness {
   readonly ready: boolean;
@@ -90,6 +101,12 @@ const MAX_PROVIDER_INDEX = 63;
 /** Report blocks are kept per cycle until the cycle ends; a stuck cycle cannot grow this without bound. */
 const MAX_REMEMBERED_CYCLES = 64;
 
+/** The deposits of the last risk decisions keep their series; the oldest goes first, so the stream cannot grow the label set. */
+const MAX_RISK_DECISIONS = 64;
+
+/** A transaction hash or a market id. */
+const HASH_PATTERN = /^0x[0-9a-fA-F]{64}$/;
+
 export class Receiver {
   readonly #metrics: Metrics;
 
@@ -101,6 +118,9 @@ export class Receiver {
 
   /** The report block of each cycle whose reconstruction arrived, until the cycle ends. */
   readonly #reportBlocksByCycle = new Map<string, Block>();
+
+  /** The last deposits that required a report, by transaction and log index, the newest decision last. */
+  readonly #riskDecisions = new Map<string, RiskDecision>();
 
   readonly #handlers: ReadonlyMap<EventName, Handler>;
 
@@ -117,7 +137,7 @@ export class Receiver {
     this.#clock = options.clock ?? Date.now;
     this.#handlers = new Map<EventName, Handler>([
       ['cycle.reconstructed', (event) => this.#rememberReportBlock(event)],
-      ['cycle.screened', (event) => this.#countScreened(event)],
+      ['cycle.screened', (event, now) => this.#countScreened(event, now)],
       ['cycle.finished', (event, now) => this.#recordFinishedCycle(event, now)],
       ['cycle.failed', (event) => this.#recordFailedCycle(event)],
       ['transaction.preparation', ({ payload }) => this.#countTransaction('preparation', payload)],
@@ -211,15 +231,35 @@ export class Receiver {
     return block;
   }
 
-  #countScreened(event: ReceivedEvent): void {
+  #countScreened(event: ReceivedEvent, now: number): void {
     this.#rememberReportBlock(event);
     const { results, skipped } = event.payload;
     for (const entry of Array.isArray(results) ? results : []) {
-      const result = isRecord(entry) && isRecord(entry.result) ? entry.result : {};
-      this.#metrics.countAnchor(classifyAnchor(result));
+      const screened = isRecord(entry) ? entry : {};
+      const result = classifyAnchor(isRecord(screened.result) ? screened.result : {});
+      this.#metrics.countAnchor(result);
+      if (result === 'suspect' || result === 'flag') {
+        this.#rememberRiskDecision(result, screened.anchor, now);
+      }
     }
+    this.#metrics.setRiskDecisions(this.#riskDecisions.values());
     if (Array.isArray(skipped)) {
       this.#metrics.countSkippedTargets(skipped.length);
+    }
+  }
+
+  /** A later decision for the same deposit replaces the earlier one; an anchor without its fields is only counted. */
+  #rememberRiskDecision(action: RiskAction, anchor: unknown, now: number): void {
+    const deposit = readDeposit(anchor);
+    if (deposit === undefined) {
+      return;
+    }
+    const key = `${deposit.transactionHash}:${String(deposit.logIndex)}`;
+    this.#riskDecisions.delete(key);
+    this.#riskDecisions.set(key, { ...deposit, action, decidedAtMs: now });
+    const oldest = this.#riskDecisions.keys().next().value;
+    if (this.#riskDecisions.size > MAX_RISK_DECISIONS && oldest !== undefined) {
+      this.#riskDecisions.delete(oldest);
     }
   }
 
@@ -327,6 +367,29 @@ function readBuild(value: unknown): BuildInfo | undefined {
     return undefined;
   }
   return { version, branch, commit };
+}
+
+/** A hex text of the pattern's length; any other text never becomes a label value. */
+function readHex(value: unknown, pattern: RegExp): string | undefined {
+  return typeof value === 'string' && pattern.test(value) ? value : undefined;
+}
+
+/** The deposit of a supply anchor, or none unless every field has its form. */
+function readDeposit(anchor: unknown): Omit<RiskDecision, 'action' | 'decidedAtMs'> | undefined {
+  if (!isRecord(anchor)) {
+    return undefined;
+  }
+  const transactionHash = readHex(anchor.transactionHash, HASH_PATTERN);
+  const logIndex = readNumber(anchor.logIndex);
+  const marketId = readHex(anchor.marketId, HASH_PATTERN);
+  const borrower = readHex(anchor.borrower, ADDRESS_PATTERN);
+  if (transactionHash === undefined || logIndex === undefined) {
+    return undefined;
+  }
+  if (marketId === undefined || borrower === undefined) {
+    return undefined;
+  }
+  return { marketId, borrower, transactionHash, logIndex };
 }
 
 /** The span of an event from its `startedAt` and `finishedAt`, or none without both. */
