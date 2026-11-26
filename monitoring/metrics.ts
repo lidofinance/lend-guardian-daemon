@@ -36,7 +36,9 @@ export type TransactionStep =
   | 'skipped'
   | 'nonce-cleared';
 
-export type AnchorResult = 'none' | 'suspect' | 'flag' | 'incomplete';
+const ANCHOR_RESULTS = ['none', 'suspect', 'flag', 'incomplete'] as const;
+
+export type AnchorResult = (typeof ANCHOR_RESULTS)[number];
 
 /** The report that screening requires for a deposit. */
 export type RiskAction = Extract<AnchorResult, 'suspect' | 'flag'>;
@@ -98,6 +100,8 @@ export interface Block {
   readonly timestamp: number;
 }
 
+const LOG_LEVELS = ['info', 'warn', 'error'] as const satisfies readonly Level[];
+
 const SECONDS_BUCKETS = [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
 
 const CYCLE_BUCKETS = [1, 5, 15, 30, 60, 120, 300, 600, 1200, 1800];
@@ -142,6 +146,7 @@ export class Metrics {
   readonly #lastDuration = this.#gauge(
     `${DAEMON}last_cycle_duration_seconds`,
     'Duration of the last finished or failed cycle.',
+    ['chain_id'],
   );
 
   readonly #cycleDuration = this.#histogram(
@@ -154,11 +159,13 @@ export class Metrics {
   readonly #reportBlockNumber = this.#gauge(
     `${DAEMON}report_block_number`,
     'Report block number of the last complete or observed cycle.',
+    ['chain_id'],
   );
 
   readonly #reportBlockTimestamp = this.#gauge(
     `${DAEMON}report_block_timestamp_seconds`,
     'Unix time of the report block of the last complete or observed cycle.',
+    ['chain_id'],
   );
 
   readonly #restarts = this.#counter(
@@ -327,8 +334,18 @@ export class Metrics {
     this.#chainId = identity.chainId;
     this.#info.set({ mode: identity.mode, guardian: identity.guardian, chain_id: identity.chainId }, 1);
     this.#build.set({ version: build.version, branch: build.branch, commit: build.commit }, 1);
+    // Each series of a closed label set starts at 0, so increase() reads 0 rather than nothing after a restart.
     for (const outcome of OUTCOME_LABELS) {
       this.#cycles.inc({ outcome }, 0);
+    }
+    for (const level of LOG_LEVELS) {
+      this.#records.inc({ level }, 0);
+    }
+    for (const result of ANCHOR_RESULTS) {
+      this.#anchors.inc({ result }, 0);
+    }
+    for (const action of ['suspect', 'flag'] as const satisfies readonly RiskAction[]) {
+      this.#decisions.inc({ action }, 0);
     }
     this.#ready.set(0);
     collectDefaultMetrics({ register: this.#registry });
@@ -369,7 +386,7 @@ export class Metrics {
       return;
     }
     this.#cycleDuration.observe({ outcome }, toSeconds(span.durationMs));
-    this.#lastDuration.set(toSeconds(span.durationMs));
+    this.#lastDuration.set({ chain_id: this.#chainId }, toSeconds(span.durationMs));
     this.#lastCycle.set({ outcome }, toSeconds(span.finishedAtMs));
   }
 
@@ -377,9 +394,10 @@ export class Metrics {
     this.#lastProgress.set(toSeconds(acceptedAtMs));
   }
 
+  /** The label keeps both series absent until the first report block, where a gauge without labels shows 0. */
   setReportBlock(block: Block): void {
-    this.#reportBlockNumber.set(block.number);
-    this.#reportBlockTimestamp.set(block.timestamp);
+    this.#reportBlockNumber.set({ chain_id: this.#chainId }, block.number);
+    this.#reportBlockTimestamp.set({ chain_id: this.#chainId }, block.timestamp);
   }
 
   countRestart(reason: string): void {
