@@ -4,7 +4,9 @@
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import type { BuildInfo } from '../daemon/main.ts';
+import { updateBalance } from './balance.ts';
 import { readMonitorConfig } from './config.ts';
+import type { BalanceSource } from './config.ts';
 import { formatRecord, isRecord } from './events.ts';
 import { Metrics } from './metrics.ts';
 import { Receiver } from './receiver.ts';
@@ -14,6 +16,9 @@ import { startEventServer, startMonitoringServer } from './server.ts';
 const BUILD_INFO_FILE = new URL('../build-info.json', import.meta.url);
 
 const UNKNOWN_BUILD: BuildInfo = { version: 'unknown', branch: 'unknown', commit: 'unknown' };
+
+/** The delegate spends only in the daemon's cycles, six minutes apart by default, so a minute keeps the gauge current. */
+const BALANCE_INTERVAL_MS = 60_000;
 
 /**
  * `build-info.json` of the image, or `unknown` for each field without one; a broken file stops the start.
@@ -47,26 +52,47 @@ async function main(): Promise<void> {
   const config = readMonitorConfig(process.env);
   const build = readBuildInfo(BUILD_INFO_FILE);
   const metrics = new Metrics(config.identity, build);
+  const sink = (line: string): void => {
+    console.log(line);
+  };
   const receiver = new Receiver({
     metrics,
     windows: { eventTimeoutMs: config.eventTimeoutSeconds * 1000, cycleTimeoutMs: config.cycleTimeoutSeconds * 1000 },
-    sink: (line) => {
-      console.log(line);
-    },
+    sink,
   });
   const endpoints = { receiver, metrics, version: build.version };
   const servers = [
     await startEventServer(config.eventsPort, endpoints),
     await startMonitoringServer(config.port, '0.0.0.0', endpoints),
   ];
+  // The scrub of every record replaces the RPC URLs of the configuration.
   console.log(formatRecord({ event: 'monitor.started', level: 'info', build, config }));
+  const balanceTimer = watchBalance(config.balance, metrics, sink);
   const stop = (): void => {
+    clearInterval(balanceTimer);
     for (const server of servers) {
       server.close();
     }
   };
   process.once('SIGTERM', stop);
   process.once('SIGINT', stop);
+}
+
+/** Read the delegate's balance now and every `BALANCE_INTERVAL_MS`; without a source nothing is read. */
+function watchBalance(
+  source: BalanceSource | undefined,
+  metrics: Metrics,
+  sink: (line: string) => void,
+): NodeJS.Timeout | undefined {
+  if (source === undefined) {
+    return undefined;
+  }
+  const read = (): void => {
+    // `updateBalance` reports its own failures, and a read that outlasts the interval only overlaps the next.
+    void updateBalance({ source, metrics, sink, clock: Date.now });
+  };
+  read();
+  return setInterval(read, BALANCE_INTERVAL_MS);
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {

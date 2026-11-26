@@ -268,6 +268,18 @@ export class Metrics {
     "Total duration of the daemon's posts to this receiver since the daemon started. A running total: read it with increase().",
   );
 
+  readonly #delegateBalance = this.#gauge(
+    `${DAEMON}delegate_balance_wei`,
+    'Balance of the delegate in wei, as the receiver last read it from an RPC endpoint.',
+    ['delegate'],
+  );
+
+  readonly #delegateBalanceReadAt = this.#gauge(
+    `${DAEMON}delegate_balance_timestamp_seconds`,
+    "Unix time of the receiver's last read of the delegate's balance.",
+    ['delegate'],
+  );
+
   readonly #build = this.#gauge(`${MONITOR}build_info`, 'Version, branch and commit of the receiver; 1.', [
     'version',
     'branch',
@@ -414,6 +426,18 @@ export class Metrics {
       this.#posts.set({ response_code: responseCode }, posts);
     }
     this.#postSeconds.set(toSeconds(totals.durationMs));
+  }
+
+  /**
+   * The label keeps both series absent until the first read, where a gauge without labels would show a
+   * balance of zero. The reset drops the series of a rotated delegate. A gauge is a double, exact to 2^53
+   * wei and to one part in 2^53 above that.
+   */
+  setDelegateBalance(delegate: string, balanceWei: bigint, readAtMs: number): void {
+    this.#delegateBalance.reset();
+    this.#delegateBalanceReadAt.reset();
+    this.#delegateBalance.set({ delegate }, Number(balanceWei));
+    this.#delegateBalanceReadAt.set({ delegate }, toSeconds(readAtMs));
   }
 
   #counter<Label extends string = never>(
