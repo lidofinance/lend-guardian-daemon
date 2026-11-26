@@ -196,6 +196,51 @@ test('screened anchors count by result and the required actions and withheld tar
   await expectSample(metrics, `${DAEMON}screening_skipped_targets_total`, {}, 1);
 });
 
+/** A `cycle.screened` whose anchors each require the given report, as a daemon of any version may post it. */
+function screenedDeposits(deposits: readonly (readonly [action: string, transactionHash: string])[]) {
+  const results = deposits.map(([action, transactionHash]) => ({
+    anchor: { core: ADDRESS, blockHash: HASH, transactionHash, logIndex: 1, marketId: HASH, borrower: ADDRESS },
+    result: { status: 'judged', requiresSuspect: true, requiresFlag: action === 'flag' },
+  }));
+  return parseEvent({ event: 'cycle.screened', cycleId: 'c1', results, skipped: [], suspects: [], flags: [] });
+}
+
+test('a deposit that requires a report keeps one series with its market, borrower and transaction', async () => {
+  const { receiver, metrics, clock } = fixture();
+  const name = `${DAEMON}risk_decision_timestamp_seconds`;
+  const deposit = { chain_id: '560048', market_id: HASH, borrower: ADDRESS, transaction_hash: HASH, log_index: '1' };
+  const other = `0x${'12'.repeat(32)}`;
+
+  receiver.receive(
+    screenedDeposits([
+      ['suspect', HASH],
+      ['flag', other],
+      ['suspect', 'not-a-hash'],
+    ]),
+  );
+  await expectSample(metrics, name, { ...deposit, action: 'suspect' }, 1000);
+  await expectSample(metrics, name, { ...deposit, action: 'flag', transaction_hash: other }, 1000);
+  await expectSample(metrics, `${DAEMON}risk_decisions_total`, { action: 'suspect' }, 2);
+  assert.equal((await metrics.render()).includes('not-a-hash'), false);
+
+  clock.now = 2_000_000;
+  receiver.receive(screenedDeposits([['flag', HASH]]));
+  await expectSample(metrics, name, { ...deposit, action: 'flag' }, 2000);
+  assert.equal(sample(await metrics.render(), name, { ...deposit, action: 'suspect' }), undefined);
+});
+
+test('the series of risk decisions stay bounded: the oldest deposit goes first', async () => {
+  const { receiver, metrics } = fixture();
+  const name = `${DAEMON}risk_decision_timestamp_seconds`;
+  const hashes = Array.from({ length: 65 }, (_, index) => `0x${index.toString(16).padStart(64, '0')}`);
+  receiver.receive(screenedDeposits(hashes.map((hash) => ['suspect', hash] as const)));
+  const exposition = await metrics.render();
+  const series = exposition.split('\n').filter((line) => line.startsWith(`${name}{`));
+  assert.equal(series.length, 64);
+  assert.equal(exposition.includes(hashes[0] ?? ''), false);
+  assert.equal(exposition.includes(hashes[64] ?? ''), true);
+});
+
 test('RPC requests feed the policy metrics with bounded labels and the configured chain', async () => {
   const { receiver, metrics } = fixture();
   receiver.receive(parsePosted(RPC_FINISHED));

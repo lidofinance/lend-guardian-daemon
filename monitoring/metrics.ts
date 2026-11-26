@@ -1,8 +1,9 @@
 // The Prometheus registry. Metric names and outcome labels are those of the previous Guardian daemon, so
 // the `Guardian daemon` dashboard reads them unchanged; the receiver's own state is under
 // `lido_lend_guardian_monitor_`. Label values come from closed sets, never from the stream, except the
-// daemon's build, of which one series is kept. Times arrive in milliseconds, as the daemon sends them, and
-// are exposed in seconds.
+// daemon's build, of which one series is kept, and the deposits of the last risk decisions, of which the
+// receiver keeps a bounded number. Times arrive in milliseconds, as the daemon sends them, and are exposed
+// in seconds.
 
 import { collectDefaultMetrics, Counter, Gauge, Histogram, Registry } from '@prometheus-io/client';
 import type { BuildInfo } from '../daemon/main.ts';
@@ -36,6 +37,20 @@ export type TransactionStep =
   | 'nonce-cleared';
 
 export type AnchorResult = 'none' | 'suspect' | 'flag' | 'incomplete';
+
+/** The report that screening requires for a deposit. */
+export type RiskAction = Extract<AnchorResult, 'suspect' | 'flag'>;
+
+/** One deposit that requires a report, with the labels of its series. */
+export interface RiskDecision {
+  readonly action: RiskAction;
+  readonly marketId: string;
+  readonly borrower: string;
+  readonly transactionHash: string;
+  readonly logIndex: number;
+  /** When the receiver accepted the decision, in Unix milliseconds. */
+  readonly decidedAtMs: number;
+}
 
 /** The times of an event that took a while, in Unix milliseconds. */
 export interface Span {
@@ -185,6 +200,12 @@ export class Metrics {
     ['action'],
   );
 
+  readonly #riskDecision = this.#gauge(
+    `${DAEMON}risk_decision_timestamp_seconds`,
+    'Unix time the receiver last accepted a suspect or flag decision for a deposit, for the last deposits only.',
+    ['action', 'chain_id', 'market_id', 'borrower', 'transaction_hash', 'log_index'],
+  );
+
   readonly #skippedTargets = this.#counter(
     `${DAEMON}screening_skipped_targets_total`,
     'Targets withheld from screening because this Guardian had already flagged them.',
@@ -266,6 +287,18 @@ export class Metrics {
   readonly #postSeconds = this.#gauge(
     `${DAEMON}event_post_duration_seconds`,
     "Total duration of the daemon's posts to this receiver since the daemon started. A running total: read it with increase().",
+  );
+
+  readonly #delegateBalance = this.#gauge(
+    `${DAEMON}delegate_balance_wei`,
+    'Balance of the delegate in wei, as the receiver last read it from an RPC endpoint.',
+    ['delegate'],
+  );
+
+  readonly #delegateBalanceReadAt = this.#gauge(
+    `${DAEMON}delegate_balance_timestamp_seconds`,
+    "Unix time of the receiver's last read of the delegate's balance.",
+    ['delegate'],
   );
 
   readonly #build = this.#gauge(`${MONITOR}build_info`, 'Version, branch and commit of the receiver; 1.', [
@@ -376,6 +409,22 @@ export class Metrics {
     }
   }
 
+  /** The deposits the receiver remembers, as they stand; the reset drops the series of a forgotten deposit. */
+  setRiskDecisions(decisions: Iterable<RiskDecision>): void {
+    this.#riskDecision.reset();
+    for (const decision of decisions) {
+      const labels = {
+        action: decision.action,
+        chain_id: this.#chainId,
+        market_id: decision.marketId,
+        borrower: decision.borrower,
+        transaction_hash: decision.transactionHash,
+        log_index: String(decision.logIndex),
+      };
+      this.#riskDecision.set(labels, toSeconds(decision.decidedAtMs));
+    }
+  }
+
   countSkippedTargets(count: number): void {
     this.#skippedTargets.inc(count);
   }
@@ -414,6 +463,18 @@ export class Metrics {
       this.#posts.set({ response_code: responseCode }, posts);
     }
     this.#postSeconds.set(toSeconds(totals.durationMs));
+  }
+
+  /**
+   * The label keeps both series absent until the first read, where a gauge without labels would show a
+   * balance of zero. The reset drops the series of a rotated delegate. A gauge is a double, exact to 2^53
+   * wei and to one part in 2^53 above that.
+   */
+  setDelegateBalance(delegate: string, balanceWei: bigint, readAtMs: number): void {
+    this.#delegateBalance.reset();
+    this.#delegateBalanceReadAt.reset();
+    this.#delegateBalance.set({ delegate }, Number(balanceWei));
+    this.#delegateBalanceReadAt.set({ delegate }, toSeconds(readAtMs));
   }
 
   #counter<Label extends string = never>(
