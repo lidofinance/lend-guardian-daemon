@@ -20,6 +20,8 @@ const DAEMON = 'lido_lend_guardian_daemon_';
 
 const OUTCOME_LABELS = ['complete', 'observed', 'no-change', 'stale', 'incomplete', 'failed'];
 
+const CHAIN = { chain_id: '560048' };
+
 const RPC_LABELS = { network: 'ethereum', layer: 'el', chain_id: '560048', provider: 'rpc-1' };
 
 /** A finished RPC request of a quarter second, as the daemon posts it. */
@@ -52,7 +54,7 @@ test('cycle outcomes map to the previous daemon labels with source times and dur
   }
   await expectSample(metrics, `${DAEMON}last_cycle_timestamp_seconds`, { outcome: 'complete' }, 22);
   await expectSample(metrics, `${DAEMON}last_cycle_timestamp_seconds`, { outcome: 'failed' }, 4);
-  await expectSample(metrics, `${DAEMON}last_cycle_duration_seconds`, {}, 3);
+  await expectSample(metrics, `${DAEMON}last_cycle_duration_seconds`, CHAIN, 3);
   await expectSample(metrics, `${DAEMON}cycle_duration_seconds_count`, { outcome: 'stale' }, 1);
   await expectSample(metrics, `${DAEMON}cycle_restarts_total`, { reason: 'report-block-reorged' }, 1);
 });
@@ -64,6 +66,7 @@ test('a cycle end without both times counts, and records no time or duration', a
   assert.equal(sample(exposition, `${DAEMON}cycles_total`, { outcome: 'no-change' }), 1);
   assert.equal(sample(exposition, `${DAEMON}cycle_duration_seconds_count`, { outcome: 'no-change' }), undefined);
   assert.equal(sample(exposition, `${DAEMON}last_cycle_timestamp_seconds`, { outcome: 'no-change' }), undefined);
+  assert.doesNotMatch(exposition, /^lido_lend_guardian_daemon_last_cycle_duration_seconds[ {]/m);
 });
 
 test('the report block follows an attested cycle and an observed cycle through its reconstruction', async () => {
@@ -71,16 +74,16 @@ test('the report block follows an attested cycle and an observed cycle through i
   receiver.receive(
     parsePosted(cycleFinished({ kind: 'attested', previousHeartbeatBlock: BLOCK, heartbeat: HASH, digest: HASH })),
   );
-  await expectSample(metrics, `${DAEMON}report_block_number`, {}, 100);
-  await expectSample(metrics, `${DAEMON}report_block_timestamp_seconds`, {}, 1_700_000_000);
+  await expectSample(metrics, `${DAEMON}report_block_number`, CHAIN, 100);
+  await expectSample(metrics, `${DAEMON}report_block_timestamp_seconds`, CHAIN, 1_700_000_000);
   const later = { ...BLOCK, number: 150, timestamp: 1_700_000_600 };
   receiver.receive(
     parsePosted({ event: 'cycle.reconstructed', cycleId: 'c9', reportBlock: later, positions: 1, anchors: [] }),
   );
   receiver.receive(observedCycle('c9'));
-  await expectSample(metrics, `${DAEMON}report_block_number`, {}, 150);
+  await expectSample(metrics, `${DAEMON}report_block_number`, CHAIN, 150);
   receiver.receive(parsePosted(cycleFinished({ kind: 'stale', reason: 'report-block-aged-out' }, 'c10')));
-  await expectSample(metrics, `${DAEMON}report_block_number`, {}, 150);
+  await expectSample(metrics, `${DAEMON}report_block_number`, CHAIN, 150);
 });
 
 test('a failed cycle forgets the report block of its reconstruction', async () => {
@@ -91,8 +94,23 @@ test('a failed cycle forgets the report block of its reconstruction', async () =
   );
   receiver.receive(parsePosted({ event: 'cycle.failed', cycleId: 'c9', startedAt: 1, finishedAt: 2, error: 'e' }));
   receiver.receive(observedCycle('c9'));
-  // The gauge keeps its initial 0: the observed cycle found no block to report.
-  assert.equal(sample(await metrics.render(), `${DAEMON}report_block_number`), 0);
+  // The observed cycle found no block to report, so the series stays absent rather than 0.
+  const exposition = await metrics.render();
+  assert.doesNotMatch(exposition, /^lido_lend_guardian_daemon_report_block_(number|timestamp_seconds)[ {]/m);
+});
+
+test('the closed label sets of the level, anchor and decision counters start at 0', async () => {
+  const { metrics } = fixture();
+  const exposition = await metrics.render();
+  for (const level of ['info', 'warn', 'error']) {
+    assert.equal(sample(exposition, `${DAEMON}log_records_total`, { level }), 0);
+  }
+  for (const result of ['none', 'suspect', 'flag', 'incomplete']) {
+    assert.equal(sample(exposition, `${DAEMON}anchors_screened_total`, { result }), 0);
+  }
+  for (const action of ['suspect', 'flag']) {
+    assert.equal(sample(exposition, `${DAEMON}risk_decisions_total`, { action }), 0);
+  }
 });
 
 for (const outcome of [{ kind: 'unheard-of' }, 'text']) {
